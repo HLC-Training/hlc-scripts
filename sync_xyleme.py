@@ -483,7 +483,11 @@ def main():
                 'notes':        task["notes"],
                 'priority':     'Tier 2',
                 'source':       SOURCE,
-                'category':     'Content Development',
+                # action_items_category_check allows only Safety/Quality/
+                # Delivery/Cost/People/Strategy — 'Content Development' is
+                # rejected. Xyleme work maps to the AP tracker's "Content
+                # Quality & Improvements" bucket → Quality.
+                'category':     'Quality',
                 'vault_synced': True,
                 'created_date': datetime.now().strftime('%Y-%m-%d'),
                 'last_updated': datetime.now(timezone.utc).isoformat(),
