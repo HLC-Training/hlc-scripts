@@ -1,0 +1,28 @@
+name: ORION AP Sync
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'    # Every 30 minutes, matches existing ARGUS cadence
+  workflow_dispatch:            # Manual trigger for testing
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install smartsheet-python-sdk supabase requests
+
+      - name: Run sync
+        env:
+          SMARTSHEET_API_TOKEN: ${{ secrets.SMARTSHEET_API_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.ORION_SUPABASE_SERVICE_KEY }}
+          SAMCOS_SERVICE_KEY: ${{ secrets.SAMCOS_SERVICE_KEY }}
+        run: python sync_ap.py
