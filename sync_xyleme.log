@@ -1,0 +1,3 @@
+2026-07-10 13:19:11 | INFO | Sheet 3204043720576900: fetched 466 rows
+2026-07-10 13:19:14 | INFO | Sheet 8868469282918276: fetched 299 rows
+2026-07-10 13:19:14 | INFO | Exam join: 0/111 exam course-groups matched a modernization course (111 unjoined — expected while the two trackers use different course taxonomies)
