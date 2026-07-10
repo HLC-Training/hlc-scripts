@@ -117,6 +117,12 @@ logging.basicConfig(
     format='%(asctime)s | %(levelname)s | %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
 )
+# Also echo to stdout so warnings/errors are visible in the GitHub Actions
+# run log — the logfile above is discarded with the runner.
+_console = logging.StreamHandler()
+_console.setFormatter(logging.Formatter(
+    '%(asctime)s | %(levelname)s | %(message)s', '%Y-%m-%d %H:%M:%S'))
+logging.getLogger().addHandler(_console)
 log = logging.getLogger(__name__)
 
 
