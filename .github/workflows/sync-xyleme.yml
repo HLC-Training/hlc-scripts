@@ -2,7 +2,7 @@ name: Xyleme Modernization Sync
 
 on:
   schedule:
-    - cron: '*/30 * * * *'    # Every 30 minutes
+    - cron: '5,35 * * * *'    # Every 30 minutes, offset to avoid :00/:30 GitHub Actions load spikes
   workflow_dispatch:            # Manual trigger for testing
 
 jobs:
