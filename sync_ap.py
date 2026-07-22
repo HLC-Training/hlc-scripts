@@ -436,7 +436,7 @@ def main():
             from supabase import create_client as _create_client
             sc = _create_client(SAMCOS_SUPABASE_URL, SAMCOS_SERVICE_KEY)
             sc.table('context_store').upsert({
-                'key':    'health:argus:orion_ap_sync',
+                'key':    'health:github:orion_ap_sync',
                 'value':  datetime.utcnow().isoformat() + 'Z',
                 'domain': 'system',
                 'notes':  f'inserted={inserted} updated={updated} skipped={skipped}',

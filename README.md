@@ -10,7 +10,7 @@ Replaces Windows Task Scheduler scripts previously running on ARGUS.
 **Schedule:** Every 30 minutes
 **What it does:** Syncs active AP tasks from the OFS Training Action Plan Tracker
 (Smartsheet) into ORION Supabase action_items. Writes a health heartbeat to
-SAM COS context_store as `health:argus:orion_ap_sync`.
+SAM COS context_store as `health:github:orion_ap_sync`.
 
 **Secrets required:**
 - `SMARTSHEET_API_TOKEN`
