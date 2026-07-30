@@ -6,7 +6,9 @@ Smartsheet Action Plan → ORiON sync. Runs on ARGUS on a schedule.
 
 Flow:
   - Smartsheet is the SOURCE OF TRUTH. This script never writes to it.
-  - Reads active child-level AP tasks from the OFS Training Action Plan Tracker.
+  - Reads child-level AP tasks from the OFS Training Action Plan Tracker
+    (active statuses drive the sync; inactive rows are read only to settle
+    pending flags — see fetch_child_ap_tasks).
   - Each row's Lead cell is resolved to an email (linked contact value, then
     the ap_lead_aliases table, then a name match against users/portal_users —
     see resolve_lead_email), then that email is resolved against BOTH users
@@ -15,17 +17,23 @@ Flow:
     resolving in both, resolving only to a viewer, or resolving in neither,
     is skipped and logged rather than guessed.
   - Upserts into the appropriate table on ap_number (insert new, update changed).
-  - Resets ap_pending_update = false after a successful pull (Smartsheet is now
-    current). This field only exists on the Delivery (action_items) side.
   - When a PLL changes status or due date in ORiON, ap_pending_update is raised
-    in Supabase. Jennifer Wright is notified to make the actual change in Smartsheet.
-    The next sync run pulls the confirmed Smartsheet change back into ORiON.
+    (ap_pending_since records when) and the row is protected from sync
+    overwrites. Jennifer Wright makes the matching change in Smartsheet; the
+    first run that sees the row MATCH Smartsheet again clears both flag fields
+    (Smartsheet caught up). These fields only exist on the Delivery
+    (action_items) side.
+  - Flagged rows still diverging after ESCALATION_DAYS are written to SAM COS
+    context_store (orion:ap_pending:escalated, overwritten every run) and
+    paged to Jim via the samcos notification_queue → Pushover drain — but only
+    when the escalated set of AP numbers changes, never as a repeat page.
 
-Schedule: Windows Task Scheduler — same cadence as sync_vault.py (every 30 min).
+Schedule: GitHub Actions (.github/workflows/sync-ap.yml) — every 30 min.
 ─────────────────────────────────────────────────────────────────
 """
 
 import os
+import json
 import uuid
 import logging
 import argparse
@@ -41,6 +49,13 @@ SMARTSHEET_TOKEN     = os.environ.get("SMARTSHEET_API_TOKEN", "")
 
 SHEET_ID     = "1362792971980676"
 JENNIFER_EMAIL = "jennifer.b.wright@gevernova.com"
+
+# Pending-flag escalation: a flagged Delivery row still diverging from
+# Smartsheet after this many days is recorded in SAM COS and paged.
+ESCALATION_DAYS = 14
+ESCALATION_KEY  = "orion:ap_pending:escalated"
+
+SAMCOS_SUPABASE_URL = "https://hucrkbomqsxpmokgypxg.supabase.co"
 
 LOG_FILE = Path(__file__).parent / "sync_ap.log"
 
@@ -118,11 +133,20 @@ def ss_get(path: str, params: dict = None) -> dict:
     return resp.json()
 
 
-def fetch_active_ap_tasks() -> list[dict]:
+def fetch_child_ap_tasks() -> list[dict]:
     """
-    Fetch all rows from the AP sheet and return every active child-level task,
-    regardless of who the Lead is or whether they resolve to anyone in ORiON.
-    Owner resolution and routing (Delivery vs P&C vs skip) happens in main().
+    Fetch all rows from the AP sheet and return every child-level task —
+    active AND inactive — regardless of who the Lead is or whether they
+    resolve to anyone in ORiON. Owner resolution and routing (Delivery vs
+    P&C vs skip) happens in main().
+
+    Inactive rows (Complete / Cancelled / On Hold) are included ONLY so a
+    Delivery row whose ap_pending_update flag is set can be recognized as
+    caught-up once Jennifer applies the change in Smartsheet: e.g. ORiON
+    "Done" vs Smartsheet "Complete" map to the same status and must clear
+    the flag. main() restricts inactive rows to exactly that path — they
+    never insert, never route to P&C, never touch the skip counters.
+
     Smartsheet rows are retrieved via GET /sheets/{id} with pagination.
     """
     page_size = 500
@@ -147,7 +171,7 @@ def fetch_active_ap_tasks() -> list[dict]:
 
     log.info(f"Smartsheet: fetched {len(all_rows)} total rows")
 
-    active_tasks = []
+    child_tasks = []
     for row in all_rows:
         cells       = {c["columnId"]: c.get("displayValue") or c.get("value") for c in row.get("cells", [])}
         raw         = {c["columnId"]: c.get("value") for c in row.get("cells", [])}
@@ -161,10 +185,7 @@ def fetch_active_ap_tasks() -> list[dict]:
         if is_parent == "1.0" or is_parent == "1":
             continue
 
-        # Active statuses only
         status_raw = cells.get(COL_STATUS, "")
-        if status_raw not in ACTIVE_STATUSES:
-            continue
 
         # Lead value/displayValue are kept separate (not merged) — resolve_lead_email()
         # needs both: the raw contact value (an email, when linked) and the typed
@@ -172,7 +193,8 @@ def fetch_active_ap_tasks() -> list[dict]:
         lead_value   = (raw.get(COL_LEAD) or "").strip()
         lead_display = (display_raw.get(COL_LEAD) or "").strip()
 
-        active_tasks.append({
+        child_tasks.append({
+            "active":       status_raw in ACTIVE_STATUSES,
             "ap_number":    cells.get(COL_AP_NUM, ""),
             "action_text":  cells.get(COL_IMPROVEMENT, ""),
             "notes":        cells.get(COL_DESCRIPTION),
@@ -186,8 +208,9 @@ def fetch_active_ap_tasks() -> list[dict]:
             "source_raw":   cells.get(COL_SOURCE),
         })
 
-    log.info(f"Smartsheet: {len(active_tasks)} active child-level tasks found")
-    return active_tasks
+    n_active = sum(1 for t in child_tasks if t["active"])
+    log.info(f"Smartsheet: {len(child_tasks)} child-level tasks found ({n_active} active)")
+    return child_tasks
 
 
 def resolve_lead_email(lead_value: str, lead_display: str, alias_map: dict, name_to_email: dict) -> str | None:
@@ -258,6 +281,17 @@ def parse_due_date(finish_raw: str | None) -> str | None:
         return finish_raw[:10]
     except Exception:
         return None
+
+
+def days_since(iso_ts: str | None) -> float | None:
+    """Days elapsed since a Supabase timestamptz ISO string; None if unset/unparseable."""
+    if not iso_ts:
+        return None
+    try:
+        ts = datetime.fromisoformat(iso_ts.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return (datetime.now(timezone.utc) - ts).total_seconds() / 86400
 
 
 def map_category(sqdcg_raw: str | None) -> str | None:
@@ -387,6 +421,8 @@ def main(dry_run: bool = False):
     # future name collision involves two DIFFERENT people, this silently
     # picks the portal_users one.
     name_to_email = {}
+    # id → name for escalation records (Delivery owners live in users).
+    id_to_name = {u['id']: u.get('name') for u in users_resp.data}
     for u in users_resp.data:
         if u.get('name') and u.get('email'):
             name_to_email[u['name'].strip().lower()] = u['email'].strip().lower()
@@ -396,7 +432,7 @@ def main(dry_run: bool = False):
 
     # Fetch active AP tasks from Smartsheet
     try:
-        tasks = fetch_active_ap_tasks()
+        tasks = fetch_child_ap_tasks()
     except Exception as e:
         log.error(f"Smartsheet fetch failed: {e}")
         return
@@ -409,7 +445,7 @@ def main(dry_run: bool = False):
     # Load existing Delivery (action_items) rows keyed by ap_number
     try:
         existing_resp = db.table('action_items') \
-            .select('id, ap_number, owner_id, status, due_date, start_date, priority, ap_pending_update') \
+            .select('id, ap_number, owner_id, status, due_date, start_date, priority, ap_pending_update, ap_pending_since') \
             .eq('source', 'ap_import') \
             .execute()
         existing_delivery = {
@@ -440,8 +476,10 @@ def main(dry_run: bool = False):
 
     to_insert_delivery = []
     to_update_delivery = []  # list of (id, fields_to_update, ap_number)
+    to_clear_pending   = []  # list of (id, ap_number) — Smartsheet caught up, clear flag only
     to_insert_pc       = []
     to_update_pc       = []  # list of (id, fields_to_update, ap_number)
+    escalations        = []  # pending > ESCALATION_DAYS and still diverging
 
     skipped_no_ap        = 0
     skipped_unmapped     = 0
@@ -455,6 +493,16 @@ def main(dry_run: bool = False):
 
     for task in tasks:
         ap_num = task['ap_number']
+
+        # Inactive rows exist ONLY to settle a pending Delivery flag. Anything
+        # else — new rows, P&C rows, unflagged rows — is dropped here exactly
+        # as if it had never been fetched (no counters, no logs), so behavior
+        # for non-pending rows is byte-identical to the old active-only fetch.
+        if not task['active']:
+            ex_check = existing_delivery.get(ap_num)
+            if not ex_check or not ex_check.get('ap_pending_update'):
+                continue
+
         if not ap_num or not task['action_text']:
             skipped_no_ap += 1
             continue
@@ -507,18 +555,12 @@ def main(dry_run: bool = False):
             if ap_num in existing_delivery:
                 ex = existing_delivery[ap_num]
 
-                # Skip if PLL has a pending update — Smartsheet hasn't been updated yet.
-                if ex.get('ap_pending_update'):
-                    skipped_pending += 1
-                    log.info(f"Skipping {ap_num} — pending update awaiting Smartsheet change")
-                    if dry_run:
-                        print(f"[DRY RUN] SKIP     {ap_num:14} delivery — pending update awaiting Smartsheet change")
-                    continue
-
+                # Field diff runs BEFORE the pending check — the same fields
+                # dict decides both "normal update" and "Smartsheet caught up",
+                # so the reset condition and the update condition cannot drift.
                 fields = {}
                 if owner_id != ex.get('owner_id'):
                     fields['owner_id'] = owner_id
-                    log.info(f"{ap_num}: lead reassigned in Smartsheet — owner updated")
                 if status != ex['status']:
                     fields['status'] = status
                 if due_date != ex.get('due_date'):
@@ -527,7 +569,45 @@ def main(dry_run: bool = False):
                     fields['start_date'] = start_date
                 if ex.get('priority') != 'Tier 2':
                     fields['priority'] = 'Tier 2'
+
+                if ex.get('ap_pending_update'):
+                    if not fields:
+                        # Smartsheet caught up — the change the PLL flagged is
+                        # now reflected here. Clear the flag, touch nothing else.
+                        to_clear_pending.append((ex['id'], ap_num))
+                        log.info(f"{ap_num}: Smartsheet caught up — clearing ap_pending_update")
+                        if dry_run:
+                            print(f"[DRY RUN] CLEAR    {ap_num:14} delivery — Smartsheet caught up, pending flag cleared")
+                    else:
+                        # Still diverging — keep protecting the PLL's change.
+                        skipped_pending += 1
+                        log.info(f"Skipping {ap_num} — pending update awaiting Smartsheet change")
+                        if dry_run:
+                            print(f"[DRY RUN] SKIP     {ap_num:14} delivery — pending update awaiting Smartsheet change")
+                        pending_days = days_since(ex.get('ap_pending_since'))
+                        if pending_days is not None and pending_days > ESCALATION_DAYS:
+                            # ASCII arrow on purpose — this string is printed
+                            # on Windows consoles (cp1252) as well as pushed.
+                            divergence = ", ".join(
+                                f"{k}: {ex.get(k)!r} -> {v!r}" for k, v in fields.items()
+                            )
+                            escalations.append({
+                                'ap_number':    ap_num,
+                                'owner':        id_to_name.get(ex.get('owner_id')) or lead_display_for_log,
+                                'days_flagged': round(pending_days),
+                                'divergence':   divergence,
+                            })
+                            log.warning(
+                                f"ESCALATED: {ap_num} pending {round(pending_days)}d "
+                                f"(> {ESCALATION_DAYS}d) and still diverging — {divergence}"
+                            )
+                            if dry_run:
+                                print(f"[DRY RUN] ESCALATE {ap_num:14} delivery — pending {round(pending_days)}d, {divergence}")
+                    continue
+
                 if fields:
+                    if 'owner_id' in fields:
+                        log.info(f"{ap_num}: lead reassigned in Smartsheet — owner updated")
                     fields['last_updated'] = datetime.now(timezone.utc).isoformat()
                     to_update_delivery.append((ex['id'], fields, ap_num))
                     if dry_run:
@@ -558,6 +638,12 @@ def main(dry_run: bool = False):
                     print(f"[DRY RUN] INSERT   {ap_num:14} delivery — owner {owner_id}, status {status}")
 
         elif destination == 'pc':
+            # Inactive rows are fetched solely to settle Delivery pending
+            # flags — even if the Lead now resolves to a TPM, an inactive row
+            # must never create or modify a P&C project.
+            if not task['active']:
+                continue
+
             pc_status = PC_STATUS_MAP.get(task['status_raw'])
             title       = task['action_text']
             description = task['notes']
@@ -622,7 +708,8 @@ def main(dry_run: bool = False):
 
     if dry_run:
         delivery_summary = (
-            f"Delivery — would insert: {len(to_insert_delivery)}, would update: {len(to_update_delivery)}"
+            f"Delivery — would insert: {len(to_insert_delivery)}, would update: {len(to_update_delivery)}, "
+            f"would clear pending flag: {len(to_clear_pending)}"
         )
         pc_summary = (
             f"P&C      — would insert: {len(to_insert_pc)}, would update: {len(to_update_pc)}"
@@ -642,6 +729,10 @@ def main(dry_run: bool = False):
             print(f"AMBIGUOUS lead emails ({len(ambiguous_leads)}) — needs human review: {sorted(ambiguous_leads)}")
         if viewer_leads:
             print(f"VIEWER lead emails ({len(viewer_leads)}) — resolves to a real person, excluded by role: {sorted(viewer_leads)}")
+        if escalations:
+            print(f"Escalated ({len(escalations)}) — pending > {ESCALATION_DAYS} days and still diverging:")
+            for e in escalations:
+                print(f"  {e['ap_number']:14} {e['days_flagged']:>3}d  {e['owner']}  — {e['divergence']}")
         print("-" * 72)
         print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | DRY RUN complete — no writes were made.")
         return
@@ -664,6 +755,20 @@ def main(dry_run: bool = False):
             updated_delivery += 1
         except Exception as e:
             log.error(f"Delivery update failed for {ap_num}: {e}")
+
+    # Clear settled pending flags — Smartsheet caught up on these rows.
+    # Deliberately does NOT touch last_updated (or anything else): the row's
+    # content didn't change, only the flag lifecycle did.
+    cleared_pending = 0
+    for item_id, ap_num in to_clear_pending:
+        try:
+            db.table('action_items') \
+                .update({'ap_pending_update': False, 'ap_pending_since': None}) \
+                .eq('id', item_id) \
+                .execute()
+            cleared_pending += 1
+        except Exception as e:
+            log.error(f"Pending-flag clear failed for {ap_num}: {e}")
 
     # Insert new P&C items in batches of 25
     inserted_pc = 0
@@ -719,36 +824,100 @@ def main(dry_run: bool = False):
     now     = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     summary = (
         f"{now} | AP sync complete — "
-        f"Delivery: inserted {inserted_delivery}, updated {updated_delivery} | "
+        f"Delivery: inserted {inserted_delivery}, updated {updated_delivery}, "
+        f"pending cleared {cleared_pending} | "
         f"P&C: inserted {inserted_pc}, updated {updated_pc} | "
         f"skipped: {skipped_total}, "
         f"pending Smartsheet updates: {len(pending)}, "
+        f"escalated: {len(escalations)}, "
         f"WIP flags set: {wip_flagged}"
     )
     log.info(summary)
     print(summary)
 
+    # ── SAM COS client (escalation record + health heartbeat) ───
+    sc = None
+    SAMCOS_SERVICE_KEY = os.environ.get("SAMCOS_SERVICE_KEY", "")
+    if SAMCOS_SERVICE_KEY:
+        try:
+            sc = create_client(SAMCOS_SUPABASE_URL, SAMCOS_SERVICE_KEY)
+        except Exception as _e:
+            log.warning(f"SAM COS client init failed (non-critical): {_e}")
+
+    # ── Escalation record + Pushover page → SAM COS ─────────────
+    # context_store[ESCALATION_KEY] always mirrors the CURRENT escalated set —
+    # overwritten every run, including down to an empty list, so it can be
+    # trusted as durable state. The Pushover page (a notification_queue row;
+    # samcos drains the queue to Pushover) fires ONLY when the set of AP
+    # numbers differs from what context_store already held — a 30-minute cron
+    # must not re-page about the same rows all day.
+    # notification_queue is used instead of POST /api/notify because this
+    # workflow holds SAMCOS_SERVICE_KEY but not CRON_SECRET, and a queued row
+    # survives a samcos outage where a direct POST would be lost.
+    if sc is not None:
+        try:
+            stored_aps = []
+            stored_resp = sc.table('context_store').select('value').eq('key', ESCALATION_KEY).execute()
+            if stored_resp.data and stored_resp.data[0].get('value'):
+                try:
+                    stored_state = json.loads(stored_resp.data[0]['value'])
+                    stored_aps = sorted(e['ap_number'] for e in stored_state.get('escalated', []))
+                except (ValueError, KeyError, TypeError):
+                    stored_aps = []  # unreadable prior state — treat as empty
+            current_aps = sorted(e['ap_number'] for e in escalations)
+
+            sc.table('context_store').upsert({
+                'key':    ESCALATION_KEY,
+                'value':  json.dumps({
+                    'escalated': escalations,
+                    'as_of':     datetime.now(timezone.utc).isoformat(),
+                }),
+                'domain': 'work',
+                'notes':  (
+                    f'{len(escalations)} ap_import row(s) flagged ap_pending_update for '
+                    f'> {ESCALATION_DAYS} days and still diverging from Smartsheet. '
+                    f'Written by sync_ap.py every run.'
+                ),
+            }, on_conflict='key').execute()
+            log.info(f"Escalation record written to SAM COS ({len(escalations)} row(s))")
+
+            if current_aps != stored_aps:
+                if escalations:
+                    lines = [
+                        f"{e['ap_number']} ({e['days_flagged']}d, {e['owner']}) — {e['divergence']}"
+                        for e in escalations
+                    ]
+                    message = (
+                        f"{len(escalations)} AP row(s) flagged > {ESCALATION_DAYS} days, "
+                        f"Smartsheet still not updated:\n" + "\n".join(lines)
+                    )
+                else:
+                    message = "All previously escalated AP pending rows have resolved."
+                sc.table('notification_queue').insert({
+                    'title':   'ORiON AP sync — pending escalation',
+                    'message': message[:1000],
+                }).execute()
+                log.warning(f"Escalation page queued — set changed {stored_aps} -> {current_aps}")
+        except Exception as _e:
+            log.error(f"Escalation record/notify failed: {_e}")
+
     # ── Health heartbeat → SAM COS context_store ────────────────
     # Upserts last successful run timestamp so the health dashboard can monitor this script.
-    try:
-        import requests as _requests
-        SAMCOS_SUPABASE_URL = "https://hucrkbomqsxpmokgypxg.supabase.co"
-        SAMCOS_SERVICE_KEY  = os.environ.get("SAMCOS_SERVICE_KEY", "")
-        if SAMCOS_SERVICE_KEY:
-            from supabase import create_client as _create_client
-            sc = _create_client(SAMCOS_SUPABASE_URL, SAMCOS_SERVICE_KEY)
+    if sc is not None:
+        try:
             sc.table('context_store').upsert({
                 'key':    'health:github:orion_ap_sync',
                 'value':  datetime.utcnow().isoformat() + 'Z',
                 'domain': 'system',
                 'notes':  (
                     f'delivery_inserted={inserted_delivery} delivery_updated={updated_delivery} '
+                    f'pending_cleared={cleared_pending} escalated={len(escalations)} '
                     f'pc_inserted={inserted_pc} pc_updated={updated_pc} skipped={skipped_total}'
                 ),
             }, on_conflict='key').execute()
             log.info("Health heartbeat sent to SAM COS")
-    except Exception as _e:
-        log.warning(f"Health heartbeat failed (non-critical): {_e}")
+        except Exception as _e:
+            log.warning(f"Health heartbeat failed (non-critical): {_e}")
 
 
 def parse_args():
