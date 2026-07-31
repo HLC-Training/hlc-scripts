@@ -185,8 +185,11 @@ def reason_lines(r: dict, escaped: bool) -> list[str]:
     if not r['reasons']:
         return ["not yet captured"]
     fmt = esc if escaped else (lambda v: v if v not in (None, '') else '—')
+    # ASCII arrow on purpose — same reason as sync_ap.py's divergence
+    # rendering: this string is printed on Windows consoles (cp1252), which
+    # has no glyph for U+2192 and raises UnicodeEncodeError on print().
     return [
-        f"{fmt(e['field'])}: {fmt(e['old_value'])} → {fmt(e['new_value'])} — {fmt(e['reason'])}"
+        f"{fmt(e['field'])}: {fmt(e['old_value'])} -> {fmt(e['new_value'])} — {fmt(e['reason'])}"
         for e in r['reasons']
     ]
 
