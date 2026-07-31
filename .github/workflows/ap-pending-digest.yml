@@ -10,6 +10,10 @@ on:
         required: false
         type: boolean
         default: false
+      to:
+        description: 'Override recipient email (blank = default recipient)'
+        required: false
+        type: string
 
 jobs:
   digest:
@@ -30,4 +34,10 @@ jobs:
         env:
           SUPABASE_SERVICE_KEY: ${{ secrets.ORION_SUPABASE_SERVICE_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-        run: python send_ap_pending_digest.py ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          TO_OVERRIDE: ${{ github.event.inputs.to }}
+        run: |
+          ARGS=()
+          if [ "$DRY_RUN" = "true" ]; then ARGS+=(--dry-run); fi
+          if [ -n "$TO_OVERRIDE" ]; then ARGS+=(--to "$TO_OVERRIDE"); fi
+          python send_ap_pending_digest.py "${ARGS[@]}"
