@@ -1,12 +1,8 @@
 name: ORION AP Sync
 
 on:
-  # schedule disabled 2026-07-31 for AP pending lifecycle step 2 deploy
-  # (migrations + sync + app changes) — Jim approved pausing; the AP
-  # tracker tolerates a day without a sync run. Re-enable once step 2 is
-  # deployed and verified.
-  # schedule:
-  #   - cron: '5,35 * * * *'    # Every 30 minutes, offset to avoid :00/:30 GitHub Actions load spikes
+  schedule:
+    - cron: '5,35 * * * *'    # Every 30 minutes, offset to avoid :00/:30 GitHub Actions load spikes
   workflow_dispatch:            # Manual trigger for testing
 
 jobs:
