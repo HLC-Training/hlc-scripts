@@ -2,7 +2,7 @@ name: ORION AP Pending Digest
 
 on:
   schedule:
-    - cron: '0 12 * * *'    # Daily 12:00 UTC (7:00 AM Houston, CDT)
+    - cron: '0 12 * * 1-5'    # Weekdays 12:00 UTC (7:00 AM Houston, CDT; Mon-Fri)
   workflow_dispatch:            # Manual trigger for testing
     inputs:
       dry_run:

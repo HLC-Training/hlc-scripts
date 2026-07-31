@@ -43,7 +43,7 @@ per-run log reports the joined/unjoined counts.
 
 ### send_ap_pending_digest.py
 **Workflow:** ap-pending-digest.yml
-**Schedule:** Daily 12:00 UTC (7:00 AM Houston, CDT)
+**Schedule:** Weekdays 12:00 UTC (7:00 AM Houston, CDT; Mon-Fri)
 **What it does:** Reads action_items rows flagged `ap_pending_update`
 (PLL edits in ORiON not yet mirrored back to Smartsheet) and emails Jen
 Wright a digest via Resend, with a callout on rows pending more than 14
