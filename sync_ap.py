@@ -421,8 +421,11 @@ def main(dry_run: bool = False):
     # future name collision involves two DIFFERENT people, this silently
     # picks the portal_users one.
     name_to_email = {}
-    # id → name for escalation records (Delivery owners live in users).
+    # id → name for escalation records — Delivery owners live in users,
+    # P&C (TPM) owners live in portal_users; ids are table-scoped uuids so
+    # merging by id carries no collision risk across the two tables.
     id_to_name = {u['id']: u.get('name') for u in users_resp.data}
+    id_to_name.update({p['id']: p.get('name') for p in portal_resp.data})
     for u in users_resp.data:
         if u.get('name') and u.get('email'):
             name_to_email[u['name'].strip().lower()] = u['email'].strip().lower()
@@ -461,7 +464,7 @@ def main(dry_run: bool = False):
     # Load existing P&C (pc_projects) rows keyed by ap_number
     try:
         existing_pc_resp = db.table('pc_projects') \
-            .select('id, ap_number, owner_id, title, description, status, category, start_date, target_end_date, target_date_moves') \
+            .select('id, ap_number, owner_id, title, description, status, category, start_date, target_end_date, target_date_moves, ap_pending_update, ap_pending_since') \
             .eq('source', 'ap_synced') \
             .execute()
         existing_pc = {
@@ -479,6 +482,7 @@ def main(dry_run: bool = False):
     to_clear_pending   = []  # list of (id, ap_number) — Smartsheet caught up, clear flag only
     to_insert_pc       = []
     to_update_pc       = []  # list of (id, fields_to_update, ap_number)
+    to_clear_pending_pc = []  # list of (id, ap_number) — Smartsheet caught up, clear flag only
     escalations        = []  # pending > ESCALATION_DAYS and still diverging
 
     skipped_no_ap        = 0
@@ -494,13 +498,20 @@ def main(dry_run: bool = False):
     for task in tasks:
         ap_num = task['ap_number']
 
-        # Inactive rows exist ONLY to settle a pending Delivery flag. Anything
-        # else — new rows, P&C rows, unflagged rows — is dropped here exactly
+        # Inactive rows exist ONLY to settle a pending Delivery or P&C flag.
+        # Anything else — new rows, unflagged rows — is dropped here exactly
         # as if it had never been fetched (no counters, no logs), so behavior
         # for non-pending rows is byte-identical to the old active-only fetch.
+        # Each destination branch below re-checks its own table's pending
+        # flag before doing anything with an inactive row — this top-level
+        # check only decides whether the row is worth resolving a lead for
+        # at all; it must not be trusted alone to prevent an inactive insert,
+        # since destination is resolved fresh per row and could in principle
+        # land on the table that ISN'T the one holding the pending flag.
         if not task['active']:
-            ex_check = existing_delivery.get(ap_num)
-            if not ex_check or not ex_check.get('ap_pending_update'):
+            delivery_pending = bool(existing_delivery.get(ap_num, {}).get('ap_pending_update'))
+            pc_pending = bool(existing_pc.get(ap_num, {}).get('ap_pending_update'))
+            if not delivery_pending and not pc_pending:
                 continue
 
         if not ap_num or not task['action_text']:
@@ -592,6 +603,7 @@ def main(dry_run: bool = False):
                                 f"{k}: {ex.get(k)!r} -> {v!r}" for k, v in fields.items()
                             )
                             escalations.append({
+                                'module':       'delivery',
                                 'ap_number':    ap_num,
                                 'owner':        id_to_name.get(ex.get('owner_id')) or lead_display_for_log,
                                 'days_flagged': round(pending_days),
@@ -638,10 +650,11 @@ def main(dry_run: bool = False):
                     print(f"[DRY RUN] INSERT   {ap_num:14} delivery — owner {owner_id}, status {status}")
 
         elif destination == 'pc':
-            # Inactive rows are fetched solely to settle Delivery pending
-            # flags — even if the Lead now resolves to a TPM, an inactive row
-            # must never create or modify a P&C project.
-            if not task['active']:
+            # Inactive rows are fetched solely to settle a pending Delivery
+            # or P&C flag (see the top-level filter above) — an inactive row
+            # that isn't itself a pending P&C row must never create or
+            # modify a P&C project, even if the Lead now resolves to a TPM.
+            if not task['active'] and not existing_pc.get(ap_num, {}).get('ap_pending_update'):
                 continue
 
             pc_status = PC_STATUS_MAP.get(task['status_raw'])
@@ -650,6 +663,10 @@ def main(dry_run: bool = False):
 
             if ap_num in existing_pc:
                 ex = existing_pc[ap_num]
+
+                # Field diff runs BEFORE the pending check — same discipline
+                # as Delivery (572a1936): the reset condition and the update
+                # condition share one fields dict so they can't drift apart.
                 fields = {}
                 if owner_id != ex.get('owner_id'):
                     fields['owner_id'] = owner_id
@@ -672,6 +689,40 @@ def main(dry_run: bool = False):
                     fields['target_date_moves'] = (ex.get('target_date_moves') or 0) + 1
                 # priority is intentionally NOT re-forced here — Michele re-tiers
                 # P&C items in the UI and that choice should stick between syncs.
+
+                if ex.get('ap_pending_update'):
+                    if not fields:
+                        # Smartsheet caught up — clear the flag, touch nothing else.
+                        to_clear_pending_pc.append((ex['id'], ap_num))
+                        log.info(f"{ap_num}: Smartsheet caught up (P&C) — clearing ap_pending_update")
+                        if dry_run:
+                            print(f"[DRY RUN] CLEAR    {ap_num:14} P&C      — Smartsheet caught up, pending flag cleared")
+                    else:
+                        # Still diverging — keep protecting the TPM's change.
+                        skipped_pending += 1
+                        log.info(f"Skipping {ap_num} — P&C pending update awaiting Smartsheet change")
+                        if dry_run:
+                            print(f"[DRY RUN] SKIP     {ap_num:14} P&C      — pending update awaiting Smartsheet change")
+                        pending_days = days_since(ex.get('ap_pending_since'))
+                        if pending_days is not None and pending_days > ESCALATION_DAYS:
+                            divergence = ", ".join(
+                                f"{k}: {ex.get(k)!r} -> {v!r}" for k, v in fields.items()
+                            )
+                            escalations.append({
+                                'module':       'pc',
+                                'ap_number':    ap_num,
+                                'owner':        id_to_name.get(ex.get('owner_id')) or lead_display_for_log,
+                                'days_flagged': round(pending_days),
+                                'divergence':   divergence,
+                            })
+                            log.warning(
+                                f"ESCALATED: {ap_num} (P&C) pending {round(pending_days)}d "
+                                f"(> {ESCALATION_DAYS}d) and still diverging — {divergence}"
+                            )
+                            if dry_run:
+                                print(f"[DRY RUN] ESCALATE {ap_num:14} P&C      — pending {round(pending_days)}d, {divergence}")
+                    continue
+
                 if fields:
                     fields['updated_at'] = datetime.now(timezone.utc).isoformat()
                     to_update_pc.append((ex['id'], fields, ap_num))
@@ -712,7 +763,8 @@ def main(dry_run: bool = False):
             f"would clear pending flag: {len(to_clear_pending)}"
         )
         pc_summary = (
-            f"P&C      — would insert: {len(to_insert_pc)}, would update: {len(to_update_pc)}"
+            f"P&C      — would insert: {len(to_insert_pc)}, would update: {len(to_update_pc)}, "
+            f"would clear pending flag: {len(to_clear_pending_pc)}"
         )
         skip_summary = (
             f"Skipped  — no AP#/text: {skipped_no_ap}, unmapped lead: {skipped_unmapped}, "
@@ -732,7 +784,7 @@ def main(dry_run: bool = False):
         if escalations:
             print(f"Escalated ({len(escalations)}) — pending > {ESCALATION_DAYS} days and still diverging:")
             for e in escalations:
-                print(f"  {e['ap_number']:14} {e['days_flagged']:>3}d  {e['owner']}  — {e['divergence']}")
+                print(f"  [{e['module']:8}] {e['ap_number']:14} {e['days_flagged']:>3}d  {e['owner']}  — {e['divergence']}")
         print("-" * 72)
         print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | DRY RUN complete — no writes were made.")
         return
@@ -789,6 +841,19 @@ def main(dry_run: bool = False):
         except Exception as e:
             log.error(f"P&C update failed for {ap_num}: {e}")
 
+    # Clear settled P&C pending flags — same discipline as Delivery: only
+    # the flag lifecycle changes, nothing else on the row.
+    cleared_pending_pc = 0
+    for item_id, ap_num in to_clear_pending_pc:
+        try:
+            db.table('pc_projects') \
+                .update({'ap_pending_update': False, 'ap_pending_since': None}) \
+                .eq('id', item_id) \
+                .execute()
+            cleared_pending_pc += 1
+        except Exception as e:
+            log.error(f"P&C pending-flag clear failed for {ap_num}: {e}")
+
     # Check for WIP overages caused by new Delivery inserts (Delivery only)
     if inserted_delivery > 0:
         new_owner_ids = {item['owner_id'] for item in to_insert_delivery[:inserted_delivery]}
@@ -826,7 +891,8 @@ def main(dry_run: bool = False):
         f"{now} | AP sync complete — "
         f"Delivery: inserted {inserted_delivery}, updated {updated_delivery}, "
         f"pending cleared {cleared_pending} | "
-        f"P&C: inserted {inserted_pc}, updated {updated_pc} | "
+        f"P&C: inserted {inserted_pc}, updated {updated_pc}, "
+        f"pending cleared {cleared_pending_pc} | "
         f"skipped: {skipped_total}, "
         f"pending Smartsheet updates: {len(pending)}, "
         f"escalated: {len(escalations)}, "
@@ -874,9 +940,9 @@ def main(dry_run: bool = False):
                 }),
                 'domain': 'work',
                 'notes':  (
-                    f'{len(escalations)} ap_import row(s) flagged ap_pending_update for '
-                    f'> {ESCALATION_DAYS} days and still diverging from Smartsheet. '
-                    f'Written by sync_ap.py every run.'
+                    f'{len(escalations)} row(s) (Delivery action_items or P&C pc_projects) '
+                    f'flagged ap_pending_update for > {ESCALATION_DAYS} days and still '
+                    f'diverging from Smartsheet. Written by sync_ap.py every run.'
                 ),
             }, on_conflict='key').execute()
             log.info(f"Escalation record written to SAM COS ({len(escalations)} row(s))")
@@ -884,7 +950,7 @@ def main(dry_run: bool = False):
             if current_aps != stored_aps:
                 if escalations:
                     lines = [
-                        f"{e['ap_number']} ({e['days_flagged']}d, {e['owner']}) — {e['divergence']}"
+                        f"[{e['module']}] {e['ap_number']} ({e['days_flagged']}d, {e['owner']}) — {e['divergence']}"
                         for e in escalations
                     ]
                     message = (
@@ -911,8 +977,9 @@ def main(dry_run: bool = False):
                 'domain': 'system',
                 'notes':  (
                     f'delivery_inserted={inserted_delivery} delivery_updated={updated_delivery} '
-                    f'pending_cleared={cleared_pending} escalated={len(escalations)} '
-                    f'pc_inserted={inserted_pc} pc_updated={updated_pc} skipped={skipped_total}'
+                    f'delivery_pending_cleared={cleared_pending} escalated={len(escalations)} '
+                    f'pc_inserted={inserted_pc} pc_updated={updated_pc} '
+                    f'pc_pending_cleared={cleared_pending_pc} skipped={skipped_total}'
                 ),
             }, on_conflict='key').execute()
             log.info("Health heartbeat sent to SAM COS")
