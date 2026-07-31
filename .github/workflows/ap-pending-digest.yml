@@ -1,0 +1,33 @@
+name: ORION AP Pending Digest
+
+on:
+  schedule:
+    - cron: '0 12 * * *'    # Daily 12:00 UTC (7:00 AM Houston, CDT)
+  workflow_dispatch:            # Manual trigger for testing
+    inputs:
+      dry_run:
+        description: 'Dry run (render only, do not send)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install supabase requests
+
+      - name: Send digest
+        env:
+          SUPABASE_SERVICE_KEY: ${{ secrets.ORION_SUPABASE_SERVICE_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+        run: python send_ap_pending_digest.py ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}

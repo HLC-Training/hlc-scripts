@@ -41,6 +41,21 @@ per-run log reports the joined/unjoined counts.
 - Training Modernization Tracker: `3204043720576900`
 - Exams Transfer Tracker: `8868469282918276`
 
+### send_ap_pending_digest.py
+**Workflow:** ap-pending-digest.yml
+**Schedule:** Daily 12:00 UTC (7:00 AM Houston, CDT)
+**What it does:** Reads action_items rows flagged `ap_pending_update`
+(PLL edits in ORiON not yet mirrored back to Smartsheet) and emails Jen
+Wright a digest via Resend, with a callout on rows pending more than 14
+days. Sends nothing when zero rows are flagged. Delivery-only in v1 —
+see `orion/knowledge/decisions/2026-07-31-ap-lifecycle-step2-design.md`
+for the reason-capture/P&C-parity follow-up. Run with `--dry-run` to
+render without sending, or `--to <email>` to override the recipient.
+
+**Secrets required:**
+- `ORION_SUPABASE_SERVICE_KEY`
+- `RESEND_API_KEY`
+
 ### keepalive.yml
 Weekly no-op run (Mondays 12:00 UTC) to keep scheduled workflows from being
 paused by GitHub's inactivity rules.
