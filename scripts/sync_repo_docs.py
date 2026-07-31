@@ -22,8 +22,10 @@ Schedule: GitHub Actions, on push to main + workflow_dispatch (backfill).
 
 import argparse
 import glob
+import hashlib
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 SYNC_PATHS = [
@@ -47,6 +49,28 @@ def find_docs(root: Path) -> dict:
             rel = path.relative_to(root).as_posix()
             matched[rel] = path
     return matched
+
+
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def record_sync_meta(client, repo: str, root: Path) -> None:
+    """Hash this script and its workflow as they exist on disk in this checkout,
+    and upsert one row into repo_sync_meta. Reports what is actually running,
+    same principle as commit_sha — never fails the doc sync it rides along with.
+    """
+    try:
+        script_sha = sha256_file(Path(__file__).resolve())
+        workflow_sha = sha256_file(root / ".github" / "workflows" / "sync-repo-docs.yml")
+        client.table("repo_sync_meta").upsert({
+            "repo": repo,
+            "script_sha": script_sha,
+            "workflow_sha": workflow_sha,
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="repo").execute()
+    except Exception as exc:
+        print(f"::warning::Failed to record repo_sync_meta for {repo}: {exc}")
 
 
 def build_rows(matched: dict, repo: str, commit_sha: str):
@@ -140,6 +164,8 @@ def main():
             failed = True
 
     print(f"{repo}: {len(rows)} synced, {len(stale)} deleted, {len(skipped)} skipped, commit {github_sha[:12]}")
+
+    record_sync_meta(client, repo, root)
 
     if failed:
         sys.exit(1)
