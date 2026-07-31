@@ -2,29 +2,31 @@
 """
 send_ap_pending_digest.py
 ─────────────────────────────────────────────────────────────────
-Daily digest to Jen Wright of AP rows flagged ap_pending_update — PLL
+Daily digest to Jen Wright of AP rows flagged ap_pending_update — PLL/TPM
 edits in ORiON that sync_ap.py has not yet seen the matching Smartsheet
 change for. Closes SAM COS bug 4e36b85d (JENNIFER_EMAIL defined and
 never used).
 
 Flow:
-  - Reads action_items where source = 'ap_import' AND
-    ap_pending_update = true from ORiON Supabase. Read-only — never
-    writes to action_items or Smartsheet. Delivery-only in v1;
-    pc_projects has no pending columns until AP lifecycle step 2 (see
-    orion/knowledge/decisions/2026-07-31-ap-lifecycle-step2-design.md).
-  - Zero flagged rows → exits without sending (daily cadence is the
-    dedup; no additional state needed).
+  - Reads flagged rows from BOTH action_items (source = 'ap_import',
+    module 'delivery') and pc_projects (module 'pc') — AP lifecycle step 2
+    gave pc_projects the same ap_pending_update/ap_pending_since columns.
+    Read-only — never writes to action_items, pc_projects, or Smartsheet.
+  - Zero flagged rows across both modules → exits without sending (daily
+    cadence is the dedup; no additional state needed).
   - Rows pending more than AGE_CALLOUT_DAYS get a visible callout.
-  - The change-log/reason table doesn't exist yet (step 2) — each row
-    shows a "Reason: not yet captured" placeholder so the template
-    doesn't need a rewrite once reasons exist.
-  - Sent via Resend (same endpoint/from-address as orion/lib/resend.ts).
+  - Reasons come from ap_change_log: for each flagged row, entries where
+    changed_at >= ap_pending_since (i.e. written during the CURRENT flag
+    episode — a cleared-then-re-flagged row's old entries don't leak into
+    the new one). A row with zero matching entries — a pre-step-2 flag, or
+    a flag set before reason-capture shipped — keeps the "not yet
+    captured" placeholder.
+  - Sent via Resend (same endpoint/from-address as orion-pll/lib/resend.ts).
     A send failure raises and fails the job — a missed daily digest
     should page, not vanish silently.
 
 Schedule: GitHub Actions (.github/workflows/ap-pending-digest.yml) —
-daily 12:00 UTC (7:00 AM Houston, CDT).
+weekdays 12:00 UTC (7:00 AM Houston, CDT).
 ─────────────────────────────────────────────────────────────────
 """
 
@@ -74,20 +76,70 @@ log = logging.getLogger(__name__)
 
 
 # ─── DATA ───────────────────────────────────────────────────────
-def fetch_pending_rows(db) -> list[dict]:
+def fetch_pending_delivery_rows(db) -> list[dict]:
     resp = db.table('action_items') \
-        .select('ap_number, action_text, status, due_date, original_due_date, ap_pending_since, owner_id') \
+        .select('id, ap_number, action_text, status, due_date, original_due_date, ap_pending_since, owner_id') \
         .eq('source', 'ap_import') \
         .eq('ap_pending_update', True) \
         .execute()
-    return resp.data or []
+    rows = resp.data or []
+    for r in rows:
+        r['module'] = 'delivery'
+    return rows
 
 
-def fetch_owner_names(db, owner_ids: set) -> dict:
-    if not owner_ids:
+def fetch_pending_pc_rows(db) -> list[dict]:
+    # pc_projects has no due_date/original_due_date — its schema (see
+    # sync_ap.py's P&C insert/update payloads) uses target_end_date /
+    # original_target_date. Normalized into the same due_date/
+    # original_due_date keys here so downstream rendering is module-agnostic.
+    resp = db.table('pc_projects') \
+        .select('id, ap_number, title, status, target_end_date, original_target_date, ap_pending_since, owner_id') \
+        .eq('ap_pending_update', True) \
+        .execute()
+    rows = resp.data or []
+    for r in rows:
+        r['module']            = 'pc'
+        r['action_text']       = r.pop('title')
+        r['due_date']          = r.pop('target_end_date')
+        r['original_due_date'] = r.pop('original_target_date')
+    return rows
+
+
+def fetch_owner_names(db, delivery_owner_ids: set, pc_owner_ids: set) -> dict:
+    # users and portal_users are different tables with table-scoped uuids —
+    # merging by id carries no collision risk.
+    names = {}
+    if delivery_owner_ids:
+        resp = db.table('users').select('id, name').in_('id', list(delivery_owner_ids)).execute()
+        names.update({u['id']: u['name'] for u in resp.data or []})
+    if pc_owner_ids:
+        resp = db.table('portal_users').select('id, name').in_('id', list(pc_owner_ids)).execute()
+        names.update({u['id']: u['name'] for u in resp.data or []})
+    return names
+
+
+def fetch_change_log_reasons(db, rows: list[dict]) -> dict:
+    """item_id -> list of change-log entries, each restricted to this row's
+    CURRENT flag episode (changed_at >= that row's ap_pending_since)."""
+    ids = [r['id'] for r in rows]
+    if not ids:
         return {}
-    resp = db.table('users').select('id, name').in_('id', list(owner_ids)).execute()
-    return {u['id']: u['name'] for u in resp.data or []}
+    resp = db.table('ap_change_log').select('*').in_('item_id', ids).order('changed_at').execute()
+    by_item: dict = {}
+    for entry in (resp.data or []):
+        by_item.setdefault(entry['item_id'], []).append(entry)
+
+    since_by_item = {r['id']: r.get('ap_pending_since') for r in rows}
+    out = {}
+    for item_id, entries in by_item.items():
+        since = since_by_item.get(item_id)
+        if not since:
+            out[item_id] = entries
+            continue
+        since_ts = parse_timestamp(since)
+        out[item_id] = [e for e in entries if parse_timestamp(e['changed_at']) >= since_ts]
+    return out
 
 
 def parse_timestamp(raw: str) -> datetime:
@@ -97,7 +149,7 @@ def parse_timestamp(raw: str) -> datetime:
     return ts
 
 
-def enrich_rows(rows: list[dict], owner_names: dict) -> list[dict]:
+def enrich_rows(rows: list[dict], owner_names: dict, reasons_by_item: dict) -> list[dict]:
     now = datetime.now(timezone.utc)
     enriched = []
     for r in rows:
@@ -109,6 +161,7 @@ def enrich_rows(rows: list[dict], owner_names: dict) -> list[dict]:
             'pending_since': pending_since,
             'age_days':      age_days,
             'flagged':       age_days is not None and age_days > AGE_CALLOUT_DAYS,
+            'reasons':       reasons_by_item.get(r['id'], []),
         })
     # Oldest (most overdue) first — the rows most in need of attention lead.
     enriched.sort(key=lambda r: r['age_days'] if r['age_days'] is not None else -1, reverse=True)
@@ -124,6 +177,20 @@ def build_subject(count: int) -> str:
     return f"ORiON — AP updates pending your review ({count} item{'s' if count != 1 else ''})"
 
 
+def module_label(module: str) -> str:
+    return "P&C" if module == 'pc' else "Delivery"
+
+
+def reason_lines(r: dict, escaped: bool) -> list[str]:
+    if not r['reasons']:
+        return ["not yet captured"]
+    fmt = esc if escaped else (lambda v: v if v not in (None, '') else '—')
+    return [
+        f"{fmt(e['field'])}: {fmt(e['old_value'])} → {fmt(e['new_value'])} — {fmt(e['reason'])}"
+        for e in r['reasons']
+    ]
+
+
 def build_html_body(rows: list[dict]) -> str:
     intro = (
         f"<p>{len(rows)} AP item(s) have been edited in ORiON and are "
@@ -131,7 +198,7 @@ def build_html_body(rows: list[dict]) -> str:
     )
     header = (
         "<tr>"
-        "<th>AP #</th><th>Action</th><th>Status</th><th>Owner</th>"
+        "<th>Module</th><th>AP #</th><th>Action</th><th>Status</th><th>Owner</th>"
         "<th>Due Date</th><th>Orig. Due</th><th>Pending Since</th>"
         "<th>Age</th><th>Reason</th>"
         "</tr>"
@@ -142,8 +209,10 @@ def build_html_body(rows: list[dict]) -> str:
         if r['flagged']:
             age_cell += " ⚠"
         pending_since_str = r['pending_since'].strftime('%Y-%m-%d') if r['pending_since'] else '—'
+        reason_cell = "<br>".join(reason_lines(r, escaped=True))
         body_rows.append(
             "<tr>"
+            f"<td>{esc(module_label(r['module']))}</td>"
             f"<td>{esc(r['ap_number'])}</td>"
             f"<td>{esc(r['action_text'])}</td>"
             f"<td>{esc(r['status'])}</td>"
@@ -152,7 +221,7 @@ def build_html_body(rows: list[dict]) -> str:
             f"<td>{esc(r['original_due_date'])}</td>"
             f"<td>{esc(pending_since_str)}</td>"
             f"<td>{age_cell}</td>"
-            f"<td>not yet captured</td>"
+            f"<td>{reason_cell}</td>"
             "</tr>"
         )
     table = (
@@ -179,14 +248,15 @@ def build_text_body(rows: list[dict]) -> str:
         pending_since_str = r['pending_since'].strftime('%Y-%m-%d') if r['pending_since'] else '—'
         age_str = f"{r['age_days']} days" if r['age_days'] is not None else 'unknown'
         callout = f" — OVER {AGE_CALLOUT_DAYS} DAYS" if r['flagged'] else ""
-        lines.append(f"{r['ap_number']} — {r['action_text']}")
+        lines.append(f"[{module_label(r['module'])}] {r['ap_number']} — {r['action_text']}")
         lines.append(
             f"  Status: {r['status'] or '—'} | Owner: {r['owner_name']} | "
             f"Due: {r['due_date'] or '—'}"
             + (f" (orig: {r['original_due_date']})" if r['original_due_date'] else "")
         )
         lines.append(f"  Pending since: {pending_since_str} ({age_str}){callout}")
-        lines.append("  Reason: not yet captured")
+        for rl in reason_lines(r, escaped=False):
+            lines.append(f"  Reason: {rl}")
         lines.append("")
     return "\n".join(lines)
 
@@ -237,15 +307,19 @@ def main():
     args = parse_args()
     db = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-    rows = fetch_pending_rows(db)
+    delivery_rows = fetch_pending_delivery_rows(db)
+    pc_rows = fetch_pending_pc_rows(db)
+    rows = delivery_rows + pc_rows
     if not rows:
-        log.info("No AP rows flagged ap_pending_update — nothing to send.")
+        log.info("No AP rows flagged ap_pending_update (Delivery or P&C) — nothing to send.")
         print("No flagged rows — digest skipped.")
         return
 
-    owner_ids = {r['owner_id'] for r in rows if r.get('owner_id')}
-    owner_names = fetch_owner_names(db, owner_ids)
-    enriched = enrich_rows(rows, owner_names)
+    delivery_owner_ids = {r['owner_id'] for r in delivery_rows if r.get('owner_id')}
+    pc_owner_ids = {r['owner_id'] for r in pc_rows if r.get('owner_id')}
+    owner_names = fetch_owner_names(db, delivery_owner_ids, pc_owner_ids)
+    reasons_by_item = fetch_change_log_reasons(db, rows)
+    enriched = enrich_rows(rows, owner_names, reasons_by_item)
 
     subject = build_subject(len(enriched))
     html_body = build_html_body(enriched)
