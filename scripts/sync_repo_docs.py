@@ -76,6 +76,12 @@ def record_sync_meta(client, repo: str, root: Path) -> None:
 def build_rows(matched: dict, repo: str, commit_sha: str):
     rows = []
     skipped = []
+    # updated_at is set explicitly on every row (not left to the column's
+    # DEFAULT now()) — bug d2215a97: an upsert's ON CONFLICT DO UPDATE does
+    # not re-invoke a column default unless the column is named in the
+    # payload, so content/commit_sha were changing on update while
+    # updated_at stayed frozen at the original insert time.
+    synced_at = datetime.now(timezone.utc).isoformat()
     for doc_name, path in sorted(matched.items()):
         size = path.stat().st_size
         if size > MAX_BYTES:
@@ -87,6 +93,7 @@ def build_rows(matched: dict, repo: str, commit_sha: str):
             "doc_name": doc_name,
             "content": content,
             "commit_sha": commit_sha,
+            "updated_at": synced_at,
         })
     return rows, skipped
 
