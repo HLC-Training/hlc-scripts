@@ -60,3 +60,28 @@ Multi-statement queries through Supabase MCP parse unreliably. Split them.
 
 `vault_write_queue` inserts go one row per file at a time. Concurrent inserts
 fire webhooks that clobber each other. Verify status before the next insert.
+
+## 2026-08-03 — Generic Supabase key names are a repo-wide pattern, not a one-script bug
+
+Fixed `sync_ap.py`'s Smartsheet-fetch-failure exit code (`sys.exit(1)`
+instead of a silent `return`, closing the "exit 0 on a failed fetch" lesson
+above) and renamed its `SUPABASE_SERVICE_KEY` read to
+`ORION_SUPABASE_SERVICE_KEY` (bug 306cea89) — the generic name risked
+resolving to the wrong project's key if ever set at Windows User scope on
+HERMES across the three-project Supabase estate (this ORiON project, SAM
+COS, GreenThumb). `sync-ap.yml`'s secret was already named
+`ORION_SUPABASE_SERVICE_KEY` at the repo level; only the env var mapping
+inside the workflow needed to stop renaming it on the way in.
+
+While checking for a naming convention to match, found `sync_xyleme.py` and
+`send_ap_pending_digest.py` read the exact same generic
+`SUPABASE_SERVICE_KEY` name for this same ORiON project — same collision
+risk, not fixed this session (out of the scoped bug). Worth its own
+follow-up rather than assuming a fix in one script covers the pattern.
+
+Also added a started-class heartbeat (`health:github:orion_ap_sync:last_run`,
+written unconditionally before the Smartsheet fetch) alongside the existing
+completion heartbeat (`health:github:orion_ap_sync`, unchanged, written only
+at the end of a fully successful run) — mirrors the email-scan routine's
+`last_run`/`last_success` split so "started" and "succeeded" stay two
+different signals here too.
