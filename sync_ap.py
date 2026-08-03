@@ -33,6 +33,7 @@ Schedule: GitHub Actions (.github/workflows/sync-ap.yml) — every 30 min.
 """
 
 import os
+import sys
 import json
 import uuid
 import logging
@@ -44,7 +45,12 @@ from supabase import create_client
 
 # ─── CONFIG ─────────────────────────────────────────────────────
 SUPABASE_URL         = "https://czdkctjbejnwuopigxta.supabase.co"
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+# Project-scoped name (closes bug 306cea89) — the generic "SUPABASE_SERVICE_KEY"
+# risked resolving to the wrong project's key if ever set at Windows User scope
+# on HERMES (machine-wide) for a local run, across a three-project Supabase
+# estate (this ORiON project, SAM COS, GreenThumb). Matches the SAMCOS_SERVICE_KEY
+# naming convention already used below for the SAM COS client.
+ORION_SUPABASE_SERVICE_KEY = os.environ.get("ORION_SUPABASE_SERVICE_KEY", "")
 SMARTSHEET_TOKEN     = os.environ.get("SMARTSHEET_API_TOKEN", "")
 
 SHEET_ID     = "1362792971980676"
@@ -59,8 +65,8 @@ SAMCOS_SUPABASE_URL = "https://hucrkbomqsxpmokgypxg.supabase.co"
 
 LOG_FILE = Path(__file__).parent / "sync_ap.log"
 
-if not SUPABASE_SERVICE_KEY:
-    raise SystemExit("ERROR: SUPABASE_SERVICE_KEY environment variable is not set.")
+if not ORION_SUPABASE_SERVICE_KEY:
+    raise SystemExit("ERROR: ORION_SUPABASE_SERVICE_KEY environment variable is not set.")
 if not SMARTSHEET_TOKEN:
     raise SystemExit("ERROR: SMARTSHEET_API_TOKEN environment variable is not set.")
 
@@ -357,9 +363,31 @@ def main(dry_run: bool = False):
     if dry_run:
         print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | DRY RUN — no Supabase writes will be made.")
 
+    # ── SAM COS client + STARTED heartbeat (unconditional, top of routine) ──
+    # Written before any Smartsheet/ORiON work is attempted, mirroring the
+    # email-scan routine's last_run/last_success split (2026-07-17 lesson: a
+    # cross-run signal that must fire "every run" belongs as close to the top
+    # as possible, not after work that can fail or exit early). The completion
+    # heartbeat (health:github:orion_ap_sync) at the bottom of this function is
+    # unchanged and is the success-class signal the health dashboard keys on;
+    # this is its started-class counterpart.
+    sc = None
+    SAMCOS_SERVICE_KEY = os.environ.get("SAMCOS_SERVICE_KEY", "")
+    if SAMCOS_SERVICE_KEY and not dry_run:
+        try:
+            sc = create_client(SAMCOS_SUPABASE_URL, SAMCOS_SERVICE_KEY)
+            sc.table('context_store').upsert({
+                'key':    'health:github:orion_ap_sync:last_run',
+                'value':  datetime.now(timezone.utc).isoformat(),
+                'domain': 'system',
+                'notes':  'Run started — written before Smartsheet fetch, unconditional (proves a run began, not that it finished).',
+            }, on_conflict='key').execute()
+        except Exception as _e:
+            log.warning(f"SAM COS client init / started heartbeat failed (non-critical): {_e}")
+
     # Connect to Supabase
     try:
-        db = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        db = create_client(SUPABASE_URL, ORION_SUPABASE_SERVICE_KEY)
         log.info("Supabase connected")
     except Exception as e:
         log.error(f"Supabase connection failed: {e}")
@@ -437,8 +465,15 @@ def main(dry_run: bool = False):
     try:
         tasks = fetch_child_ap_tasks()
     except Exception as e:
+        # Exit non-zero (closes bug 306cea89 / lessons.md "exit 0 on a failed
+        # fetch is a lie the whole system believes") — a plain `return` here
+        # exits the process with code 0, so a Smartsheet outage produced a
+        # green GitHub Actions run that synced nothing. No success heartbeat
+        # is reachable from this path either way (it lives at the very end
+        # of this function, well past this return), so the fix is the exit
+        # code the CI run reports, not a heartbeat change.
         log.error(f"Smartsheet fetch failed: {e}")
-        return
+        sys.exit(1)
 
     if not tasks:
         log.info("No active AP tasks found.")
@@ -901,14 +936,9 @@ def main(dry_run: bool = False):
     log.info(summary)
     print(summary)
 
-    # ── SAM COS client (escalation record + health heartbeat) ───
-    sc = None
-    SAMCOS_SERVICE_KEY = os.environ.get("SAMCOS_SERVICE_KEY", "")
-    if SAMCOS_SERVICE_KEY:
-        try:
-            sc = create_client(SAMCOS_SUPABASE_URL, SAMCOS_SERVICE_KEY)
-        except Exception as _e:
-            log.warning(f"SAM COS client init failed (non-critical): {_e}")
+    # `sc` (SAM COS client) was already created at the top of this function
+    # for the started heartbeat — reused here for the escalation record and
+    # completion heartbeat rather than recreated.
 
     # ── Escalation record + Pushover page → SAM COS ─────────────
     # context_store[ESCALATION_KEY] always mirrors the CURRENT escalated set —
