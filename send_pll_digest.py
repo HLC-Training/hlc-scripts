@@ -59,6 +59,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from supabase import create_client
 
+from ge_holidays import HOLIDAYS, send_decision
+
 # ─── CONFIG ─────────────────────────────────────────────────────
 SUPABASE_URL = "https://czdkctjbejnwuopigxta.supabase.co"
 # ORION_-prefixed on purpose — the generic SUPABASE_SERVICE_KEY name risks
@@ -78,23 +80,10 @@ DUE_SOON_DAYS   = 14
 OVERDUE_CAP     = 5
 FALLBACK_WINDOW_HOURS = 72   # first run ever: no watermark row yet
 
-# FieldCore US Staff/RETX 2026 calendar (sam-drop). HARDCODED for 2026 —
-# refresh this list for 2027 before the year turns.
-HOLIDAYS = {
-    date(2026, 1, 1),    # New Year's Day
-    date(2026, 1, 19),   # Martin Luther King Jr. Day
-    date(2026, 2, 16),   # Presidents Day
-    date(2026, 4, 3),    # Good Friday
-    date(2026, 5, 25),   # Memorial Day
-    date(2026, 6, 19),   # Juneteenth
-    date(2026, 7, 3),    # Independence Day (observed)
-    date(2026, 9, 7),    # Labor Day
-    date(2026, 11, 11),  # Veterans Day
-    date(2026, 11, 26),  # Thanksgiving Day
-    date(2026, 11, 27),  # Day After Thanksgiving
-    date(2026, 12, 24),  # Christmas Eve
-    date(2026, 12, 25),  # Christmas Day
-}
+# HOLIDAYS + the weekday/holiday gate live in ge_holidays.py — shared with
+# send_tpm_digest.py (factored out 2026-08-05, see
+# knowledge/decisions/2026-08-05-tpm-daily-digest.md). Refresh HOLIDAYS
+# for 2027 before the year turns.
 
 # Brand values from orion-pll app/styles/vernova-tokens.css + orion-tokens.css.
 # Ion Blue is identity/accent only — status meaning belongs to RAG.
@@ -124,16 +113,6 @@ _console.setFormatter(logging.Formatter(
     '%(asctime)s | %(levelname)s | %(message)s', '%Y-%m-%d %H:%M:%S'))
 logging.getLogger().addHandler(_console)
 log = logging.getLogger(__name__)
-
-
-# ─── DATE GATE ──────────────────────────────────────────────────
-def send_decision(d: date) -> tuple[bool, str]:
-    """Weekday + holiday gate on a Chicago-local date."""
-    if d.weekday() >= 5:
-        return False, f"{d} is a {d.strftime('%A')} — weekend, no send."
-    if d in HOLIDAYS:
-        return False, f"{d} is a GE Vernova 2026 holiday — no send."
-    return True, f"{d} is an ordinary weekday — send."
 
 
 # ─── DATA (all reads; any failure must end the run non-zero) ────

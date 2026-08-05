@@ -1,0 +1,57 @@
+name: ORION TPM P&C Daily Digest
+
+on:
+  schedule:
+    # 11:21 UTC weekdays = 6:21 AM America/Chicago during CDT (5:21 CST).
+    # Minute 21 on purpose: distinct from every other cron slot in this
+    # repo (PLL digest :07, AP sync :13/:43, xyleme :17/:47, :00/:30 are
+    # the contended Actions slots per tasks/lessons.md) so this job and
+    # the PLL digest never contend for the same slot. The in-script gate
+    # re-checks weekday + GE Vernova holidays on the Chicago date, so a
+    # delayed or duplicate firing stays safe.
+    - cron: '21 11 * * 1-5'
+  workflow_dispatch:            # Manual trigger for testing
+    inputs:
+      dry_run:
+        description: 'Dry run (render only, do not send)'
+        required: false
+        type: boolean
+        default: false
+      force_date_gate:
+        description: 'Bypass the weekday/holiday gate (manual tests)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install supabase requests tzdata
+
+      - name: Send digest
+        env:
+          ORION_SUPABASE_SERVICE_KEY: ${{ secrets.ORION_SUPABASE_SERVICE_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          # LIVE ROLLOUT SWITCH — deliberately absent. Per Jim (2026-08-05,
+          # action item c5cf4442) this digest stays in TEST mode
+          # indefinitely, even after verification, until P&C's non-AP
+          # import + launch. SEPARATE variable from the PLL digest's
+          # PLL_DIGEST_LIVE — do not reuse or alias it.
+          TPM_DIGEST_LIVE: ${{ vars.TPM_DIGEST_LIVE }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          FORCE_DATE_GATE: ${{ github.event.inputs.force_date_gate }}
+        run: |
+          ARGS=()
+          if [ "$DRY_RUN" = "true" ]; then ARGS+=(--dry-run); fi
+          if [ "$FORCE_DATE_GATE" = "true" ]; then ARGS+=(--force-date-gate); fi
+          python send_tpm_digest.py "${ARGS[@]}"
