@@ -104,3 +104,29 @@ Python's `zoneinfo` raises `ZoneInfoNotFoundError` on Windows unless the
 back on. Ubuntu runners mask this. Any script using `ZoneInfo(...)` must
 list `tzdata` in its install line or it works in CI and dies on HERMES/
 ARGUS.
+
+## 2026-08-05 — a timestamptz insert column beats a bare-date one, and check for triggers before assuming either way
+
+From the TPM digest build (`send_tpm_digest.py`, action item c5cf4442):
+`pc_projects.created_at` is a `timestamptz` with `default now()`, and
+`pg_trigger` returned zero rows for the whole table — no DB-level bump
+on anything, unlike `action_items.last_updated`'s `BEFORE UPDATE`
+trigger (previous entry, above). Confirmed in `sync_ap.py` too: its P&C
+update path never includes `created_at` in the fields it writes on an
+existing row. Given both a clean column and no trigger, a full
+timestamp watermark comparison (`created_at > watermark_timestamp`) is
+possible and is strictly better than the PLL digest's
+`created_date >= watermark_date` — the date-truncated comparison there
+was forced by `action_items.created_date` being a bare `date` column,
+and it required a whole reported-ids exclusion list to avoid
+same-day double-counting. A timestamptz insert column doesn't need
+that workaround at all. Lesson either way: before designing a "new
+since X" filter, query `pg_trigger` for the target table AND check
+whether the candidate column is a date or a timestamptz — both change
+what watermark comparison is even safe to write.
+
+Also: when a second job needs a constant already hardcoded in a first
+job (here, the 2026 GE Vernova holiday list in `send_pll_digest.py`),
+factor it out to a shared module (`ge_holidays.py`) rather than
+copy-pasting it — a second inline copy is a second place that silently
+drifts when 2027's calendar refresh only touches one of them.
