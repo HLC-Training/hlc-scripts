@@ -85,3 +85,22 @@ completion heartbeat (`health:github:orion_ap_sync`, unchanged, written only
 at the end of a fully successful run) — mirrors the email-scan routine's
 `last_run`/`last_success` split so "started" and "succeeded" stay two
 different signals here too.
+
+## 2026-08-05 — last_updated is not an insert timestamp, and zoneinfo needs tzdata on Windows
+
+Two from the PLL digest build (`send_pll_digest.py`):
+
+`action_items.last_updated` defaults to `now()` at insert but a
+`BEFORE UPDATE` trigger bumps it on every later edit — live vault rows
+showed lags up to 55 days between `created_date` and `last_updated`. Any
+"new since X" logic keyed on `last_updated` silently reports old,
+recently-edited rows as new. This table has NO immutable insert
+timestamp; the digest uses `created_date` (the vault header date) plus a
+reported-ids exclusion list instead. Check for an update trigger before
+trusting any timestamp column to mean "created."
+
+Python's `zoneinfo` raises `ZoneInfoNotFoundError` on Windows unless the
+`tzdata` pip package is installed — there is no OS tz database to fall
+back on. Ubuntu runners mask this. Any script using `ZoneInfo(...)` must
+list `tzdata` in its install line or it works in CI and dies on HERMES/
+ARGUS.
