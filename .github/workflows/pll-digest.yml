@@ -1,0 +1,54 @@
+name: ORION PLL Daily Digest
+
+on:
+  schedule:
+    # 11:07 UTC weekdays = 6:07 AM America/Chicago during CDT (5:07 CST).
+    # Minute 7 on purpose: :00/:30 are the contended Actions cron slots on
+    # this account (tasks/lessons.md — AP sync on :05/:35 fired ~1 in 7).
+    # The in-script gate re-checks weekday + GE Vernova holidays on the
+    # Chicago date, so a delayed or duplicate firing stays safe.
+    - cron: '7 11 * * 1-5'
+  workflow_dispatch:            # Manual trigger for testing
+    inputs:
+      dry_run:
+        description: 'Dry run (render only, do not send)'
+        required: false
+        type: boolean
+        default: false
+      force_date_gate:
+        description: 'Bypass the weekday/holiday gate (manual tests)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install supabase requests tzdata
+
+      - name: Send digest
+        env:
+          ORION_SUPABASE_SERVICE_KEY: ${{ secrets.ORION_SUPABASE_SERVICE_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          # LIVE ROLLOUT SWITCH — deliberately absent until Jim reviews the
+          # test bundle and gives the explicit go (action item 37425f71).
+          # To go live: set repo variable PLL_DIGEST_LIVE=true. Until then
+          # every run is test mode: all email goes to Jim only.
+          PLL_DIGEST_LIVE: ${{ vars.PLL_DIGEST_LIVE }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          FORCE_DATE_GATE: ${{ github.event.inputs.force_date_gate }}
+        run: |
+          ARGS=()
+          if [ "$DRY_RUN" = "true" ]; then ARGS+=(--dry-run); fi
+          if [ "$FORCE_DATE_GATE" = "true" ]; then ARGS+=(--force-date-gate); fi
+          python send_pll_digest.py "${ARGS[@]}"
