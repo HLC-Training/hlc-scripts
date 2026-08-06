@@ -2,12 +2,12 @@ name: ORION PLL Daily Digest
 
 on:
   schedule:
-    # 11:07 UTC weekdays = 6:07 AM America/Chicago during CDT (5:07 CST).
+    # 7:07 UTC weekdays = 2:07 AM America/Chicago during CDT (1:07 CST).
     # Minute 7 on purpose: :00/:30 are the contended Actions cron slots on
     # this account (tasks/lessons.md — AP sync on :05/:35 fired ~1 in 7).
     # The in-script gate re-checks weekday + GE Vernova holidays on the
     # Chicago date, so a delayed or duplicate firing stays safe.
-    - cron: '7 11 * * 1-5'
+    - cron: '7 7 * * 1-5'
   workflow_dispatch:            # Manual trigger for testing
     inputs:
       dry_run:

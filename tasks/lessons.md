@@ -130,3 +130,16 @@ job (here, the 2026 GE Vernova holiday list in `send_pll_digest.py`),
 factor it out to a shared module (`ge_holidays.py`) rather than
 copy-pasting it — a second inline copy is a second place that silently
 drifts when 2027's calendar refresh only touches one of them.
+
+## 2026-08-06 — A newly merged schedule trigger can miss its first slot with no error
+
+The PLL digest's cron (`7 11 * * 1-5`) never fired for its first eligible
+weekday after the workflow was merged. No error, nothing in Actions history
+except the manual dispatch from the day before. The script was fine — this
+was GitHub's scheduler, not the code.
+
+Two takeaways: don't trust a brand-new cron schedule to prove itself on its
+first slot, and where the downstream consumer doesn't care about exact
+timing (a morning digest nobody reads before 7am), schedule it hours earlier
+than the deadline rather than right up against it. Slack absorbs a missed or
+delayed trigger before it becomes a Jim-visible problem.

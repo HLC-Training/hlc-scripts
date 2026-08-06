@@ -82,3 +82,24 @@ are receiving it and Jim has confirmed the first live run.
 
 `ORION_SUPABASE_SERVICE_KEY`, never the generic name (lessons.md
 2026-08-03 — collision risk across the three-project Supabase estate).
+
+---
+
+## Amendment 2026-08-06 — cron moved to 07:07 UTC
+
+The first live run (06:07 CT / 11:07 UTC, 2026-08-06) never fired on
+schedule — Actions showed no scheduled run, only the prior day's manual
+dispatch. Jim ran it manually; the send itself worked cleanly, so the miss
+was the schedule trigger, most likely GitHub's known quirk where a newly
+merged `schedule:` block can miss its first eligible slot.
+
+Cron changed from `7 11 * * 1-5` to `7 7 * * 1-5` (06:07 CT → 02:07 CT
+during CDT, 01:07 CT during CST). Jim's reasoning: recipients read the
+digest in the morning regardless of exact send time, so pushing it four
+hours earlier trades away nothing and buys a wide buffer against exactly
+this kind of delayed-or-dropped trigger before anyone notices. Same
+tradeoff already accepted for the diary job's `0 7 * * *` cron
+(`samcos/knowledge/decisions/2026-07-19-personal-vault-journal.md`).
+
+Minute offset (`:07`) unchanged — still dodging the `:00`/`:30` contention
+window from the cron-contention lesson.
