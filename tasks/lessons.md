@@ -143,3 +143,29 @@ first slot, and where the downstream consumer doesn't care about exact
 timing (a morning digest nobody reads before 7am), schedule it hours earlier
 than the deadline rather than right up against it. Slack absorbs a missed or
 delayed trigger before it becomes a Jim-visible problem.
+
+## 2026-08-10 — A secondary capture bolted onto a primary sync needs three separate failure behaviors, decided up front
+
+From the AP title capture build (sync_ap.py → ap_titles): adding a
+side-channel write to an existing production sync forces a decision that
+"log it and move on" quietly dodges. The shape that held up:
+
+1. Sequence the secondary WRITE after every primary write phase, even if
+   the data was fetched/diffed earlier — then a secondary failure can
+   never cost a primary row.
+2. Exit non-zero at the very END on secondary failure. "Exit 0 on a
+   failed fetch is a lie" (top of this file) applies to partial success
+   too — a green run that silently dropped half its job invites nobody
+   to look. But don't exit early: red exit code AND completed primary
+   work are not in tension if the exit is last.
+3. Let the completion heartbeat still fire — it's the PRIMARY sync's
+   health signal and the primary succeeded. Put the secondary's state
+   into the heartbeat notes (titles_captured/written/failed) so the two
+   signals stay distinguishable instead of muddled into one.
+
+Also: you can't force a production Supabase table write to fail on demand
+(service role bypasses RLS; breaking prod with a bad CHECK to watch CI go
+red is vandalism). The honest failure-path proof is running the real
+main() with a stubbed DB layer where ONLY the new table's write raises —
+assert the primary writes landed first and the exit code went non-zero.
+Prints, not vibes.
