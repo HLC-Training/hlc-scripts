@@ -18,10 +18,15 @@ Flow:
     is skipped and logged rather than guessed.
   - Upserts into the appropriate table on ap_number (insert new, update changed).
   - Top-level parent/summary rows (Is Parent, AP# like "AP-0621") are read in
-    the same fetch and their "Improvement" text is upserted into ap_titles
-    (new/changed only) — the AP-name source for orion-pll's grouping headers.
-    Titles write AFTER the child sync; a title write failure exits non-zero
-    at the very end but never blocks or aborts the child sync.
+    the same fetch and their "Improvement" text and "Current Finish" date are
+    upserted into ap_titles (new/changed only) — the AP-name source for
+    orion-pll's grouping headers, plus the parent-level end date. A changed
+    end date (vs the stored ap_titles.end_date) additionally inserts one
+    event row into ap_end_date_changes — the trigger for orion-pll's
+    owner-acknowledgment flow (1d039530). A stored NULL end_date is a silent
+    baseline write, never an event, so the first run after ship flags nobody.
+    Titles/events write AFTER the child sync; a write failure there exits
+    non-zero at the very end but never blocks or aborts the child sync.
   - When a PLL changes status or due date in ORiON, ap_pending_update is raised
     (ap_pending_since records when) and the row is protected from sync
     overwrites. Jennifer Wright makes the matching change in Smartsheet; the
@@ -161,8 +166,10 @@ def fetch_child_ap_tasks() -> tuple[list[dict], list[dict]]:
 
     parent_titles — one dict per TOP-LEVEL parent/summary row (Is Parent
     set, AP# like "AP-0621" with no sub-segments): the AP number, the
-    primary "Improvement" text (the AP's real title), and the Smartsheet
-    row id for traceability. Mid-level summary rows (Is Parent on e.g.
+    primary "Improvement" text (the AP's real title), the parent-level
+    "Current Finish" end date (None when blank/unparseable — the diff in
+    main() keeps the stored value in that case), and the Smartsheet row id
+    for traceability. Mid-level summary rows (Is Parent on e.g.
     AP-0621-1) are expected and silently skipped — ap_titles keys on
     top-level numbers only. A top-level parent with a blank title is
     logged and skipped, never captured as an empty string.
@@ -225,6 +232,7 @@ def fetch_child_ap_tasks() -> tuple[list[dict], list[dict]]:
                     parent_titles.append({
                         "ap_number":     p_ap,
                         "title":         p_title,
+                        "end_date":      parse_due_date(cells.get(COL_FINISH)),
                         "source_row_id": row.get("id"),
                     })
             # Non-top-level parents (AP-0621-1 etc.) and blank AP# summary
@@ -567,18 +575,55 @@ def main(dry_run: bool = False):
     # very end, but the child sync always completes first. Malformed
     # parent rows were already logged and skipped at fetch time.
     titles_to_write      = []
+    date_events          = []  # parent-level end-date moves → ap_end_date_changes
+    date_baselines       = 0   # stored end_date NULL → silent first capture, no event
     title_capture_failed = False
     try:
-        titles_resp = db.table('ap_titles').select('ap_number, title, source_row_id').execute()
+        titles_resp = db.table('ap_titles').select('ap_number, title, source_row_id, end_date').execute()
         existing_titles = {r['ap_number']: r for r in (titles_resp.data or []) if r.get('ap_number')}
         for p in parent_titles:
-            ex = existing_titles.get(p['ap_number'])
-            if ex is None or ex.get('title') != p['title'] or ex.get('source_row_id') != p['source_row_id']:
-                titles_to_write.append(p)
-        log.info(f"AP titles: {len(existing_titles)} existing, {len(titles_to_write)} new/changed")
+            ex         = existing_titles.get(p['ap_number'])
+            stored_end = ex.get('end_date') if ex else None
+            new_end    = p['end_date']
+
+            if new_end is None:
+                # Blank/unparseable Current Finish on a top-level parent
+                # (none exist in the sheet today) — keep the stored value,
+                # never null it out, never fire an event.
+                if stored_end is not None:
+                    log.warning(f"End-date capture: top-level parent {p['ap_number']} has a blank Current Finish — keeping stored {stored_end}")
+                write_end = stored_end
+            else:
+                write_end = new_end
+                if stored_end is None:
+                    # First capture for this AP (or a brand-new AP row) —
+                    # silent baseline. Historical moves never flag anyone.
+                    date_baselines += 1
+                elif stored_end != new_end:
+                    # Genuine parent-level move (either direction — a pull-in
+                    # matters to a child owner as much as a slip).
+                    date_events.append({
+                        'ap_number':    p['ap_number'],
+                        'old_end_date': stored_end,
+                        'new_end_date': new_end,
+                    })
+
+            if (ex is None or ex.get('title') != p['title']
+                    or ex.get('source_row_id') != p['source_row_id']
+                    or stored_end != write_end):
+                titles_to_write.append({
+                    'ap_number':     p['ap_number'],
+                    'title':         p['title'],
+                    'end_date':      write_end,
+                    'source_row_id': p['source_row_id'],
+                })
+        log.info(
+            f"AP titles: {len(existing_titles)} existing, {len(titles_to_write)} new/changed, "
+            f"{date_baselines} end-date baseline(s), {len(date_events)} end-date change event(s)"
+        )
     except Exception as e:
         title_capture_failed = True
-        log.error(f"AP title capture: failed to load existing ap_titles — no titles will be written this run: {e}")
+        log.error(f"AP title capture: failed to load existing ap_titles — no titles/events will be written this run: {e}")
 
     to_insert_delivery = []
     to_update_delivery = []  # list of (id, fields_to_update, ap_number)
@@ -876,7 +921,9 @@ def main(dry_run: bool = False):
         )
         titles_summary = (
             f"AP titles — captured from Smartsheet: {len(parent_titles)}, "
-            f"would write (new/changed): {len(titles_to_write)}"
+            f"would write (new/changed): {len(titles_to_write)}, "
+            f"end-date baselines: {date_baselines}, "
+            f"end-date change events: {len(date_events)}"
             + (" [CAPTURE FAILED — existing ap_titles unreadable]" if title_capture_failed else "")
         )
         print("-" * 72)
@@ -885,7 +932,9 @@ def main(dry_run: bool = False):
         print(skip_summary)
         print(titles_summary)
         for t in titles_to_write:
-            print(f"[DRY RUN] TITLE    {t['ap_number']:14} \"{t['title']}\" (row {t['source_row_id']})")
+            print(f"[DRY RUN] TITLE    {t['ap_number']:14} \"{t['title']}\" end {t['end_date']} (row {t['source_row_id']})")
+        for ev in date_events:
+            print(f"[DRY RUN] DATEMOVE {ev['ap_number']:14} {ev['old_end_date']} -> {ev['new_end_date']}")
         if unmapped_leads:
             print(f"Unmapped lead emails ({len(unmapped_leads)}): {sorted(unmapped_leads)}")
         if ambiguous_leads:
@@ -965,6 +1014,25 @@ def main(dry_run: bool = False):
         except Exception as e:
             log.error(f"P&C pending-flag clear failed for {ap_num}: {e}")
 
+    # ── End-date change events (diffed pre-gate; deliberately AFTER the
+    # child sync, and BEFORE the ap_titles upsert: if the stored end_date
+    # advanced but the event insert had failed, the event would be lost
+    # forever — the next run's diff would see no change. The reverse
+    # failure only produces a duplicate event on retry, which the app's
+    # ack-all-outstanding-events-per-AP design absorbs. So: events first,
+    # and on event failure skip the title writes so the stored dates
+    # cannot advance past an unrecorded event. ──────────────────────
+    date_events_written = 0
+    if not title_capture_failed and date_events:
+        try:
+            db.table('ap_end_date_changes').insert(date_events).execute()
+            date_events_written = len(date_events)
+            for ev in date_events:
+                log.info(f"End-date change event: {ev['ap_number']} {ev['old_end_date']} -> {ev['new_end_date']}")
+        except Exception as e:
+            title_capture_failed = True
+            log.error(f"ap_end_date_changes insert failed — skipping ap_titles writes this run so stored dates don't advance past the unrecorded event(s): {e}")
+
     # ── AP title writes (diffed pre-gate; deliberately AFTER the child
     # sync so a title failure can never cost a child row) ───────────
     titles_written = 0
@@ -1028,8 +1096,9 @@ def main(dry_run: bool = False):
         f"pending Smartsheet updates: {len(pending)}, "
         f"escalated: {len(escalations)}, "
         f"WIP flags set: {wip_flagged} | "
-        f"AP titles: captured {len(parent_titles)}, written {titles_written}"
-        + (" [TITLE CAPTURE FAILED]" if title_capture_failed else "")
+        f"AP titles: captured {len(parent_titles)}, written {titles_written}, "
+        f"end-date events: {len(date_events)} detected, {date_events_written} written"
+        + (" [TITLE/DATE CAPTURE FAILED]" if title_capture_failed else "")
     )
     log.info(summary)
     print(summary)
@@ -1109,6 +1178,8 @@ def main(dry_run: bool = False):
                     f'pc_inserted={inserted_pc} pc_updated={updated_pc} '
                     f'pc_pending_cleared={cleared_pending_pc} skipped={skipped_total} '
                     f'titles_captured={len(parent_titles)} titles_written={titles_written} '
+                    f'date_events_detected={len(date_events)} date_events_written={date_events_written} '
+                    f'date_baselines={date_baselines} '
                     f'title_capture_failed={title_capture_failed}'
                 ),
             }, on_conflict='key').execute()
@@ -1124,7 +1195,7 @@ def main(dry_run: bool = False):
     # 2026-07-30 fetch-failure incident, just smaller. Decision doc:
     # knowledge/decisions/2026-08-10-ap-title-capture.md.
     if title_capture_failed:
-        msg = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | AP title capture FAILED — exiting non-zero (child sync completed; see log)"
+        msg = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | AP title/end-date capture FAILED — exiting non-zero (child sync completed; see log)"
         log.error(msg)
         print(msg)
         sys.exit(1)
