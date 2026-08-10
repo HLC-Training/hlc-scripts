@@ -17,6 +17,11 @@ Flow:
     resolving in both, resolving only to a viewer, or resolving in neither,
     is skipped and logged rather than guessed.
   - Upserts into the appropriate table on ap_number (insert new, update changed).
+  - Top-level parent/summary rows (Is Parent, AP# like "AP-0621") are read in
+    the same fetch and their "Improvement" text is upserted into ap_titles
+    (new/changed only) — the AP-name source for orion-pll's grouping headers.
+    Titles write AFTER the child sync; a title write failure exits non-zero
+    at the very end but never blocks or aborts the child sync.
   - When a PLL changes status or due date in ORiON, ap_pending_update is raised
     (ap_pending_since records when) and the row is protected from sync
     overwrites. Jennifer Wright makes the matching change in Smartsheet; the
@@ -33,6 +38,7 @@ Schedule: GitHub Actions (.github/workflows/sync-ap.yml) — every 30 min.
 """
 
 import os
+import re
 import sys
 import json
 import uuid
@@ -104,6 +110,11 @@ PC_STATUS_MAP = {
 # Active statuses — only import these (both Delivery and P&C)
 ACTIVE_STATUSES = {"Not Started", "In Progress"}
 
+# Top-level AP numbers only (AP-0621, never AP-0621-1) — ap_titles keys on
+# these; mid-level summary rows (Is Parent set on e.g. AP-0621-1) are
+# expected in the sheet and are not titles we capture.
+TOP_LEVEL_AP_RE = re.compile(r"^AP-\d+$")
+
 # SQDCG → ORiON category (first letter wins; G = Growth = Strategy)
 SQDCG_MAP = {
     "S": "Safety",
@@ -139,12 +150,22 @@ def ss_get(path: str, params: dict = None) -> dict:
     return resp.json()
 
 
-def fetch_child_ap_tasks() -> list[dict]:
+def fetch_child_ap_tasks() -> tuple[list[dict], list[dict]]:
     """
-    Fetch all rows from the AP sheet and return every child-level task —
-    active AND inactive — regardless of who the Lead is or whether they
-    resolve to anyone in ORiON. Owner resolution and routing (Delivery vs
-    P&C vs skip) happens in main().
+    Fetch all rows from the AP sheet and return
+    (child_tasks, parent_titles):
+
+    child_tasks — every child-level task, active AND inactive — regardless
+    of who the Lead is or whether they resolve to anyone in ORiON. Owner
+    resolution and routing (Delivery vs P&C vs skip) happens in main().
+
+    parent_titles — one dict per TOP-LEVEL parent/summary row (Is Parent
+    set, AP# like "AP-0621" with no sub-segments): the AP number, the
+    primary "Improvement" text (the AP's real title), and the Smartsheet
+    row id for traceability. Mid-level summary rows (Is Parent on e.g.
+    AP-0621-1) are expected and silently skipped — ap_titles keys on
+    top-level numbers only. A top-level parent with a blank title is
+    logged and skipped, never captured as an empty string.
 
     Inactive rows (Complete / Cancelled / On Hold) are included ONLY so a
     Delivery row whose ap_pending_update flag is set can be recognized as
@@ -177,15 +198,39 @@ def fetch_child_ap_tasks() -> list[dict]:
 
     log.info(f"Smartsheet: fetched {len(all_rows)} total rows")
 
-    child_tasks = []
+    child_tasks   = []
+    parent_titles = []
+    seen_title_aps = set()
     for row in all_rows:
         cells       = {c["columnId"]: c.get("displayValue") or c.get("value") for c in row.get("cells", [])}
         raw         = {c["columnId"]: c.get("value") for c in row.get("cells", [])}
         display_raw = {c["columnId"]: c.get("displayValue") for c in row.get("cells", [])}
 
-        # Child tasks only
         is_child  = str(cells.get(COL_IS_CHILD, "0")).strip()
         is_parent = str(cells.get(COL_IS_PARENT, "0")).strip()
+
+        # Title capture from TOP-LEVEL parent rows — read-only side channel,
+        # runs before the child filters and never short-circuits them, so
+        # child_tasks comes out byte-identical to the pre-capture behavior.
+        if is_parent == "1.0" or is_parent == "1":
+            p_ap    = str(cells.get(COL_AP_NUM) or "").strip()
+            p_title = str(cells.get(COL_IMPROVEMENT) or "").strip()
+            if TOP_LEVEL_AP_RE.match(p_ap):
+                if not p_title:
+                    log.warning(f"Title capture: top-level parent {p_ap} has a blank Improvement cell — skipped, not captured as empty")
+                elif p_ap in seen_title_aps:
+                    log.warning(f"Title capture: duplicate top-level parent row for {p_ap} — keeping the first, skipping row {row.get('id')}")
+                else:
+                    seen_title_aps.add(p_ap)
+                    parent_titles.append({
+                        "ap_number":     p_ap,
+                        "title":         p_title,
+                        "source_row_id": row.get("id"),
+                    })
+            # Non-top-level parents (AP-0621-1 etc.) and blank AP# summary
+            # rows are expected sheet structure — no log, no capture.
+
+        # Child tasks only
         if is_child != "1.0" and is_child != "1":
             continue
         if is_parent == "1.0" or is_parent == "1":
@@ -216,7 +261,8 @@ def fetch_child_ap_tasks() -> list[dict]:
 
     n_active = sum(1 for t in child_tasks if t["active"])
     log.info(f"Smartsheet: {len(child_tasks)} child-level tasks found ({n_active} active)")
-    return child_tasks
+    log.info(f"Smartsheet: {len(parent_titles)} top-level AP titles found on parent rows")
+    return child_tasks, parent_titles
 
 
 def resolve_lead_email(lead_value: str, lead_display: str, alias_map: dict, name_to_email: dict) -> str | None:
@@ -463,7 +509,7 @@ def main(dry_run: bool = False):
 
     # Fetch active AP tasks from Smartsheet
     try:
-        tasks = fetch_child_ap_tasks()
+        tasks, parent_titles = fetch_child_ap_tasks()
     except Exception as e:
         # Exit non-zero (closes bug 306cea89 / lessons.md "exit 0 on a failed
         # fetch is a lie the whole system believes") — a plain `return` here
@@ -511,6 +557,28 @@ def main(dry_run: bool = False):
     except Exception as e:
         log.error(f"Failed to load existing P&C AP items: {e}")
         return
+
+    # ── AP title diff (top-level parent rows → ap_titles) ───────
+    # Diffed here (before the dry-run gate) so dry runs can report it;
+    # the actual writes happen AFTER the child-row write phase below —
+    # a display-title write must never precede or block the primary
+    # child sync. Failure discipline (2026-08-10 decision doc): a failed
+    # ap_titles read/write marks the run failed and exits non-zero at the
+    # very end, but the child sync always completes first. Malformed
+    # parent rows were already logged and skipped at fetch time.
+    titles_to_write      = []
+    title_capture_failed = False
+    try:
+        titles_resp = db.table('ap_titles').select('ap_number, title, source_row_id').execute()
+        existing_titles = {r['ap_number']: r for r in (titles_resp.data or []) if r.get('ap_number')}
+        for p in parent_titles:
+            ex = existing_titles.get(p['ap_number'])
+            if ex is None or ex.get('title') != p['title'] or ex.get('source_row_id') != p['source_row_id']:
+                titles_to_write.append(p)
+        log.info(f"AP titles: {len(existing_titles)} existing, {len(titles_to_write)} new/changed")
+    except Exception as e:
+        title_capture_failed = True
+        log.error(f"AP title capture: failed to load existing ap_titles — no titles will be written this run: {e}")
 
     to_insert_delivery = []
     to_update_delivery = []  # list of (id, fields_to_update, ap_number)
@@ -806,10 +874,18 @@ def main(dry_run: bool = False):
             f"ambiguous lead: {skipped_ambiguous}, owner is viewer: {skipped_viewer}, "
             f"pending Smartsheet update: {skipped_pending}, unchanged: {skipped_unchanged}"
         )
+        titles_summary = (
+            f"AP titles — captured from Smartsheet: {len(parent_titles)}, "
+            f"would write (new/changed): {len(titles_to_write)}"
+            + (" [CAPTURE FAILED — existing ap_titles unreadable]" if title_capture_failed else "")
+        )
         print("-" * 72)
         print(delivery_summary)
         print(pc_summary)
         print(skip_summary)
+        print(titles_summary)
+        for t in titles_to_write:
+            print(f"[DRY RUN] TITLE    {t['ap_number']:14} \"{t['title']}\" (row {t['source_row_id']})")
         if unmapped_leads:
             print(f"Unmapped lead emails ({len(unmapped_leads)}): {sorted(unmapped_leads)}")
         if ambiguous_leads:
@@ -889,6 +965,26 @@ def main(dry_run: bool = False):
         except Exception as e:
             log.error(f"P&C pending-flag clear failed for {ap_num}: {e}")
 
+    # ── AP title writes (diffed pre-gate; deliberately AFTER the child
+    # sync so a title failure can never cost a child row) ───────────
+    titles_written = 0
+    if not title_capture_failed and titles_to_write:
+        # Explicit updated_at on every write (2026-08-05 lesson class: no
+        # trigger bumps this table — verified at migration time), and only
+        # on new/changed rows, so updated_at stays meaningful as "the title
+        # last actually changed", not "the sync last ran".
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for i in range(0, len(titles_to_write), 25):
+            batch = [{**t, 'updated_at': now_iso} for t in titles_to_write[i:i + 25]]
+            try:
+                db.table('ap_titles').upsert(batch, on_conflict='ap_number').execute()
+                titles_written += len(batch)
+            except Exception as e:
+                title_capture_failed = True
+                log.error(f"AP title upsert batch failed: {e}")
+    if titles_written:
+        log.info(f"AP titles written: {titles_written} (of {len(parent_titles)} captured)")
+
     # Check for WIP overages caused by new Delivery inserts (Delivery only)
     if inserted_delivery > 0:
         new_owner_ids = {item['owner_id'] for item in to_insert_delivery[:inserted_delivery]}
@@ -931,7 +1027,9 @@ def main(dry_run: bool = False):
         f"skipped: {skipped_total}, "
         f"pending Smartsheet updates: {len(pending)}, "
         f"escalated: {len(escalations)}, "
-        f"WIP flags set: {wip_flagged}"
+        f"WIP flags set: {wip_flagged} | "
+        f"AP titles: captured {len(parent_titles)}, written {titles_written}"
+        + (" [TITLE CAPTURE FAILED]" if title_capture_failed else "")
     )
     log.info(summary)
     print(summary)
@@ -1009,12 +1107,27 @@ def main(dry_run: bool = False):
                     f'delivery_inserted={inserted_delivery} delivery_updated={updated_delivery} '
                     f'delivery_pending_cleared={cleared_pending} escalated={len(escalations)} '
                     f'pc_inserted={inserted_pc} pc_updated={updated_pc} '
-                    f'pc_pending_cleared={cleared_pending_pc} skipped={skipped_total}'
+                    f'pc_pending_cleared={cleared_pending_pc} skipped={skipped_total} '
+                    f'titles_captured={len(parent_titles)} titles_written={titles_written} '
+                    f'title_capture_failed={title_capture_failed}'
                 ),
             }, on_conflict='key').execute()
             log.info("Health heartbeat sent to SAM COS")
         except Exception as _e:
             log.warning(f"Health heartbeat failed (non-critical): {_e}")
+
+    # ── Title-capture failure → non-zero exit, LAST ─────────────────
+    # Runs after every write phase and both heartbeats: the child sync (the
+    # production purpose of this run) completed and its heartbeat reflects
+    # that, but the run itself must not report green on a partial success —
+    # a green run that silently dropped titles is the same lie as the
+    # 2026-07-30 fetch-failure incident, just smaller. Decision doc:
+    # knowledge/decisions/2026-08-10-ap-title-capture.md.
+    if title_capture_failed:
+        msg = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | AP title capture FAILED — exiting non-zero (child sync completed; see log)"
+        log.error(msg)
+        print(msg)
+        sys.exit(1)
 
 
 def parse_args():
