@@ -5,15 +5,23 @@ send_pll_digest.py
 Daily per-PLL action-item digest (SAM COS action item 37425f71).
 
 Weekday mornings (~6:00 America/Chicago), each PLL gets an
-ORiON-branded email with up to three sections:
+ORiON-branded email with up to four sections:
   1. "Added since your last update" — items imported by sync_vault.py
      (source = 'vault_import') since the last digest actually sent.
      Watermark-based, NOT "yesterday": Monday covers the weekend.
   2. "Coming up in the next two weeks" — active items due in <= 14 days.
   3. "Past due" — active items past due, capped at the 5 longest-overdue
      with a "+N more" line.
-A PLL with zero items across all three sections gets NO email.
-Jim gets one consolidated roll-up per run (not a cc on each email).
+  4. "Approaching Stale" — items the shared action_items_staleness view
+     (public.staleness_state(), orion-pll knowledge/decisions/
+     2026-08-11-approaching-stale-warning.md) flags as 'approaching'.
+     No status filter beyond the view's own terminal set ({Done}) — this
+     mirrors Part 1's badge, which shows regardless of Open/In Progress/
+     Deferred. Capped at 5 longest-quiet with a "+N more" line, same
+     convention as Past due.
+A PLL with zero items across all four sections gets NO email.
+Jim gets one consolidated roll-up per run (not a cc on each email),
+including per-PLL Approaching counts.
 
 WATERMARK (pll_digest_state, ORiON Supabase):
   One row per successful run, inserted only after every send completed
@@ -137,6 +145,29 @@ def fetch_items(db, owner_ids: list[str]) -> list[dict]:
     return resp.data or []
 
 
+def fetch_approaching(db, owner_ids: list[str]) -> list[dict]:
+    """Approaching-stale items for these owners, from the shared
+    action_items_staleness view (public.staleness_state() —
+    knowledge/decisions/2026-08-11-approaching-stale-warning.md in
+    orion-pll), joined back to action_items for the detail fields the
+    other sections already render. No status filter beyond what the view
+    itself applies (its terminal set is {Done} only) — Part 1's badge
+    shows on the item's normal, everyday view regardless of Open/In
+    Progress/Deferred, so this section mirrors that, not ACTIVE_STATUSES."""
+    resp = db.table('action_items_staleness').select('id, owner_id') \
+        .eq('staleness', 'approaching') \
+        .in_('owner_id', owner_ids) \
+        .execute()
+    stale_ids = [r['id'] for r in (resp.data or [])]
+    if not stale_ids:
+        return []
+    detail = db.table('action_items') \
+        .select('id, owner_id, action_text, status, priority, due_date, last_updated') \
+        .in_('id', stale_ids) \
+        .execute()
+    return detail.data or []
+
+
 def fetch_state(db) -> tuple[datetime | None, set]:
     """Return (watermark, ids reported in the previous run's section 1)."""
     resp = db.table('pll_digest_state').select('sent_at, summary') \
@@ -161,10 +192,11 @@ def parse_date(raw) -> date | None:
 
 
 # ─── DIGEST ASSEMBLY ────────────────────────────────────────────
-def build_digest(pll: dict, items: list[dict], watermark_date: date,
-                 prev_section1_ids: set, today: date) -> dict | None:
-    """Three sections for one PLL; None if all empty (→ no email)."""
+def build_digest(pll: dict, items: list[dict], approaching_items: list[dict],
+                 watermark_date: date, prev_section1_ids: set, today: date) -> dict | None:
+    """Four sections for one PLL; None if all empty (→ no email)."""
     own = [i for i in items if i['owner_id'] == pll['id']]
+    own_approaching = [i for i in approaching_items if i['owner_id'] == pll['id']]
 
     new_items = sorted(
         (i for i in own
@@ -186,16 +218,22 @@ def build_digest(pll: dict, items: list[dict], watermark_date: date,
          and parse_date(i['due_date']) < today),
         key=lambda i: i['due_date'],   # oldest due date first = longest overdue first
     )
+    approaching_all = sorted(
+        own_approaching,
+        key=lambda i: i.get('last_updated') or '',   # oldest last_updated first = longest quiet
+    )
 
-    if not new_items and not due_soon and not overdue_all:
+    if not new_items and not due_soon and not overdue_all and not approaching_all:
         return None
 
     return {
-        'pll':              pll,
-        'new_items':        new_items,
-        'due_soon':         due_soon,
-        'overdue':          overdue_all[:OVERDUE_CAP],
-        'overdue_overflow': max(0, len(overdue_all) - OVERDUE_CAP),
+        'pll':                  pll,
+        'new_items':            new_items,
+        'due_soon':             due_soon,
+        'overdue':              overdue_all[:OVERDUE_CAP],
+        'overdue_overflow':     max(0, len(overdue_all) - OVERDUE_CAP),
+        'approaching':          approaching_all[:OVERDUE_CAP],
+        'approaching_overflow': max(0, len(approaching_all) - OVERDUE_CAP),
     }
 
 
@@ -226,6 +264,11 @@ def days_overdue(raw, today: date) -> str:
     return f"{n} day{'s' if n != 1 else ''} past"
 
 
+def days_quiet(raw, today: date) -> str:
+    n = (today - parse_timestamp(raw).astimezone(CHICAGO).date()).days
+    return f"{n} day{'s' if n != 1 else ''} without an update"
+
+
 def item_row_html(item: dict, meta: str, meta_color: str, zebra: bool) -> str:
     bg = f'background-color:{ZEBRA};' if zebra else ''
     return (
@@ -237,7 +280,11 @@ def item_row_html(item: dict, meta: str, meta_color: str, zebra: bool) -> str:
     )
 
 
-def section_html(heading: str, rows: list[str], extra_row: str = '') -> str:
+def section_html(heading: str, rows: list[str], extra_row: str = '', intro: str = '') -> str:
+    intro_row = (
+        f'<tr><td style="padding:0 0 6px 0;font-family:{FONT};font-size:12px;'
+        f'color:{MUTED};line-height:1.4;">{intro}</td></tr>' if intro else ''
+    )
     return (
         f'<tr><td style="padding:22px 0 0 0;">'
         f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
@@ -245,6 +292,7 @@ def section_html(heading: str, rows: list[str], extra_row: str = '') -> str:
         f'color:{EVERGREEN};padding:0 0 4px 0;">{heading}</td></tr>'
         f'<tr><td style="font-size:0;line-height:0;height:3px;background-color:{ION};'
         f'width:44px;">&nbsp;</td></tr>'
+        f'{intro_row}'
         f'<tr><td style="padding:6px 0 0 0;">'
         f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
         f'{"".join(rows)}{extra_row}'
@@ -299,6 +347,26 @@ def build_html_body(digest: dict, today: date) -> str:
                 f'color:{MUTED};">Plus {digest["overdue_overflow"]} more past due in ORiON.</td></tr>'
             )
         sections.append(section_html("Past due", rows, extra))
+    if digest['approaching']:
+        rows = [
+            item_row_html(
+                i,
+                f"{days_quiet(i['last_updated'], today)} &middot; {esc(i.get('status'))}"
+                + (f" &middot; due {fmt_date(i['due_date'])}" if i.get('due_date') else ""),
+                MUTED, idx % 2 == 1)
+            for idx, i in enumerate(digest['approaching'])
+        ]
+        extra = ''
+        if digest['approaching_overflow']:
+            extra = (
+                f'<tr><td style="padding:10px 14px;font-family:{FONT};font-size:13px;'
+                f'color:{MUTED};">Plus {digest["approaching_overflow"]} more approaching stale in ORiON.</td></tr>'
+            )
+        sections.append(section_html(
+            "Approaching Stale", rows, extra,
+            intro="These haven't been updated in a while and will flip to Stale soon "
+                  '&mdash; a quick note in ORiON resets the clock. See the Approaching Stale '
+                  'help article in ORiON for details.'))
 
     return f"""<!DOCTYPE html>
 <html>
@@ -376,6 +444,19 @@ def build_text_body(digest: dict, today: date) -> str:
         if digest['overdue_overflow']:
             lines.append(f"Plus {digest['overdue_overflow']} more past due in ORiON.")
         lines.append("")
+    if digest['approaching']:
+        lines.append("Approaching Stale")
+        lines.append("-" * 17)
+        lines.append("These haven't been updated in a while and will flip to Stale soon "
+                      "-- a quick note in ORiON resets the clock. See the Approaching "
+                      "Stale help article in ORiON for details.")
+        for i in digest['approaching']:
+            due = f" | due {fmt_date(i['due_date'])}" if i.get('due_date') else ""
+            lines.append(f"- {i['action_text']}")
+            lines.append(f"    {days_quiet(i['last_updated'], today)} | {i.get('status')}{due}")
+        if digest['approaching_overflow']:
+            lines.append(f"Plus {digest['approaching_overflow']} more approaching stale in ORiON.")
+        lines.append("")
     lines += [
         "Want the full picture? Open ORiON to see everything on your plate.",
         f"Open ORiON: {ORION_URL}",
@@ -397,6 +478,7 @@ def build_rollup(results: list[dict], today: date, live: bool,
         '<tr><th style="text-align:left;padding:6px 10px;">PLL</th>'
         '<th style="padding:6px 10px;">New</th><th style="padding:6px 10px;">Due 14d</th>'
         '<th style="padding:6px 10px;">Overdue</th><th style="padding:6px 10px;">Overflow</th>'
+        '<th style="padding:6px 10px;">Approaching</th>'
         '<th style="text-align:left;padding:6px 10px;">Result</th></tr>'
     )
     body_rows, text_lines = [], []
@@ -407,19 +489,22 @@ def build_rollup(results: list[dict], today: date, live: bool,
                 f'<tr><td style="padding:6px 10px;">{esc(r["pll"]["name"])}</td>'
                 f'<td align="center">0</td><td align="center">0</td>'
                 f'<td align="center">0</td><td align="center">—</td>'
+                f'<td align="center">0</td>'
                 f'<td style="padding:6px 10px;">no items — no email</td></tr>')
             text_lines.append(f"{r['pll']['name']}: no items -- no email")
         else:
             n, s, o = len(d['new_items']), len(d['due_soon']), len(d['overdue'])
+            a = len(d['approaching'])
             ov = d['overdue_overflow'] or '—'
             body_rows.append(
                 f'<tr><td style="padding:6px 10px;">{esc(r["pll"]["name"])}</td>'
                 f'<td align="center">{n}</td><td align="center">{s}</td>'
                 f'<td align="center">{o}</td><td align="center">{ov}</td>'
+                f'<td align="center">{a}</td>'
                 f'<td style="padding:6px 10px;">{esc(r["result"])}</td></tr>')
             text_lines.append(
                 f"{r['pll']['name']}: new={n} due14={s} overdue={o} "
-                f"overflow={d['overdue_overflow']} -> {r['result']}")
+                f"overflow={d['overdue_overflow']} approaching={a} -> {r['result']}")
     html_body = (
         f'<html><body style="font-family:{FONT};color:{NIGHT};">'
         f'<p><strong>ORiON PLL digest roll-up</strong> — {today.strftime("%A, %B %d, %Y")}<br>'
@@ -511,6 +596,7 @@ def main():
         db = create_client(SUPABASE_URL, ORION_SUPABASE_SERVICE_KEY)
         plls = fetch_plls(db)
         items = fetch_items(db, [p['id'] for p in plls])
+        approaching = fetch_approaching(db, [p['id'] for p in plls])
         watermark, prev_section1_ids = fetch_state(db)
     except Exception as e:
         log.error(f"Supabase fetch failed — aborting without sending: {e}")
@@ -524,7 +610,7 @@ def main():
 
     results = []
     for pll in plls:
-        digest = build_digest(pll, items, watermark_date, prev_section1_ids, today)
+        digest = build_digest(pll, items, approaching, watermark_date, prev_section1_ids, today)
         results.append({'pll': pll, 'digest': digest, 'result': None})
 
     to_send = [r for r in results if r['digest'] is not None]

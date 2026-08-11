@@ -11,14 +11,22 @@ In P&C, "project" (pc_projects) is the naming convention for what
 Delivery calls an action item — same concept, different table and
 different word. Weekday mornings (~6:00 America/Chicago), Michele gets
 ONE combined ORiON-branded email covering every TPM's P&C projects,
-grouped by TPM owner, with up to three sections:
+grouped by TPM owner, with up to four sections:
   1. "New projects" — pc_projects rows created since the last digest
      actually sent.
   2. "Coming up in the next two weeks" — non-terminal projects with
      target_end_date within 14 days.
   3. "Overdue" — non-terminal projects past target_end_date, capped
      PER TPM at the 5 longest-overdue with a "+N more" line.
-If every TPM is empty across all three sections, NO email is sent —
+  4. "Approaching Stale" — projects the shared pc_projects_staleness
+     view (public.staleness_state(), orion-pll knowledge/decisions/
+     2026-08-11-approaching-stale-warning.md) flags as 'approaching'.
+     The view's own terminal set ({complete, cancelled}) matches
+     DONE_STATUSES here, so no extra filtering is needed. Capped PER
+     TPM at 5 longest-quiet with a "+N more" line, same convention as
+     Overdue. Present only for TPMs with items in it, same
+     absent-if-empty behavior as the other sections.
+If every TPM is empty across all four sections, NO email is sent —
 there is nothing here for the once-a-day habit to protect.
 
 Nothing is ever sent to a TPM. Michele is the sole live recipient; Jim
@@ -160,6 +168,28 @@ def fetch_projects(db, owner_ids: list[str]) -> list[dict]:
     return resp.data or []
 
 
+def fetch_approaching(db, owner_ids: list[str]) -> list[dict]:
+    """Approaching-stale projects for these owners, from the shared
+    pc_projects_staleness view (public.staleness_state() — orion-pll
+    knowledge/decisions/2026-08-11-approaching-stale-warning.md), joined
+    back to pc_projects for the detail fields the other sections already
+    render. No status filter beyond what the view itself applies (its
+    terminal set is {complete, cancelled} — same as DONE_STATUSES here,
+    so no double-filtering needed)."""
+    resp = db.table('pc_projects_staleness').select('id, owner_id') \
+        .eq('staleness', 'approaching') \
+        .in_('owner_id', owner_ids) \
+        .execute()
+    stale_ids = [r['id'] for r in (resp.data or [])]
+    if not stale_ids:
+        return []
+    detail = db.table('pc_projects') \
+        .select('id, owner_id, title, status, target_end_date, updated_at') \
+        .in_('id', stale_ids) \
+        .execute()
+    return detail.data or []
+
+
 def fetch_state(db) -> datetime | None:
     """Return the watermark timestamp (latest successful run's sent_at)."""
     resp = db.table('tpm_digest_state').select('sent_at') \
@@ -180,11 +210,12 @@ def parse_date(raw) -> date | None:
 
 
 # ─── DIGEST ASSEMBLY ────────────────────────────────────────────
-def build_digest(tpm: dict, projects: list[dict], watermark: datetime,
-                 today: date) -> dict | None:
-    """Three sections for one TPM; None if all empty."""
+def build_digest(tpm: dict, projects: list[dict], approaching_items: list[dict],
+                 watermark: datetime, today: date) -> dict | None:
+    """Four sections for one TPM; None if all empty."""
     own = [p for p in projects
            if p['owner_id'] == tpm['id'] and p.get('status') not in DONE_STATUSES]
+    own_approaching = [p for p in approaching_items if p['owner_id'] == tpm['id']]
 
     new_items = sorted(
         (p for p in own if parse_timestamp(p['created_at']) > watermark),
@@ -202,16 +233,22 @@ def build_digest(tpm: dict, projects: list[dict], watermark: datetime,
          and parse_date(p['target_end_date']) < today),
         key=lambda p: p['target_end_date'],   # oldest target first = longest overdue first
     )
+    approaching_all = sorted(
+        own_approaching,
+        key=lambda p: p.get('updated_at') or '',   # oldest updated_at first = longest quiet
+    )
 
-    if not new_items and not due_soon and not overdue_all:
+    if not new_items and not due_soon and not overdue_all and not approaching_all:
         return None
 
     return {
-        'tpm':              tpm,
-        'new_items':        new_items,
-        'due_soon':         due_soon,
-        'overdue':          overdue_all[:OVERDUE_CAP],
-        'overdue_overflow': max(0, len(overdue_all) - OVERDUE_CAP),
+        'tpm':                  tpm,
+        'new_items':            new_items,
+        'due_soon':             due_soon,
+        'overdue':              overdue_all[:OVERDUE_CAP],
+        'overdue_overflow':     max(0, len(overdue_all) - OVERDUE_CAP),
+        'approaching':          approaching_all[:OVERDUE_CAP],
+        'approaching_overflow': max(0, len(approaching_all) - OVERDUE_CAP),
     }
 
 
@@ -242,6 +279,11 @@ def days_overdue(raw, today: date) -> str:
     return f"{n} day{'s' if n != 1 else ''} past"
 
 
+def days_quiet(raw, today: date) -> str:
+    n = (today - parse_timestamp(raw).astimezone(CHICAGO).date()).days
+    return f"{n} day{'s' if n != 1 else ''} without an update"
+
+
 def item_row_html(project: dict, meta: str, zebra: bool) -> str:
     bg = f'background-color:{ZEBRA};' if zebra else ''
     return (
@@ -262,9 +304,13 @@ def tpm_group_html(tpm_name: str, rows: list[str], extra_row: str = '') -> str:
     )
 
 
-def section_html(heading: str, tpm_blocks: list[str]) -> str:
+def section_html(heading: str, tpm_blocks: list[str], intro: str = '') -> str:
     if not tpm_blocks:
         return ''
+    intro_row = (
+        f'<tr><td style="padding:0 0 6px 0;font-family:{FONT};font-size:12px;'
+        f'color:{MUTED};line-height:1.4;">{intro}</td></tr>' if intro else ''
+    )
     return (
         f'<tr><td style="padding:22px 0 0 0;">'
         f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
@@ -272,6 +318,7 @@ def section_html(heading: str, tpm_blocks: list[str]) -> str:
         f'color:{EVERGREEN};padding:0 0 4px 0;">{heading}</td></tr>'
         f'<tr><td style="font-size:0;line-height:0;height:3px;background-color:{ION};'
         f'width:44px;">&nbsp;</td></tr>'
+        f'{intro_row}'
         f'<tr><td style="padding:2px 0 0 0;">'
         f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
         f'{"".join(tpm_blocks)}'
@@ -294,6 +341,11 @@ def section_blocks(results: list[dict], key: str, meta_fn) -> list[str]:
             extra = (
                 f'<tr><td style="padding:8px 14px 8px 28px;font-family:{FONT};font-size:13px;'
                 f'color:{MUTED};">Plus {d["overdue_overflow"]} more past due in ORiON.</td></tr>'
+            )
+        elif key == 'approaching' and d['approaching_overflow']:
+            extra = (
+                f'<tr><td style="padding:8px 14px 8px 28px;font-family:{FONT};font-size:13px;'
+                f'color:{MUTED};">Plus {d["approaching_overflow"]} more approaching stale in ORiON.</td></tr>'
             )
         blocks.append(tpm_group_html(r['tpm']['name'], rows, extra))
     return blocks
@@ -320,6 +372,13 @@ def build_html_body(results: list[dict], today: date) -> str:
             lambda p: (f'<span style="color:{CRITICAL};">Target {fmt_date(p["target_end_date"])} '
                        f'&middot; {days_overdue(p["target_end_date"], today)}</span> '
                        f'&middot; {esc(p.get("status"))}'))),
+        section_html("Approaching Stale", section_blocks(
+            results, 'approaching',
+            lambda p: f"{days_quiet(p['updated_at'], today)} &middot; {esc(p.get('status'))}"
+                      + (f" &middot; target {fmt_date(p['target_end_date'])}" if p.get('target_end_date') else "")),
+            intro="These haven't been updated in a while and will flip to Stale soon "
+                  "&mdash; a note in ORiON resets the clock. See the Approaching Stale "
+                  "help article in ORiON for details."),
     ]
 
     return f"""<!DOCTYPE html>
@@ -364,7 +423,7 @@ def build_html_body(results: list[dict], today: date) -> str:
 </html>"""
 
 
-def text_section(heading: str, results: list[dict], key: str, meta_fn) -> list[str]:
+def text_section(heading: str, results: list[dict], key: str, meta_fn, intro: str = '') -> list[str]:
     lines = []
     any_block = False
     for r in results:
@@ -374,6 +433,8 @@ def text_section(heading: str, results: list[dict], key: str, meta_fn) -> list[s
         if not any_block:
             lines.append(heading)
             lines.append("-" * len(heading))
+            if intro:
+                lines.append(intro)
             any_block = True
         lines.append(f"{r['tpm']['name']}:")
         for p in d[key]:
@@ -381,6 +442,8 @@ def text_section(heading: str, results: list[dict], key: str, meta_fn) -> list[s
             lines.append(f"      {meta_fn(p)}")
         if key == 'overdue' and d['overdue_overflow']:
             lines.append(f"      Plus {d['overdue_overflow']} more past due in ORiON.")
+        elif key == 'approaching' and d['approaching_overflow']:
+            lines.append(f"      Plus {d['approaching_overflow']} more approaching stale in ORiON.")
     if any_block:
         lines.append("")
     return lines
@@ -401,6 +464,11 @@ def build_text_body(results: list[dict], today: date) -> str:
     lines += text_section("Overdue", results, 'overdue',
                           lambda p: f"Target {fmt_date(p['target_end_date'])} | "
                                     f"{days_overdue(p['target_end_date'], today)} | {p.get('status')}")
+    lines += text_section("Approaching Stale", results, 'approaching',
+                          lambda p: f"{days_quiet(p['updated_at'], today)} | {p.get('status')}",
+                          intro="These haven't been updated in a while and will flip to Stale soon "
+                                "-- a note in ORiON resets the clock. See the Approaching Stale "
+                                "help article in ORiON for details.")
     lines += [
         "Want the full picture? Open ORiON to see every P&C project.",
         f"Open ORiON: {ORION_URL}",
@@ -484,6 +552,7 @@ def main():
         db = create_client(SUPABASE_URL, ORION_SUPABASE_SERVICE_KEY)
         tpms = fetch_tpms(db)
         projects = fetch_projects(db, [t['id'] for t in tpms])
+        approaching = fetch_approaching(db, [t['id'] for t in tpms])
         watermark = fetch_state(db)
     except Exception as e:
         log.error(f"Supabase fetch failed — aborting without sending: {e}")
@@ -493,7 +562,7 @@ def main():
         watermark = now_chicago.astimezone(timezone.utc) - timedelta(hours=FALLBACK_WINDOW_HOURS)
         log.info(f"No watermark row — fallback window since {watermark.isoformat()}.")
 
-    results = [{'tpm': t, 'digest': build_digest(t, projects, watermark, today)} for t in tpms]
+    results = [{'tpm': t, 'digest': build_digest(t, projects, approaching, watermark, today)} for t in tpms]
     to_report = [r for r in results if r['digest'] is not None]
     log.info(f"{len(tpms)} TPMs — {len(to_report)} with items to report, "
              f"{len(tpms) - len(to_report)} suppressed (no items).")
