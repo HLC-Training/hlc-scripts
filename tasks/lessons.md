@@ -169,3 +169,32 @@ red is vandalism). The honest failure-path proof is running the real
 main() with a stubbed DB layer where ONLY the new table's write raises —
 assert the primary writes landed first and the exit code went non-zero.
 Prints, not vibes.
+
+## 2026-08-11 — A narrow view means a two-step fetch, not a wider select
+
+From the Approaching Stale digest build (send_pll_digest.py /
+send_tpm_digest.py → action_items_staleness / pc_projects_staleness,
+action item bde783ad): `supabase-py`'s `.table(name)` works identically
+for a view as for a table — no special call, no `.rpc()`, filters and
+`.select()` work the same way. That part held no surprise.
+
+The wrinkle: these views expose only `(id, owner_id, staleness)` — they
+don't re-expose the base table's other columns, and there's no declared
+FK relationship PostgREST could use to embed them even if asked. Trying
+`.select('id, owner_id, action_text, ...')` against the view itself just
+errors on the unknown columns. The fix is the two-step fetch this repo's
+digests already do elsewhere for unrelated reasons (fetch_plls →
+fetch_items): query the view for matching ids filtered on the state you
+want, then a second `.in_('id', ids)` query against the real source
+table for every detail field to render. Don't assume a "thin" view can
+carry a wider select just because a table with the same name-ish shape
+usually can.
+
+Also worth the explicit check next time a digest section is built on a
+shared threshold/classification view: read what triggers the
+classification in the app that owns it (here, orion-pll's Approaching
+Stale badge decision doc) before assuming the digest's own established
+status filter (here, `ACTIVE_STATUSES`) should apply on top. The view's
+own terminal-status set is the intended filter — re-narrowing it in
+Python risks the digest silently disagreeing with the UI badge for the
+same row.
