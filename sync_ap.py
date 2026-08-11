@@ -371,33 +371,51 @@ def check_and_flag_wip_overages(db, owner_ids: set, log) -> int:
     start_date <= today <= due_date (nulls = unbounded).
     If count > 5, set pending_wip_review = true.
     Returns number of users flagged.
+
+    One batched SELECT across all owner_ids (grouped in memory) plus one
+    batched UPDATE for whichever owners are over, instead of a per-owner
+    query pair — mirrors the batch-insert/batch-update discipline this
+    script's main reconcile loop already uses (bug 0514aaac).
     """
-    today   = datetime.now().date()
-    flagged = 0
-    for owner_id in owner_ids:
-        try:
-            resp = db.table('action_items') \
-                .select('id, start_date, due_date') \
-                .eq('owner_id', owner_id) \
-                .eq('priority', 'Tier 2') \
-                .in_('status', ['Open', 'In Progress']) \
-                .execute()
-            rows  = resp.data or []
-            count = sum(
-                1 for r in rows
-                if (r.get('start_date') is None or r['start_date'] <= str(today))
-                and (r.get('due_date')   is None or r['due_date']   >= str(today))
-            )
-            if count > 5:
-                db.table('users') \
-                    .update({'pending_wip_review': True}) \
-                    .eq('id', owner_id) \
-                    .execute()
-                log.warning(f"WIP overage: owner {owner_id} has {count} active Tier 2 items — pending_wip_review flagged")
-                flagged += 1
-        except Exception as e:
-            log.error(f"WIP check failed for {owner_id}: {e}")
-    return flagged
+    if not owner_ids:
+        return 0
+
+    today = datetime.now().date()
+    try:
+        resp = db.table('action_items') \
+            .select('id, owner_id, start_date, due_date') \
+            .in_('owner_id', list(owner_ids)) \
+            .eq('priority', 'Tier 2') \
+            .in_('status', ['Open', 'In Progress']) \
+            .execute()
+    except Exception as e:
+        log.error(f"WIP check failed for owners {sorted(owner_ids)}: {e}")
+        return 0
+
+    counts = {}
+    for r in (resp.data or []):
+        if (r.get('start_date') is None or r['start_date'] <= str(today)) \
+                and (r.get('due_date') is None or r['due_date'] >= str(today)):
+            counts[r['owner_id']] = counts.get(r['owner_id'], 0) + 1
+
+    over_ids = [owner_id for owner_id, count in counts.items() if count > 5]
+    if not over_ids:
+        log.info(f"WIP check: {len(owner_ids)} owner(s) checked via 1 query, 0 over threshold")
+        return 0
+
+    try:
+        db.table('users') \
+            .update({'pending_wip_review': True}) \
+            .in_('id', over_ids) \
+            .execute()
+    except Exception as e:
+        log.error(f"WIP flag update failed for owners {sorted(over_ids)}: {e}")
+        return 0
+
+    for owner_id in over_ids:
+        log.warning(f"WIP overage: owner {owner_id} has {counts[owner_id]} active Tier 2 items — pending_wip_review flagged")
+    log.info(f"WIP check: {len(owner_ids)} owner(s) checked via 1 query, {len(over_ids)} flagged via 1 update")
+    return len(over_ids)
 
 
 def build_delivery_notes(task: dict) -> str | None:
