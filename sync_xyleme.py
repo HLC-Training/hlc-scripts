@@ -442,7 +442,7 @@ def main():
     # Load existing xyleme_import rows keyed by action_text
     try:
         existing_resp = db.table('action_items') \
-            .select('id, action_text, status, due_date, notes') \
+            .select('id, action_text, status, due_date, notes, owner_id') \
             .eq('source', SOURCE) \
             .execute()
         existing = {r['action_text']: r for r in (existing_resp.data or [])}
@@ -465,8 +465,11 @@ def main():
                 fields["due_date"] = task["due_date"]
             if task["notes"]    != ex.get("notes"):
                 fields["notes"]    = task["notes"]
-            if task["owner_id"]:
-                # Always keep owner current in case PLL mapping changes
+            if task["owner_id"] and task["owner_id"] != ex.get("owner_id"):
+                # Keep owner current in case PLL mapping changes, but only
+                # write it when it actually differs — an unconditional write
+                # here bumped last_updated on every run and defeated
+                # staleness detection downstream.
                 fields["owner_id"] = task["owner_id"]
 
             if fields:
