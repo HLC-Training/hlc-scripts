@@ -198,3 +198,31 @@ status filter (here, `ACTIVE_STATUSES`) should apply on top. The view's
 own terminal-status set is the intended filter — re-narrowing it in
 Python risks the digest silently disagreeing with the UI badge for the
 same row.
+
+## 2026-08-12 — A bug found while investigating an adjacent one is a finding, not a footnote
+
+The 8/11 category investigation named the exact 6 rows that were Complete in
+Smartsheet but active in ORiON, described the inactive-row path that would
+never touch them, and used both facts as *evidence for its own conclusion* —
+then closed without asking whether that behavior was itself a defect. It
+was. Michele hit it the next day, twice, through portal_feedback, and it
+became a trust-critical fix on a deadline instead of a quiet one-line map
+extension a day earlier.
+
+The lesson isn't "investigate everything" — it's that when a session writes
+a sentence of the form "the sync only ever revisits a Complete row to
+settle a pending flag" as supporting evidence, that sentence is a claim
+about intended behavior being asserted from observed behavior. File it as a
+question (bug row, action item, anything queryable) even when it's not the
+thing being investigated. The 8/11 session did file the category clobber it
+tripped over; the status gap got described in prose and lost. The
+difference between the two outcomes was one INSERT.
+
+Two smaller ones from the same session: a "status transition guard" trigger
+had appeared on pc_projects since the 8/05 zero-triggers check — re-query
+pg_trigger before any new write path to a table, because a BEFORE UPDATE
+guard can veto a sync write silently (these turned out to gate on
+auth.uid(), so service-role writes pass); and when the only credentials
+live in GitHub secrets, `gh workflow run --ref <branch>` is the honest way
+to run unmerged sync code against production once — main's cron never sees
+the branch, and main still gets exactly one reviewed commit.

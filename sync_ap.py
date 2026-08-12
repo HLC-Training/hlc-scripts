@@ -7,8 +7,9 @@ Smartsheet Action Plan → ORiON sync. Runs on ARGUS on a schedule.
 Flow:
   - Smartsheet is the SOURCE OF TRUTH. This script never writes to it.
   - Reads child-level AP tasks from the OFS Training Action Plan Tracker
-    (active statuses drive the sync; inactive rows are read only to settle
-    pending flags — see fetch_child_ap_tasks).
+    (active statuses drive the sync; inactive rows are read to settle
+    pending flags and to close out existing rows whose Smartsheet status
+    went On Hold / Complete / Cancelled — see fetch_child_ap_tasks).
   - Each row's Lead cell is resolved to an email (linked contact value, then
     the ap_lead_aliases table, then a name match against users/portal_users —
     see resolve_lead_email), then that email is resolved against BOTH users
@@ -31,8 +32,9 @@ Flow:
     (ap_pending_since records when) and the row is protected from sync
     overwrites. Jennifer Wright makes the matching change in Smartsheet; the
     first run that sees the row MATCH Smartsheet again clears both flag fields
-    (Smartsheet caught up). These fields only exist on the Delivery
-    (action_items) side.
+    (Smartsheet caught up). Both tables carry the flag fields; the
+    Jennifer-reconcile narrative above is the Delivery flow, and pc_projects
+    has the same settle mechanics.
   - Flagged rows still diverging after ESCALATION_DAYS are written to SAM COS
     context_store (orion:ap_pending:escalated, overwritten every run) and
     paged to Jim via the samcos notification_queue → Pushover drain — but only
@@ -106,10 +108,18 @@ STATUS_MAP = {
 }
 
 # Smartsheet Overall Status → P&C (pc_projects) status.
-# Only Not Started / In Progress ever reach this map — see ACTIVE_STATUSES.
+# Active statuses flow through the normal update path; inactive ones
+# (On Hold / Complete / Cancelled) reach an existing row only via the
+# status-only close pass in main() or the pending-settle diff — never as
+# inserts. Before the inactive mappings existed (bug e6b35596), a pending
+# P&C row that went Complete in Smartsheet diffed status against None and
+# could never settle its flag.
 PC_STATUS_MAP = {
     "Not Started": "approved",
     "In Progress": "active",
+    "On Hold":     "on_hold",
+    "Complete":    "complete",
+    "Cancelled":   "cancelled",
 }
 
 # Active statuses — only import these (both Delivery and P&C)
@@ -174,12 +184,16 @@ def fetch_child_ap_tasks() -> tuple[list[dict], list[dict]]:
     top-level numbers only. A top-level parent with a blank title is
     logged and skipped, never captured as an empty string.
 
-    Inactive rows (Complete / Cancelled / On Hold) are included ONLY so a
-    Delivery row whose ap_pending_update flag is set can be recognized as
-    caught-up once Jennifer applies the change in Smartsheet: e.g. ORiON
-    "Done" vs Smartsheet "Complete" map to the same status and must clear
-    the flag. main() restricts inactive rows to exactly that path — they
-    never insert, never route to P&C, never touch the skip counters.
+    Inactive rows (Complete / Cancelled / On Hold) are included for two
+    purposes only: (a) a row whose ap_pending_update flag is set can be
+    recognized as caught-up once Jennifer applies the change in Smartsheet
+    (e.g. ORiON "Done" vs Smartsheet "Complete" map to the same status and
+    must clear the flag), and (b) an existing non-pending row whose
+    Smartsheet status went inactive gets a status-only close write, so
+    Complete/Cancelled/On Hold actually reaches ORiON (bug e6b35596).
+    main() restricts inactive rows to exactly those paths — they never
+    insert, never touch any field beyond status on a close, and never
+    touch the skip counters.
 
     Smartsheet rows are retrieved via GET /sheets/{id} with pagination.
     """
@@ -646,9 +660,11 @@ def main(dry_run: bool = False):
     to_insert_delivery = []
     to_update_delivery = []  # list of (id, fields_to_update, ap_number)
     to_clear_pending   = []  # list of (id, ap_number) — Smartsheet caught up, clear flag only
+    to_close_delivery  = []  # list of (id, new_status, ap_number) — row went inactive in Smartsheet
     to_insert_pc       = []
     to_update_pc       = []  # list of (id, fields_to_update, ap_number)
     to_clear_pending_pc = []  # list of (id, ap_number) — Smartsheet caught up, clear flag only
+    to_close_pc        = []  # list of (id, new_status, ap_number) — row went inactive in Smartsheet
     escalations        = []  # pending > ESCALATION_DAYS and still diverging
 
     skipped_no_ap        = 0
@@ -664,20 +680,41 @@ def main(dry_run: bool = False):
     for task in tasks:
         ap_num = task['ap_number']
 
-        # Inactive rows exist ONLY to settle a pending Delivery or P&C flag.
-        # Anything else — new rows, unflagged rows — is dropped here exactly
-        # as if it had never been fetched (no counters, no logs), so behavior
-        # for non-pending rows is byte-identical to the old active-only fetch.
-        # Each destination branch below re-checks its own table's pending
-        # flag before doing anything with an inactive row — this top-level
-        # check only decides whether the row is worth resolving a lead for
-        # at all; it must not be trusted alone to prevent an inactive insert,
-        # since destination is resolved fresh per row and could in principle
-        # land on the table that ISN'T the one holding the pending flag.
+        # Inactive rows exist ONLY to settle a pending Delivery or P&C flag,
+        # or (non-pending) to close an existing row whose Smartsheet status
+        # went inactive. New/unknown rows are still dropped exactly as if
+        # never fetched (no counters, no logs). Pending rows continue into
+        # the main loop so the settle diff keeps sole authority over the
+        # flag; each destination branch below re-checks its own table's
+        # pending flag before doing anything with an inactive row — this
+        # top-level check must not be trusted alone to prevent an inactive
+        # insert, since destination is resolved fresh per row and could in
+        # principle land on the table that ISN'T the one holding the flag.
         if not task['active']:
             delivery_pending = bool(existing_delivery.get(ap_num, {}).get('ap_pending_update'))
             pc_pending = bool(existing_pc.get(ap_num, {}).get('ap_pending_update'))
             if not delivery_pending and not pc_pending:
+                # Status-only close (bug e6b35596 + its Delivery sibling):
+                # Complete/Cancelled/On Hold set in Smartsheet must reach an
+                # existing ORiON row even though inactive rows never
+                # otherwise sync. Update-only (never insert), and deliberately
+                # independent of lead resolution — a cleared Lead cell must
+                # not leave a finished row showing active forever. Only
+                # status moves: the row is inactive in the source, so nothing
+                # else should change on the way out (in particular, a
+                # cleared SQDCG must not null category — see bug b75a59f6).
+                d_ex = existing_delivery.get(ap_num)
+                d_status = STATUS_MAP.get(task['status_raw'])
+                if d_ex and d_status and d_ex.get('status') != d_status:
+                    to_close_delivery.append((d_ex['id'], d_status, ap_num))
+                    if dry_run:
+                        print(f"[DRY RUN] CLOSE    {ap_num:14} delivery — {d_ex.get('status')} -> {d_status} (Smartsheet: {task['status_raw']})")
+                pc_ex = existing_pc.get(ap_num)
+                pc_close_status = PC_STATUS_MAP.get(task['status_raw'])
+                if pc_ex and pc_close_status and pc_ex.get('status') != pc_close_status:
+                    to_close_pc.append((pc_ex['id'], pc_close_status, ap_num))
+                    if dry_run:
+                        print(f"[DRY RUN] CLOSE    {ap_num:14} P&C      — {pc_ex.get('status')} -> {pc_close_status} (Smartsheet: {task['status_raw']})")
                 continue
 
         if not ap_num or not task['action_text']:
@@ -726,6 +763,13 @@ def main(dry_run: bool = False):
         category   = map_category(task['sqdcg_raw'])
 
         if destination == 'delivery':
+            # Mirror of the P&C guard below: an inactive row let through the
+            # top-level filter by the OTHER table's pending flag must never
+            # create or modify a Delivery row, even if the Lead now resolves
+            # to a PLL.
+            if not task['active'] and not existing_delivery.get(ap_num, {}).get('ap_pending_update'):
+                continue
+
             status = STATUS_MAP.get(task['status_raw'], 'Open')
             notes  = build_delivery_notes(task)
 
@@ -842,7 +886,11 @@ def main(dry_run: bool = False):
                     fields['description'] = description
                 if pc_status != ex.get('status'):
                     fields['status'] = pc_status
-                if category != ex.get('category'):
+                # Guard (bug b75a59f6): never write a computed None over an
+                # existing non-null category — SQDCG is sparsely populated in
+                # the sheet, and a blank/cleared cell must not silently null
+                # a hand-set value. A real (non-null) change still syncs.
+                if category is not None and category != ex.get('category'):
                     fields['category'] = category
                 if start_date != ex.get('start_date'):
                     fields['start_date'] = start_date
@@ -926,11 +974,11 @@ def main(dry_run: bool = False):
     if dry_run:
         delivery_summary = (
             f"Delivery — would insert: {len(to_insert_delivery)}, would update: {len(to_update_delivery)}, "
-            f"would clear pending flag: {len(to_clear_pending)}"
+            f"would close: {len(to_close_delivery)}, would clear pending flag: {len(to_clear_pending)}"
         )
         pc_summary = (
             f"P&C      — would insert: {len(to_insert_pc)}, would update: {len(to_update_pc)}, "
-            f"would clear pending flag: {len(to_clear_pending_pc)}"
+            f"would close: {len(to_close_pc)}, would clear pending flag: {len(to_clear_pending_pc)}"
         )
         skip_summary = (
             f"Skipped  — no AP#/text: {skipped_no_ap}, unmapped lead: {skipped_unmapped}, "
@@ -1000,6 +1048,20 @@ def main(dry_run: bool = False):
         except Exception as e:
             log.error(f"Pending-flag clear failed for {ap_num}: {e}")
 
+    # Close Delivery rows that went inactive in Smartsheet — status only,
+    # plus last_updated to match the normal update path's discipline.
+    closed_delivery = 0
+    for item_id, new_status, ap_num in to_close_delivery:
+        try:
+            db.table('action_items') \
+                .update({'status': new_status, 'last_updated': datetime.now(timezone.utc).isoformat()}) \
+                .eq('id', item_id) \
+                .execute()
+            closed_delivery += 1
+            log.info(f"{ap_num}: closed (Delivery) — status -> {new_status}")
+        except Exception as e:
+            log.error(f"Delivery close failed for {ap_num}: {e}")
+
     # Insert new P&C items in batches of 25
     inserted_pc = 0
     for i in range(0, len(to_insert_pc), 25):
@@ -1031,6 +1093,20 @@ def main(dry_run: bool = False):
             cleared_pending_pc += 1
         except Exception as e:
             log.error(f"P&C pending-flag clear failed for {ap_num}: {e}")
+
+    # Close P&C rows that went inactive in Smartsheet — status only, plus
+    # updated_at to match the normal P&C update path's discipline.
+    closed_pc = 0
+    for item_id, new_status, ap_num in to_close_pc:
+        try:
+            db.table('pc_projects') \
+                .update({'status': new_status, 'updated_at': datetime.now(timezone.utc).isoformat()}) \
+                .eq('id', item_id) \
+                .execute()
+            closed_pc += 1
+            log.info(f"{ap_num}: closed (P&C) — status -> {new_status}")
+        except Exception as e:
+            log.error(f"P&C close failed for {ap_num}: {e}")
 
     # ── End-date change events (diffed pre-gate; deliberately AFTER the
     # child sync, and BEFORE the ap_titles upsert: if the stored end_date
@@ -1107,9 +1183,9 @@ def main(dry_run: bool = False):
     summary = (
         f"{now} | AP sync complete — "
         f"Delivery: inserted {inserted_delivery}, updated {updated_delivery}, "
-        f"pending cleared {cleared_pending} | "
+        f"closed {closed_delivery}, pending cleared {cleared_pending} | "
         f"P&C: inserted {inserted_pc}, updated {updated_pc}, "
-        f"pending cleared {cleared_pending_pc} | "
+        f"closed {closed_pc}, pending cleared {cleared_pending_pc} | "
         f"skipped: {skipped_total}, "
         f"pending Smartsheet updates: {len(pending)}, "
         f"escalated: {len(escalations)}, "
@@ -1192,8 +1268,10 @@ def main(dry_run: bool = False):
                 'domain': 'system',
                 'notes':  (
                     f'delivery_inserted={inserted_delivery} delivery_updated={updated_delivery} '
+                    f'delivery_closed={closed_delivery} '
                     f'delivery_pending_cleared={cleared_pending} escalated={len(escalations)} '
                     f'pc_inserted={inserted_pc} pc_updated={updated_pc} '
+                    f'pc_closed={closed_pc} '
                     f'pc_pending_cleared={cleared_pending_pc} skipped={skipped_total} '
                     f'titles_captured={len(parent_titles)} titles_written={titles_written} '
                     f'date_events_detected={len(date_events)} date_events_written={date_events_written} '
