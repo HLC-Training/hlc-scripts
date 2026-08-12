@@ -32,7 +32,7 @@ jobs:
 
       - name: Send digest
         env:
-          SUPABASE_SERVICE_KEY: ${{ secrets.ORION_SUPABASE_SERVICE_KEY }}
+          ORION_SUPABASE_SERVICE_KEY: ${{ secrets.ORION_SUPABASE_SERVICE_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
           TO_OVERRIDE: ${{ github.event.inputs.to }}

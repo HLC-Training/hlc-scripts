@@ -477,7 +477,7 @@ def main(dry_run: bool = False):
         log.info("Supabase connected")
     except Exception as e:
         log.error(f"Supabase connection failed: {e}")
-        return
+        sys.exit(1)
 
     # Load PLL (users) and TPM (portal_users) email → id maps.
     # Both sides are matched by lowercased email — GE addresses are mixed case.
@@ -497,7 +497,7 @@ def main(dry_run: bool = False):
         log.info(f"Users loaded: {len(email_to_id)} eligible (non-viewer), {len(viewer_emails)} viewer")
     except Exception as e:
         log.error(f"Failed to load users: {e}")
-        return
+        sys.exit(1)
 
     # portal_users is fetched WITHOUT a role filter: portal_email_to_id (the
     # actual P&C routing map) stays narrowed to role=tpm, but name_to_email
@@ -512,7 +512,7 @@ def main(dry_run: bool = False):
         log.info(f"Portal users loaded: {len(portal_email_to_id)} eligible (tpm) of {len(portal_resp.data)} total")
     except Exception as e:
         log.error(f"Failed to load portal_users: {e}")
-        return
+        sys.exit(1)
 
     # ap_lead_aliases: Smartsheet Lead text (a name or a wrong-but-linked email)
     # → the correct email. Loaded once per run, not queried per row.
@@ -525,7 +525,7 @@ def main(dry_run: bool = False):
         log.info(f"Lead aliases loaded: {len(alias_map)}")
     except Exception as e:
         log.error(f"Failed to load ap_lead_aliases: {e}")
-        return
+        sys.exit(1)
 
     # Name → email fallback for free-text Leads with no alias row (any role,
     # in either table — resolve_owner() is what actually enforces role/table).
@@ -580,7 +580,7 @@ def main(dry_run: bool = False):
         log.info(f"Existing Delivery AP items in Supabase: {len(existing_delivery)}")
     except Exception as e:
         log.error(f"Failed to load existing Delivery AP items: {e}")
-        return
+        sys.exit(1)
 
     # Load existing P&C (pc_projects) rows keyed by ap_number
     try:
@@ -596,7 +596,7 @@ def main(dry_run: bool = False):
         log.info(f"Existing P&C AP items in Supabase: {len(existing_pc)}")
     except Exception as e:
         log.error(f"Failed to load existing P&C AP items: {e}")
-        return
+        sys.exit(1)
 
     # ── AP title diff (top-level parent rows → ap_titles) ───────
     # Diffed here (before the dry-run gate) so dry runs can report it;
@@ -892,9 +892,15 @@ def main(dry_run: bool = False):
                 # a hand-set value. A real (non-null) change still syncs.
                 if category is not None and category != ex.get('category'):
                     fields['category'] = category
-                if start_date != ex.get('start_date'):
+                # Guard (bug 6f43d355): a blank/cleared Smartsheet cell must not
+                # null a stored date. Dates read as accident when blank, unlike
+                # category (sparse source) and unlike description (mirrored:
+                # a cleared description is intent, ruled 8/12). The target_end_date
+                # guard also stops the phantom target_date_moves increment that a
+                # None-write would record as a schedule slip that never happened.
+                if start_date is not None and start_date != ex.get('start_date'):
                     fields['start_date'] = start_date
-                if due_date != ex.get('target_end_date'):
+                if due_date is not None and due_date != ex.get('target_end_date'):
                     fields['target_end_date'] = due_date
                     # target_date_moves feeds the P&C timeline's drift view —
                     # increment the CURRENT value on every real target_end_date

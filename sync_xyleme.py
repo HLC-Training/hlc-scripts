@@ -39,7 +39,11 @@ from supabase import create_client
 
 # ─── CONFIG ─────────────────────────────────────────────────────
 SUPABASE_URL         = "https://czdkctjbejnwuopigxta.supabase.co"
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+# Project-scoped name (bug d2f44099, matching sync_ap.py / bug 306cea89) — the
+# generic "SUPABASE_SERVICE_KEY" risked resolving to the wrong project's key
+# across a three-project Supabase estate (this ORiON project, SAM COS,
+# GreenThumb). Matches the SAMCOS_SERVICE_KEY naming convention below.
+ORION_SUPABASE_SERVICE_KEY = os.environ.get("ORION_SUPABASE_SERVICE_KEY", "")
 SMARTSHEET_TOKEN     = os.environ.get("SMARTSHEET_API_TOKEN", "")
 SAMCOS_SERVICE_KEY   = os.environ.get("SAMCOS_SERVICE_KEY", "")
 
@@ -48,8 +52,8 @@ EXAMS_SHEET_ID         = "8868469282918276"
 
 LOG_FILE = Path(__file__).parent / "sync_xyleme.log"
 
-if not SUPABASE_SERVICE_KEY:
-    raise SystemExit("ERROR: SUPABASE_SERVICE_KEY not set.")
+if not ORION_SUPABASE_SERVICE_KEY:
+    raise SystemExit("ERROR: ORION_SUPABASE_SERVICE_KEY not set.")
 if not SMARTSHEET_TOKEN:
     raise SystemExit("ERROR: SMARTSHEET_API_TOKEN not set.")
 
@@ -410,7 +414,7 @@ def main():
 
     # Connect to ORION Supabase
     try:
-        db = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        db = create_client(SUPABASE_URL, ORION_SUPABASE_SERVICE_KEY)
         log.info("Supabase connected")
     except Exception as e:
         log.error(f"Supabase connection failed: {e}")

@@ -41,7 +41,11 @@ from supabase import create_client
 
 # ─── CONFIG ─────────────────────────────────────────────────────
 SUPABASE_URL         = "https://czdkctjbejnwuopigxta.supabase.co"
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+# Project-scoped name (bug d2f44099, matching sync_ap.py / bug 306cea89) — the
+# generic "SUPABASE_SERVICE_KEY" risked resolving to the wrong project's key
+# across a three-project Supabase estate (this ORiON project, SAM COS,
+# GreenThumb).
+ORION_SUPABASE_SERVICE_KEY = os.environ.get("ORION_SUPABASE_SERVICE_KEY", "")
 RESEND_API_KEY       = os.environ.get("RESEND_API_KEY", "")
 
 RESEND_API_URL = "https://api.resend.com/emails"
@@ -56,8 +60,8 @@ AGE_CALLOUT_DAYS = 14
 
 LOG_FILE = Path(__file__).parent / "send_ap_pending_digest.log"
 
-if not SUPABASE_SERVICE_KEY:
-    raise SystemExit("ERROR: SUPABASE_SERVICE_KEY environment variable is not set.")
+if not ORION_SUPABASE_SERVICE_KEY:
+    raise SystemExit("ERROR: ORION_SUPABASE_SERVICE_KEY environment variable is not set.")
 
 # ─── LOGGING ────────────────────────────────────────────────────
 logging.basicConfig(
@@ -308,7 +312,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    db = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    db = create_client(SUPABASE_URL, ORION_SUPABASE_SERVICE_KEY)
 
     delivery_rows = fetch_pending_delivery_rows(db)
     pc_rows = fetch_pending_pc_rows(db)

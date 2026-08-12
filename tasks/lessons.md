@@ -226,3 +226,24 @@ auth.uid(), so service-role writes pass); and when the only credentials
 live in GitHub secrets, `gh workflow run --ref <branch>` is the honest way
 to run unmerged sync code against production once — main's cron never sees
 the branch, and main still gets exactly one reviewed commit.
+
+## 2026-08-12 — Enumerate an exit-path class from the code, and rule null-guards per field
+
+Two from the sync-family cleanup (exit-0 hardening + P&C date guards,
+action item 83271599):
+
+Bug 2ae04371 said sync_ap.py main() had FIVE bare-return exit-0 paths; the
+code had SIX — the report never counted the client-init failure separately
+from the five table loads. When converting a class of early exits, grep
+the function and enumerate from the code, not from the bug report's list;
+a miscount here means one path keeps lying green after the "fix" ships.
+
+"Never write a computed None over a stored value" is not a blanket rule —
+it's a per-field ruling about what a blank source cell MEANS. Dates:
+accident, guard them (nobody deliberately clears a date, and target_end_date's
+None-write also phantom-incremented target_date_moves). Category: accident,
+guarded 8/11 (sparse source). Description: intent, MIRROR it — free text
+the owner cleared should clear downstream, and guarding it pins stale text
+forever. Ask "is a blank here a decision or a gap?" field by field before
+reaching for the guard; the same question is still open for the
+Delivery-side due_date/start_date diff, deliberately unfixed.
