@@ -247,3 +247,41 @@ the owner cleared should clear downstream, and guarding it pins stale text
 forever. Ask "is a blank here a decision or a gap?" field by field before
 reaching for the guard; the same question is still open for the
 Delivery-side due_date/start_date diff, deliberately unfixed.
+
+## 2026-08-12 (round 2) — A guard on a field that also feeds divergence logic changes two behaviors
+
+From the second sync-family pass (sync_xyleme exit-0 + Delivery date
+guards, action item dac56281, bugs bcd87bc4 / 74ebd314).
+
+The Delivery `due_date`/`start_date` null-guard looked like a mechanical
+repeat of the P&C one. It wasn't, because the `fields` dict it builds has
+two consumers, not one: the `if fields:` write path, AND the
+`ap_pending_update` caught-up/divergence check right below it, which
+decides whether a PLL's protected change has been reconciled and whether
+to escalate to a human past ESCALATION_DAYS. Guarding the dates therefore
+changed what counts as divergence — a blanked Smartsheet cell used to land
+in `fields` and read as "still diverging"; it now leaves `fields` empty and
+reads as "Smartsheet caught up."
+
+That reading is correct, and it killed a real prior misbehavior: a blank
+cell could never catch up, so the flag stayed set indefinitely and
+eventually escalated `due_date: '2026-09-30' -> None` — a phantom
+divergence about a change nobody made. The accepted residual: clearing the
+flag on a blank drops the PLL's protection without Smartsheet actually
+matching, so a later real date change overwrites the PLL edit instead of
+being held back. Narrower than the old failure, so it stands.
+
+The lesson, distinct from the plain null-guard one above: before adding a
+guard, find every reader of the structure you're guarding. A guard on a
+value that only feeds a write is a one-behavior change; the same guard on
+a value that also feeds divergence, reset, or escalation logic is a
+two-behavior change — and the second behavior is invisible in the diff.
+Verify both, and never edit the consumer to make the gate pass; the guard
+is what changed, not the logic reading it.
+
+Harness note: both proofs ran the REAL code, not a retyped copy — the
+Delivery gate extracts sync_ap.py's line range verbatim, dedents it, and
+execs it against synthetic rows, so the proof can't drift from what ships.
+The xyleme stub was also run against `git show 2b5417a:sync_xyleme.py` as
+a control: all four paths exit 0 there and 1 after the fix. A behavioral
+gate you never saw fail hasn't told you anything yet.

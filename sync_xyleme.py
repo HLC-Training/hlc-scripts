@@ -30,6 +30,7 @@ Schedule: GitHub Actions — every 30 minutes (same as sync_ap.py).
 
 import os
 import re
+import sys
 import uuid
 import logging
 import requests
@@ -418,7 +419,7 @@ def main():
         log.info("Supabase connected")
     except Exception as e:
         log.error(f"Supabase connection failed: {e}")
-        return
+        sys.exit(1)
 
     # Load user name → ID map
     try:
@@ -427,7 +428,7 @@ def main():
         log.info(f"Users loaded: {len(name_to_id)}")
     except Exception as e:
         log.error(f"Failed to load users: {e}")
-        return
+        sys.exit(1)
 
     # Fetch and aggregate Smartsheet data
     try:
@@ -435,7 +436,7 @@ def main():
         exam_map, exam_rows = fetch_sheet(EXAMS_SHEET_ID)
     except Exception as e:
         log.error(f"Smartsheet fetch failed: {e}")
-        return
+        sys.exit(1)
 
     courses = aggregate_modules(mod_map, mod_rows)
     exams   = aggregate_exams(exam_map, exam_rows)
@@ -453,7 +454,7 @@ def main():
         log.info(f"Existing xyleme items in Supabase: {len(existing)}")
     except Exception as e:
         log.error(f"Failed to load existing items: {e}")
-        return
+        sys.exit(1)
 
     inserted = updated = skipped = 0
 

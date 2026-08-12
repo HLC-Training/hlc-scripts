@@ -784,9 +784,16 @@ def main(dry_run: bool = False):
                     fields['owner_id'] = owner_id
                 if status != ex['status']:
                     fields['status'] = status
-                if due_date != ex.get('due_date'):
+                # Guard (bug 74ebd314): a blank/cleared Smartsheet date cell must
+                # not null a stored Delivery date. Same accident-when-blank ruling
+                # as the P&C side (6f43d355) — a blank date reads as accident, not
+                # intent, and the failure is silent unrecoverable data loss. Note:
+                # `fields` also drives the ap_pending_update caught-up/divergence
+                # logic below, so guarding here also (correctly) stops a blanked
+                # cell from registering as a diverging change the PLL flagged.
+                if due_date is not None and due_date != ex.get('due_date'):
                     fields['due_date'] = due_date
-                if start_date != ex.get('start_date'):
+                if start_date is not None and start_date != ex.get('start_date'):
                     fields['start_date'] = start_date
                 if ex.get('priority') != 'Tier 2':
                     fields['priority'] = 'Tier 2'
