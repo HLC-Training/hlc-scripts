@@ -317,3 +317,15 @@ lints (leaked-password-protection) but not auth_otp_long_expiry bounds
 the email OTP expiry at <= 3600s without ever reading the setting. An
 absence argument needs the presence of a sibling lint to prove the
 category is being checked at all.
+
+## reply_to lives on the Resend payload, not the recipient list
+
+`send_tpm_onboarding.py`'s copy says "reply here or ping me directly," but
+the Resend `.emails.send` call had no `reply_to` field, so a reply from a
+TPM went to nowhere anyone reads — `from:` controls where mail is sent
+FROM, not where a reply lands. Found and fixed 2026-08-14 (action item
+`4ba69961`). `send_pll_digest.py` already has this as an optional
+per-call parameter (`send_email(..., reply_to=None)`); onboarding only
+ever needs one fixed reply-to, so it's a module-level constant instead —
+same field, no per-call plumbing needed since there's only one caller
+shape.

@@ -74,6 +74,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 RESEND_API_URL = "https://api.resend.com/emails"
 GENERATE_LINK_URL = f"{SUPABASE_URL}/auth/v1/admin/generate_link"
 FROM_EMAIL = "orion@ofstraining.com"
+REPLY_TO_EMAIL = "jim.rosen@gevernova.com"
 JIM_EMAIL = "jim.rosen@gevernova.com"
 ORION_URL = "https://orion.ofstraining.com"
 # The recovery-link landing page (orion-pll app/reset-password/page.tsx).
@@ -267,11 +268,12 @@ directly.</td></tr>
 # ─── SEND ───────────────────────────────────────────────────────
 def send_email(to: str, subject: str, html_body: str, text_body: str) -> None:
     payload = {
-        'from':    FROM_EMAIL,
-        'to':      [to],
-        'subject': subject,
-        'html':    html_body,
-        'text':    text_body,
+        'from':     FROM_EMAIL,
+        'to':       [to],
+        'reply_to': REPLY_TO_EMAIL,
+        'subject':  subject,
+        'html':     html_body,
+        'text':     text_body,
     }
     resp = requests.post(
         RESEND_API_URL,
