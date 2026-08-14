@@ -152,7 +152,7 @@ def generate_recovery_link(email: str) -> str:
     payload = {
         "type": "recovery",
         "email": email,
-        "options": {"redirect_to": REDIRECT_TO},
+        "redirect_to": REDIRECT_TO,
     }
     headers = {
         "apikey": ORION_SUPABASE_SERVICE_KEY,

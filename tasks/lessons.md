@@ -329,3 +329,19 @@ per-call parameter (`send_email(..., reply_to=None)`); onboarding only
 ever needs one fixed reply-to, so it's a module-level constant instead —
 same field, no per-call plumbing needed since there's only one caller
 shape.
+
+## Raw REST calls to Supabase need their exact documented body shape, not SDK conventions
+
+Bug 065c166e: `send_tpm_onboarding.py`'s raw HTTP POST to
+`/auth/v1/admin/generate_link` nested `redirect_to` under `"options"`
+following the Python SDK's pattern, but the REST endpoint expects
+`redirect_to` as a flat top-level field. Supabase silently ignored the
+malformed nesting and fell back to the Site URL for every generated link.
+
+The official Python client's `.auth.admin.generate_link(...)` method
+handles the translation to the REST shape; raw endpoints need the exact
+documented body structure, and SDKs' nested-option conventions don't apply.
+If using raw HTTP to a Supabase Admin API, read the exact shape from the
+OpenAPI docs, not from an SDK example — and test the generated link's
+redirect_to field (parsed from the returned action_link) to catch this
+class of silent failure.
