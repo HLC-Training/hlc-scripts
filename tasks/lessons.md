@@ -345,3 +345,29 @@ If using raw HTTP to a Supabase Admin API, read the exact shape from the
 OpenAPI docs, not from an SDK example — and test the generated link's
 redirect_to field (parsed from the returned action_link) to catch this
 class of silent failure.
+
+## 2026-08-14 — "Deployed" means the SHA the runner checked out, not the file on disk
+
+The redirect_preserved=False that survived the 065c166e nesting fix was
+neither a second payload bug nor a checker bug: the fix commit (79b87c4)
+was sitting unpushed on local main, and every "post-fix" workflow_dispatch
+test ran at origin/main's c4815fe — the pre-fix code. The confirmation
+that the fix "was deployed" had been made by reading the local working
+tree, which is not the thing GitHub Actions executes. Once pushed, the
+very next test run logged redirect_preserved=True with zero code changes.
+
+The check that settles this in one line: compare `gh run list`'s headSha
+for the test run against `git log origin/main..main`. If the fix commit
+appears in the second command's output, no run has ever executed it. For
+any script whose only runtime is CI, "fixed locally" is indistinguishable
+from "not fixed" — verify the run's SHA contains the fix before
+interpreting its output as evidence about the fix.
+
+Also ruled out along the way: the URL-encoding false-negative hypothesis
+(that redirect_preserved() substring-matches an unencoded URL against an
+encoded action_link). The checker uses urllib's parse_qs, which
+percent-DECODES query values before the comparison, so an encoded
+redirect_to compares equal — encoding cannot produce a false negative
+there. Worth remembering the distinction anyway: a checker that string-
+hunts `redirect_to=<url>` inside a raw link WOULD break on encoding;
+parse-then-compare is the shape that survives.
