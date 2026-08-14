@@ -285,3 +285,35 @@ execs it against synthetic rows, so the proof can't drift from what ships.
 The xyleme stub was also run against `git show 2b5417a:sync_xyleme.py` as
 a control: all four paths exit 0 there and 1 after the fix. A behavioral
 gate you never saw fail hasn't told you anything yet.
+
+## 2026-08-14 — Trust the generate_link response over the auth config you remember, and a new dispatch workflow needs main first
+
+Three from the TPM onboarding build (send_tpm_onboarding.py, action
+item 083cc7a5):
+
+GoTrue silently REWRITES a redirect_to that fails the auth URL
+allow-list — generate_link still returns 200 and a working-looking
+action link whose redirect_to is now the Site URL fallback. The only
+honest check is parsing the returned action_link and comparing
+redirect_to to what was sent; the script does this and refuses a live
+send on mismatch. Related: a dashboard-config fix deferred to a human
+("Jim adds the allow-list entry") is not done until re-verified — the
+2026-08-04 fix for exactly this never happened, and by 2026-08-14 even
+the entries that DID exist then (vercel.app, localhost:3100) no longer
+survived. Config drifts; probe it empirically before building on it.
+
+A NEW workflow_dispatch workflow 404s on dispatch until its file exists
+on the DEFAULT branch — gh resolves the workflow against main, and
+pushing the file to a topic branch never registers it. The 8/12 lesson's
+`gh workflow run --ref <branch>` pattern works only for workflows main
+already has. Consequence: a brand-new manually-triggered workflow cannot
+be test-run before its first main commit, so "1 commit including the
+verification-evidence doc" is structurally impossible — code commit
+first, docs commit after the verified run.
+
+When the Management API and dashboard are both unreachable, advisor
+ABSENCE is usable config evidence: get_advisors returning auth-level
+lints (leaked-password-protection) but not auth_otp_long_expiry bounds
+the email OTP expiry at <= 3600s without ever reading the setting. An
+absence argument needs the presence of a sibling lint to prove the
+category is being checked at all.
