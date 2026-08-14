@@ -21,16 +21,20 @@ TARGETS
       email per person. Jim's trigger alone, D-Day morning.
 
 REDIRECT PRESERVATION GUARD
-  GoTrue silently replaces a redirect_to that is not on the Auth URL
-  allow-list with the project Site URL — which on this shared project
-  is still the legacy hlc-pll-dashboard GitHub Pages URL (orion-pll
-  knowledge/decisions/2026-08-04-redirect-fix.md, bug 42ca9229; the
-  allow-list entry for orion.ofstraining.com was confirmed still
-  missing 2026-08-14). A generated link that came back rewritten is a
-  BROKEN link. Live mode therefore generates and validates every link
-  BEFORE sending anything, and refuses to send at all on a mismatch.
-  Test mode warns loudly but still sends, so the rest of the pipeline
-  stays provable while the dashboard config is pending.
+  GoTrue silently replaces a redirect_to it does not recognize with the
+  project Site URL — which on this shared project is still the legacy
+  hlc-pll-dashboard GitHub Pages URL (orion-pll
+  knowledge/decisions/2026-08-04-redirect-fix.md, bug 42ca9229). A
+  generated link that came back rewritten is a BROKEN link. Two causes
+  have produced this in practice: an allow-list gap (the 2026-08-04
+  incident; the orion.ofstraining.com entries were confirmed PRESENT on
+  2026-08-14, screenshot evidence) and a malformed generate_link payload
+  (bug 065c166e — redirect_to nested under "options" instead of
+  top-level, which GoTrue silently ignores). Live mode therefore
+  generates and validates every link BEFORE sending anything, and
+  refuses to send at all on a mismatch. Test mode warns loudly but
+  still sends, so the rest of the pipeline stays provable while a
+  redirect problem is being chased.
 
 TOKEN HYGIENE
   The action link contains an unexpired recovery token. It goes into
@@ -355,10 +359,12 @@ def main():
               if u['id'] in links and not redirect_preserved(links[u['id']])]
     if broken:
         msg = (f"redirect_to was NOT preserved for {len(broken)}/{len(links)} links — "
-               f"the Supabase Auth URL allow-list is missing {REDIRECT_TO} "
-               f"(dashboard > Authentication > URL Configuration; see orion-pll "
-               f"knowledge/decisions/2026-08-04-redirect-fix.md). These links land on "
-               f"the legacy Site URL fallback instead of the reset page.")
+               f"GoTrue substituted the Site URL for {REDIRECT_TO}. Either the Auth "
+               f"URL allow-list dropped it (dashboard > Authentication > URL "
+               f"Configuration) or the generate_link payload shape regressed "
+               f"(redirect_to must be TOP-LEVEL, not under 'options' — bug 065c166e). "
+               f"These links land on the legacy Site URL fallback instead of the "
+               f"reset page.")
         if live:
             log.error(f"REFUSING LIVE SEND: {msg}")
             sys.exit(1)
