@@ -1,0 +1,46 @@
+name: ORION TPM Onboarding Email
+
+# workflow_dispatch ONLY — deliberately no schedule block. This is a
+# one-time send of account-recovery links to 9 real GE Vernova
+# colleagues, not a recurring digest: there is no next-run safety net,
+# so the trigger stays manual (Jim's, D-Day morning). Do not add a cron
+# "just in case" (SAM COS action item 083cc7a5, 2026-08-14 build brief).
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: >-
+          test = one email to Jim using Jim's own account (subject gets a
+          [TEST] prefix). live = REAL onboarding send to every
+          portal_users row with role=tpm — Jim's manual trigger only.
+        required: true
+        type: choice
+        options:
+          - test
+          - live
+        default: test
+
+jobs:
+  onboarding:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install supabase requests
+
+      - name: Send onboarding email(s)
+        env:
+          # Same repo secrets the digest workflows already read
+          # (tpm-digest.yml / pll-digest.yml). ORION_-prefixed key name on
+          # purpose — lessons.md 2026-08-03.
+          ORION_SUPABASE_SERVICE_KEY: ${{ secrets.ORION_SUPABASE_SERVICE_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          TARGET: ${{ github.event.inputs.target }}
+        run: python scripts/send_tpm_onboarding.py --target "$TARGET"
