@@ -37,7 +37,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install requests
+        run: pip install requests supabase
 
       - name: Run diagnostic (render + send)
         env:
