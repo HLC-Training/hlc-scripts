@@ -795,8 +795,12 @@ def main(dry_run: bool = False):
                     fields['due_date'] = due_date
                 if start_date is not None and start_date != ex.get('start_date'):
                     fields['start_date'] = start_date
-                if ex.get('priority') != 'Tier 2':
-                    fields['priority'] = 'Tier 2'
+                # priority is intentionally NOT re-forced here (bug aaaa96ea,
+                # 2026-08-20) — mirrors the P&C shape below. A PLL may re-tier
+                # an AP item deliberately (ORiON-side reason gate covers it);
+                # only the initial Tier 2 import assumption is forced, once,
+                # on insert. Re-forcing on every sync silently discarded that
+                # choice within 30 minutes with no error and no record.
 
                 if ex.get('ap_pending_update'):
                     if not fields:
