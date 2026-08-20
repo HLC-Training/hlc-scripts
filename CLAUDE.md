@@ -6,12 +6,17 @@ Scheduled sync and automation scripts for the SAM COS and ORiON systems.
 
 - `sync_ap.py` — Smartsheet AP tracker to ORiON Supabase (`czdkctjbejnwuopigxta`).
   One-way, Delivery and P&C scoped. Runs on GitHub Actions.
-- `sync_vault.py` — bidirectional vault sync. Vault to Supabase import, and
-  Supabase to vault export with business logic (WIP-overage flagging,
-  resurrection guards, owner-alias resolution). Runs on ARGUS Task Scheduler,
-  not Actions. It stays there until a Drive read API exists (`43d90f26`).
 - `sync_repo_docs.py` — repo reasoning docs to SAM COS Supabase. Vendored
   identically into four repos; samcos is canonical.
+
+`sync_vault.py` does NOT live in this repo, despite this file previously
+claiming otherwise. It lives in `samcos/scripts/sync_vault.py` and has run on
+GitHub Actions since 2026-08-07 (decision `6558742d` / action item `e5f1ee5c`),
+reading `open-actions.md` via the Drive API. ARGUS's Task Scheduler copy is
+disabled, not deleted — its heartbeat (`health:argus:orion_vault_sync`) has
+been frozen since 2026-08-07. Corrected 2026-08-20 during the vault-import
+due_date pipeline build (action item `b1bfe79e`); this file had never been
+updated for the 2026-08-07 migration.
 
 ## Databases
 
