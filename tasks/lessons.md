@@ -450,3 +450,28 @@ violation.
 Also from the same build: prove a behavioral gate can FAIL before
 trusting its pass — the harness ran the pre-fix code via git show as a
 control and watched it insert the duplicate the new code refuses.
+
+## 2026-08-20 — An exclusion added to work around one defect needs its reason re-derived, not just re-approved, when that defect is fixed
+
+From the AP tier authority build (bugs aaaa96ea, 6cc5e30c, decision
+2026-08-20-ap-tier-authority.md). The `86fd0c07` build excluded
+`priority` from `ap_pending_update`'s raise set because `sync_ap.py`'s
+force-reset made a priority-raised flag unclearable — a real reason, but
+a transient one, tied to a bug that was itself scheduled to be fixed a
+few hours later in the same day's work. When the force-reset fix landed,
+the exclusion's *stated* reason (the code comment) went stale, while the
+exclusion itself stayed correct — for a different, durable reason that
+had been true the whole time and nobody had written down: the Smartsheet
+tracker has no tier column at all, so a tier-raised flag could never
+clear regardless of what the sync does. Two ways to get this wrong: (1)
+"the force-reset is gone, so re-add priority to the raise set" — treats
+the stated reason as the only reason, and misses that the flag would
+still be structurally unclearable; (2) leave the comment saying "because
+of the force-reset" — technically still excluded, but the next reader
+who fixes some *other* sync behavior has no way to know the exclusion
+doesn't depend on it, and will "correct" it back in. The fix for both is
+the same: when removing whatever justified an exclusion, don't just
+re-approve the exclusion — verify independently whether a *different*,
+durable reason also holds (here: check the tracker's actual columns, not
+the sync code), and if it does, rewrite the reason in place so the next
+session inherits the real one instead of the expired one.
