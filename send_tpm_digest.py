@@ -11,7 +11,7 @@ In P&C, "project" (pc_projects) is the naming convention for what
 Delivery calls an action item — same concept, different table and
 different word. Weekday mornings (~6:00 America/Chicago), Michele gets
 ONE combined ORiON-branded email covering every TPM's P&C projects,
-grouped by TPM owner, with up to four sections:
+grouped by TPM owner, with up to five sections:
   1. "New projects" — pc_projects rows created since the last digest
      actually sent.
   2. "Coming up in the next two weeks" — non-terminal projects with
@@ -26,7 +26,17 @@ grouped by TPM owner, with up to four sections:
      TPM at 5 longest-quiet with a "+N more" line, same convention as
      Overdue. Present only for TPMs with items in it, same
      absent-if-empty behavior as the other sections.
-If every TPM is empty across all four sections, NO email is sent —
+  5. "Missing required information" — open projects missing a mandatory
+     field, from the shared incomplete_pc_rows view (Mechanism 3, SAM COS
+     action item 7007b802, orion-pll docs/migrations/
+     2026-08-20_incomplete_rows_view.sql — single completeness definition,
+     ported from lib/incomplete-rows.ts; this digest never reimplements
+     the predicate). Closed rows (complete/cancelled) excluded, matching
+     the in-app Mechanism 2 prompt exactly. Capped PER TPM at 5 with a
+     "+N more" line, same convention as Overdue / Approaching Stale. This
+     section ships behind the same TEST-mode gate as the rest of this
+     digest — inert (renders to Jim only) until Jim flips TPM_DIGEST_LIVE.
+If every TPM is empty across all five sections, NO email is sent —
 there is nothing here for the once-a-day habit to protect.
 
 Nothing is ever sent to a TPM. Michele is the sole live recipient; Jim
@@ -190,6 +200,19 @@ def fetch_approaching(db, owner_ids: list[str]) -> list[dict]:
     return detail.data or []
 
 
+def fetch_incomplete(db, owner_ids: list[str]) -> list[dict]:
+    """Missing-required-information projects for these owners, from the
+    shared incomplete_pc_rows view (Mechanism 3, SAM COS action item
+    7007b802, orion-pll docs/migrations/2026-08-20_incomplete_rows_view.sql).
+    Defines completeness once — this digest must never reimplement the
+    predicate in Python, same rule as the Approaching Stale view above."""
+    resp = db.table('incomplete_pc_rows') \
+        .select('id, owner_id, title, missing_fields') \
+        .in_('owner_id', owner_ids) \
+        .execute()
+    return resp.data or []
+
+
 def fetch_state(db) -> datetime | None:
     """Return the watermark timestamp (latest successful run's sent_at)."""
     resp = db.table('tpm_digest_state').select('sent_at') \
@@ -211,11 +234,13 @@ def parse_date(raw) -> date | None:
 
 # ─── DIGEST ASSEMBLY ────────────────────────────────────────────
 def build_digest(tpm: dict, projects: list[dict], approaching_items: list[dict],
+                 incomplete_items: list[dict],
                  watermark: datetime, today: date) -> dict | None:
-    """Four sections for one TPM; None if all empty."""
+    """Five sections for one TPM; None if all empty."""
     own = [p for p in projects
            if p['owner_id'] == tpm['id'] and p.get('status') not in DONE_STATUSES]
     own_approaching = [p for p in approaching_items if p['owner_id'] == tpm['id']]
+    own_incomplete = [p for p in incomplete_items if p['owner_id'] == tpm['id']]
 
     new_items = sorted(
         (p for p in own if parse_timestamp(p['created_at']) > watermark),
@@ -237,8 +262,9 @@ def build_digest(tpm: dict, projects: list[dict], approaching_items: list[dict],
         own_approaching,
         key=lambda p: p.get('updated_at') or '',   # oldest updated_at first = longest quiet
     )
+    incomplete_all = sorted(own_incomplete, key=lambda p: p['title'])
 
-    if not new_items and not due_soon and not overdue_all and not approaching_all:
+    if not new_items and not due_soon and not overdue_all and not approaching_all and not incomplete_all:
         return None
 
     return {
@@ -249,6 +275,8 @@ def build_digest(tpm: dict, projects: list[dict], approaching_items: list[dict],
         'overdue_overflow':     max(0, len(overdue_all) - OVERDUE_CAP),
         'approaching':          approaching_all[:OVERDUE_CAP],
         'approaching_overflow': max(0, len(approaching_all) - OVERDUE_CAP),
+        'incomplete':           incomplete_all[:OVERDUE_CAP],
+        'incomplete_overflow':  max(0, len(incomplete_all) - OVERDUE_CAP),
     }
 
 
@@ -327,6 +355,39 @@ def section_html(heading: str, tpm_blocks: list[str], intro: str = '') -> str:
     )
 
 
+def incomplete_row_html(project: dict, zebra: bool) -> str:
+    # Single-line row per Task 4's verbatim per-row format — no second
+    # meta line, unlike item_row_html's other-section shape.
+    bg = f'background-color:{ZEBRA};' if zebra else ''
+    labels = esc(', '.join(project['missing_fields']))
+    return (
+        f'<tr><td style="{bg}padding:8px 14px 8px 28px;border-bottom:1px solid {BORDER};'
+        f'font-family:{FONT};font-size:14px;color:{NIGHT};line-height:1.4;">'
+        f'{esc(project["title"])} &mdash; missing: {labels}'
+        f'</td></tr>'
+    )
+
+
+def incomplete_blocks(results: list[dict]) -> list[str]:
+    """One tpm_group_html block per TPM that has incomplete projects."""
+    blocks = []
+    for r in results:
+        d = r['digest']
+        if d is None or not d['incomplete']:
+            continue
+        rows = [incomplete_row_html(p, idx % 2 == 1)
+                for idx, p in enumerate(d['incomplete'])]
+        extra = ''
+        if d['incomplete_overflow']:
+            extra = (
+                f'<tr><td style="padding:8px 14px 8px 28px;font-family:{FONT};font-size:13px;'
+                f'color:{MUTED};">Plus {d["incomplete_overflow"]} more missing required '
+                f'information in ORiON.</td></tr>'
+            )
+        blocks.append(tpm_group_html(r['tpm']['name'], rows, extra))
+    return blocks
+
+
 def section_blocks(results: list[dict], key: str, meta_fn) -> list[str]:
     """One tpm_group_html block per TPM that has items in this section."""
     blocks = []
@@ -379,6 +440,9 @@ def build_html_body(results: list[dict], today: date) -> str:
             intro="These haven't been updated in a while and will flip to Stale soon "
                   "&mdash; a note in ORiON resets the clock. See the Approaching Stale "
                   "help article in ORiON for details."),
+        section_html("Missing required information", incomplete_blocks(results),
+            intro="These projects are missing required information. Owners see the "
+                  "same list when they sign in."),
     ]
 
     return f"""<!DOCTYPE html>
@@ -449,6 +513,32 @@ def text_section(heading: str, results: list[dict], key: str, meta_fn, intro: st
     return lines
 
 
+def incomplete_text_section(results: list[dict]) -> list[str]:
+    heading = "Missing required information"
+    lines = []
+    any_block = False
+    for r in results:
+        d = r['digest']
+        if d is None or not d['incomplete']:
+            continue
+        if not any_block:
+            lines.append(heading)
+            lines.append("-" * len(heading))
+            lines.append("These projects are missing required information. Owners "
+                          "see the same list when they sign in.")
+            any_block = True
+        lines.append(f"{r['tpm']['name']}:")
+        for p in d['incomplete']:
+            labels = ', '.join(p['missing_fields'])
+            lines.append(f"  - {p['title']} -- missing: {labels}")
+        if d['incomplete_overflow']:
+            lines.append(f"      Plus {d['incomplete_overflow']} more missing required "
+                          f"information in ORiON.")
+    if any_block:
+        lines.append("")
+    return lines
+
+
 def build_text_body(results: list[dict], today: date) -> str:
     lines = [
         "Hi Michele, here's where your team's P&C projects stand this morning "
@@ -469,6 +559,7 @@ def build_text_body(results: list[dict], today: date) -> str:
                           intro="These haven't been updated in a while and will flip to Stale soon "
                                 "-- a note in ORiON resets the clock. See the Approaching Stale "
                                 "help article in ORiON for details.")
+    lines += incomplete_text_section(results)
     lines += [
         "Want the full picture? Open ORiON to see every P&C project.",
         f"Open ORiON: {ORION_URL}",
@@ -553,6 +644,7 @@ def main():
         tpms = fetch_tpms(db)
         projects = fetch_projects(db, [t['id'] for t in tpms])
         approaching = fetch_approaching(db, [t['id'] for t in tpms])
+        incomplete = fetch_incomplete(db, [t['id'] for t in tpms])
         watermark = fetch_state(db)
     except Exception as e:
         log.error(f"Supabase fetch failed — aborting without sending: {e}")
@@ -562,7 +654,7 @@ def main():
         watermark = now_chicago.astimezone(timezone.utc) - timedelta(hours=FALLBACK_WINDOW_HOURS)
         log.info(f"No watermark row — fallback window since {watermark.isoformat()}.")
 
-    results = [{'tpm': t, 'digest': build_digest(t, projects, approaching, watermark, today)} for t in tpms]
+    results = [{'tpm': t, 'digest': build_digest(t, projects, approaching, incomplete, watermark, today)} for t in tpms]
     to_report = [r for r in results if r['digest'] is not None]
     log.info(f"{len(tpms)} TPMs — {len(to_report)} with items to report, "
              f"{len(tpms) - len(to_report)} suppressed (no items).")

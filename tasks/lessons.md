@@ -371,3 +371,48 @@ redirect_to compares equal — encoding cannot produce a false negative
 there. Worth remembering the distinction anyway: a checker that string-
 hunts `redirect_to=<url>` inside a raw link WOULD break on encoding;
 parse-then-compare is the shape that survives.
+
+## 2026-08-20 — A repo variable can drift true while every doc still says off; check gh, not the docstring
+
+From the Mechanism 3 digest build (action item 7007b802). Every source —
+the build brief, send_tpm_digest.py's own module docstring, orion-pll's
+pll-digest.md help copy — agreed `TPM_DIGEST_LIVE` was off and this
+digest "stays in TEST mode indefinitely." It wasn't: `gh variable list`
+showed it flipped `true` on 2026-08-14, and `gh run list` confirmed every
+scheduled run since (08-17 through 08-20) sent live to Michele. Nothing
+that changed the flag ever touched the docstring or the help doc — a
+live/test gate's *documented* state and its *actual* state can diverge
+silently, with zero code-visible signal, the moment someone flips a GitHub
+Actions repo variable without a corresponding doc update. Before trusting
+any "this stays in test mode" comment near a live-send gate, run `gh
+variable list` (or the equivalent for the actual switch) directly — don't
+infer current state from a docstring, a help article, or a build brief,
+all of which can lag the real flag by however long nobody rewrites them.
+
+Separately: `lib/incomplete-rows.ts`'s own comment/label ("Action text")
+had quietly drifted one word from Mechanism 1's real form validator
+("Action item text") — a shared/duplicated definition can drift from its
+own upstream source, not just from a reimplementation elsewhere. And a
+decision doc's field-count table (3159216d: "five/six mandatory fields")
+listed the full design intent, including a field (owner) that is
+structurally never reachable as missing (NOT NULL / guaranteed-on-create)
+— a design-intent list and a checkable-field list aren't automatically the
+same thing; verify a fixture-count instruction against what the code can
+actually produce before building to it.
+
+Also: `findIncompleteDeliveryRows`/`findIncompletePcRows` (orion-pll,
+`lib/incomplete-rows.ts`) call `createClient()` from `@/lib/supabase/
+server`, which imports `cookies()` from `next/headers` — this throws
+outside a real Next.js request scope, so it can't be driven from a plain
+tsx script the way `lib/email-inbox.ts`'s functions can (those use
+`createServiceClient` instead, no cookies involved — check which client
+factory a function uses before assuming the authz-harness script pattern
+applies). A Node `module.register()` hook to stub `next/headers` was tried
+and abandoned: tsx's own module resolution for a script's *nested* TS
+imports doesn't visibly yield to an externally `--import`-registered
+loader, even though the loader's `resolve` hook does fire for the entry
+file and Node's own dependency graph. The honest fix was a real request
+context — a temporary, disposable API route calling the unmodified
+functions, hit from a real authenticated browser session (a disposable
+fixture director account, deleted after) — not a mock of the one thing
+that was hard to fake.

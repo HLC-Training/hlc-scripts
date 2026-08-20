@@ -5,7 +5,7 @@ send_pll_digest.py
 Daily per-PLL action-item digest (SAM COS action item 37425f71).
 
 Weekday mornings (~6:00 America/Chicago), each PLL gets an
-ORiON-branded email with up to four sections:
+ORiON-branded email with up to five sections:
   1. "Added since your last update" — items imported by sync_vault.py
      (source = 'vault_import') since the last digest actually sent.
      Watermark-based, NOT "yesterday": Monday covers the weekend.
@@ -19,7 +19,15 @@ ORiON-branded email with up to four sections:
      mirrors Part 1's badge, which shows regardless of Open/In Progress/
      Deferred. Capped at 5 longest-quiet with a "+N more" line, same
      convention as Past due.
-A PLL with zero items across all four sections gets NO email.
+  5. "Missing required information" — open items missing a mandatory
+     field, from the shared incomplete_delivery_rows view (Mechanism 3,
+     SAM COS action item 7007b802, orion-pll docs/migrations/
+     2026-08-20_incomplete_rows_view.sql — single completeness definition,
+     ported from lib/incomplete-rows.ts; this digest never reimplements
+     the predicate). Closed rows (status = 'Done') excluded, matching the
+     in-app Mechanism 2 prompt exactly. Capped at 5 with a "+N more" line,
+     same convention as Past due / Approaching Stale.
+A PLL with zero items across all five sections gets NO email.
 Jim gets one consolidated roll-up per run (not a cc on each email),
 including per-PLL Approaching counts.
 
@@ -168,6 +176,19 @@ def fetch_approaching(db, owner_ids: list[str]) -> list[dict]:
     return detail.data or []
 
 
+def fetch_incomplete(db, owner_ids: list[str]) -> list[dict]:
+    """Missing-required-information rows for these owners, from the shared
+    incomplete_delivery_rows view (Mechanism 3, SAM COS action item
+    7007b802, orion-pll docs/migrations/2026-08-20_incomplete_rows_view.sql).
+    Defines completeness once — this digest must never reimplement the
+    predicate in Python, same rule as the Approaching Stale view above."""
+    resp = db.table('incomplete_delivery_rows') \
+        .select('id, owner_id, title, missing_fields') \
+        .in_('owner_id', owner_ids) \
+        .execute()
+    return resp.data or []
+
+
 def fetch_state(db) -> tuple[datetime | None, set]:
     """Return (watermark, ids reported in the previous run's section 1)."""
     resp = db.table('pll_digest_state').select('sent_at, summary') \
@@ -193,10 +214,12 @@ def parse_date(raw) -> date | None:
 
 # ─── DIGEST ASSEMBLY ────────────────────────────────────────────
 def build_digest(pll: dict, items: list[dict], approaching_items: list[dict],
+                 incomplete_items: list[dict],
                  watermark_date: date, prev_section1_ids: set, today: date) -> dict | None:
-    """Four sections for one PLL; None if all empty (→ no email)."""
+    """Five sections for one PLL; None if all empty (→ no email)."""
     own = [i for i in items if i['owner_id'] == pll['id']]
     own_approaching = [i for i in approaching_items if i['owner_id'] == pll['id']]
+    own_incomplete = [i for i in incomplete_items if i['owner_id'] == pll['id']]
 
     new_items = sorted(
         (i for i in own
@@ -222,8 +245,9 @@ def build_digest(pll: dict, items: list[dict], approaching_items: list[dict],
         own_approaching,
         key=lambda i: i.get('last_updated') or '',   # oldest last_updated first = longest quiet
     )
+    incomplete_all = sorted(own_incomplete, key=lambda i: i['title'])
 
-    if not new_items and not due_soon and not overdue_all and not approaching_all:
+    if not new_items and not due_soon and not overdue_all and not approaching_all and not incomplete_all:
         return None
 
     return {
@@ -234,6 +258,8 @@ def build_digest(pll: dict, items: list[dict], approaching_items: list[dict],
         'overdue_overflow':     max(0, len(overdue_all) - OVERDUE_CAP),
         'approaching':          approaching_all[:OVERDUE_CAP],
         'approaching_overflow': max(0, len(approaching_all) - OVERDUE_CAP),
+        'incomplete':           incomplete_all[:OVERDUE_CAP],
+        'incomplete_overflow':  max(0, len(incomplete_all) - OVERDUE_CAP),
     }
 
 
@@ -276,6 +302,19 @@ def item_row_html(item: dict, meta: str, meta_color: str, zebra: bool) -> str:
         f'font-family:{FONT};font-size:14px;color:{NIGHT};line-height:1.4;">'
         f'{esc(item["action_text"])}'
         f'<br><span style="font-size:12px;color:{meta_color};">{meta}</span>'
+        f'</td></tr>'
+    )
+
+
+def incomplete_row_html(item: dict, zebra: bool) -> str:
+    # Single-line row per Task 4's verbatim per-row format — no second
+    # meta line, unlike the other sections' item_row_html.
+    bg = f'background-color:{ZEBRA};' if zebra else ''
+    labels = esc(', '.join(item['missing_fields']))
+    return (
+        f'<tr><td style="{bg}padding:10px 14px;border-bottom:1px solid {BORDER};'
+        f'font-family:{FONT};font-size:14px;color:{NIGHT};line-height:1.4;">'
+        f'{esc(item["title"])} &mdash; missing: {labels}'
         f'</td></tr>'
     )
 
@@ -367,6 +406,22 @@ def build_html_body(digest: dict, today: date) -> str:
             intro="These haven't been updated in a while and will flip to Stale soon "
                   '&mdash; a quick note in ORiON resets the clock. See the Approaching Stale '
                   'help article in ORiON for details.'))
+    if digest['incomplete']:
+        rows = [
+            incomplete_row_html(i, idx % 2 == 1)
+            for idx, i in enumerate(digest['incomplete'])
+        ]
+        extra = ''
+        if digest['incomplete_overflow']:
+            extra = (
+                f'<tr><td style="padding:10px 14px;font-family:{FONT};font-size:13px;'
+                f'color:{MUTED};">Plus {digest["incomplete_overflow"]} more missing '
+                f'required information in ORiON.</td></tr>'
+            )
+        sections.append(section_html(
+            "Missing required information", rows, extra,
+            intro="These items are missing information ORiON needs. Open one to "
+                  "fill in what's missing."))
 
     return f"""<!DOCTYPE html>
 <html>
@@ -456,6 +511,18 @@ def build_text_body(digest: dict, today: date) -> str:
             lines.append(f"    {days_quiet(i['last_updated'], today)} | {i.get('status')}{due}")
         if digest['approaching_overflow']:
             lines.append(f"Plus {digest['approaching_overflow']} more approaching stale in ORiON.")
+        lines.append("")
+    if digest['incomplete']:
+        lines.append("Missing required information")
+        lines.append("-" * 29)
+        lines.append("These items are missing information ORiON needs. Open one to "
+                      "fill in what's missing.")
+        for i in digest['incomplete']:
+            labels = ', '.join(i['missing_fields'])
+            lines.append(f"- {i['title']} -- missing: {labels}")
+        if digest['incomplete_overflow']:
+            lines.append(f"Plus {digest['incomplete_overflow']} more missing required "
+                          f"information in ORiON.")
         lines.append("")
     lines += [
         "Want the full picture? Open ORiON to see everything on your plate.",
@@ -597,6 +664,7 @@ def main():
         plls = fetch_plls(db)
         items = fetch_items(db, [p['id'] for p in plls])
         approaching = fetch_approaching(db, [p['id'] for p in plls])
+        incomplete = fetch_incomplete(db, [p['id'] for p in plls])
         watermark, prev_section1_ids = fetch_state(db)
     except Exception as e:
         log.error(f"Supabase fetch failed — aborting without sending: {e}")
@@ -610,7 +678,7 @@ def main():
 
     results = []
     for pll in plls:
-        digest = build_digest(pll, items, approaching, watermark_date, prev_section1_ids, today)
+        digest = build_digest(pll, items, approaching, incomplete, watermark_date, prev_section1_ids, today)
         results.append({'pll': pll, 'digest': digest, 'result': None})
 
     to_send = [r for r in results if r['digest'] is not None]
