@@ -416,3 +416,37 @@ context — a temporary, disposable API route calling the unmodified
 functions, hit from a real authenticated browser session (a disposable
 fixture director account, deleted after) — not a mock of the one thing
 that was hard to fake.
+
+## 2026-08-20 — A dedup key for a synced file must be the file's own identity, stamped once, never derived from mutable destination state
+
+From the vault dedup fix (bug 545f0c88, decision
+2026-08-20-sync-integrity-trio.md). sync_vault.py matched vault entries
+to ORiON rows on (owner_id, action_text) — both mutable in ORiON — so
+reassigning a row's owner made its entry match nothing and the next run
+re-inserted a duplicate under the original owner. The durable shape: the
+key is the SOURCE record's own immutable identity (here the header line's
+date|owner-as-written|text), stamped on the destination row at import,
+compared on every later run. Three sub-rules that mattered:
+
+1. Enumerate the source's real identity before picking fields — text
+   alone and (date, text) were both disproven by live data (four
+   legitimate same-text same-date rows under four owners). The file's
+   identity genuinely includes its owner field.
+2. Use the source's RAW bytes, not anything that passes through a
+   resolution layer — keying on the alias-resolved owner name would
+   silently re-key every entry the day someone edits OWNER_ALIASES, and
+   a re-key at scale is a mass re-import.
+3. Exclude the one field with change pressure (status) — a key
+   containing anything editable re-creates the bug it fixes.
+
+Deploy mechanics: a stamped-key cutover has a race window (old code
+inserts keyless rows between backfill and deploy). A legacy-match
+fallback restricted to vault_key IS NULL rows, stamping on hit, closes
+it without reviving the mutable-key path — each row is legacy-matched at
+most once, ever. And a partial UNIQUE index on the key turns the
+catastrophic failure mode (mass re-duplication) into a loud constraint
+violation.
+
+Also from the same build: prove a behavioral gate can FAIL before
+trusting its pass — the harness ran the pre-fix code via git show as a
+control and watched it insert the duplicate the new code refuses.
