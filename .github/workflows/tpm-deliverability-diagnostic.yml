@@ -1,0 +1,45 @@
+name: ORION TPM Email Deliverability Diagnostic
+
+# workflow_dispatch ONLY — this is a one-off diagnostic to test whether
+# the welcome template or the TPM recipient group explains zero TPM
+# confirmations despite Resend showing all 9 sent 2026-08-17 as delivered.
+# No schedule, no automation, Jim's manual trigger only.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: >-
+          Type "send diagnostic email" to proceed. Sends one email to
+          jim.rosen@gevernova.com with the exact welcome template TPMs
+          received (same From, subject, body, link structure). An accidental
+          dispatch cannot send mail without this confirmation.
+        required: true
+        type: string
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "send diagnostic email" ]; then
+            echo "ERROR: confirmation text does not match. Aborting."
+            echo "You must type exactly: send diagnostic email"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run diagnostic (render + send)
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+        run: python verify_template_diagnostic.py
