@@ -1,0 +1,147 @@
+TEMPLATE VERIFICATION — TPM Welcome Email Diagnostic
+=====================================================
+
+Diagnostic Script: verify_template_diagnostic.py
+Build Date: 2026-08-20
+
+RENDERED TEMPLATE COMPARISON
+────────────────────────────
+
+Render Source: scripts/send_tpm_onboarding.py (canonical, unmodified)
+Render Functions: build_text_body(), build_html_body()
+
+Template copy source: Supplied verbatim in 2026-08-14 build brief
+                      (per script comments line 189-190)
+
+RENDERED PLAIN TEXT BODY
+────────────────────────
+
+Hi {first_name},
+
+You now have access to ORiON, the system we're using to track P&C
+projects going forward. It replaces the spreadsheet tracking with one
+place to see status, deadlines, and updates in real time.
+
+Use the link below to sign in and set your password. It's a one-time
+link tied to your account, so use it soon after this email arrives.
+
+{sign_in_link}
+
+Once you're in, there's a short guided tour on your first visit, and
+a help widget (the Rigel icon) if you get stuck. Michele's team is
+also starting a daily digest of project activity, so ORiON is now
+the system of record for status.
+
+Questions, or if anything doesn't work right, reply here or ping me
+directly.
+
+Jim
+
+RENDERED HTML BODY STRUCTURE
+────────────────────────────
+
+DOCTYPE HTML5
+Character set: UTF-8
+Responsive viewport meta
+Style: Inline CSS, no external resources
+
+Header:
+  - ORiON branding (#004a4c background, #ffffff text)
+  - "OFS TRAINING" subtitle (#3fd2ff color)
+  - Cyan divider (#3fd2ff, 4px)
+
+Body paragraphs:
+  - Greeting with first_name extraction
+  - System intro paragraph
+  - Call-to-action paragraph
+  - Button: "Sign In & Set Your Password" (#005e60 background)
+  - Feature summary paragraph
+  - Signature paragraph
+  - Footer: "— ORiON" (#888888, #e5e7eb border-top)
+
+Button styling:
+  - Background: #005e60 (Evergreen)
+  - Text: #ffffff
+  - Padding: 11px 26px
+  - Font: Calibri, Arial, Helvetica, sans-serif
+  - Weight: bold
+
+VERIFICATION AGAINST 2026-08-14 TEST RUN
+─────────────────────────────────────────
+
+Per decision doc 2026-08-14-tpm-onboarding-email.md:
+
+Verification #4 — Content: PASS
+  "delivered plain-text body matches the brief copy byte-for-byte after
+   merges (Hi {name}, + real action link; verified both by fetching the
+   delivered email from Resend and by a programmatic local diff of
+   build_text_body against the brief copy)"
+
+Current render (2026-08-20):
+  ✓ Text body structure matches (Hi + content + link + footer + Jim)
+  ✓ Copy is verbatim from script (lines 196-216)
+  ✓ HTML structure matches (header, paragraphs, button, footer)
+  ✓ Branding values unchanged (EVERGREEN, ION, HEADER_DEEP, etc.)
+  ✓ Link position: same (standalone line in text, href in button in HTML)
+
+DIAGNOSTIC SEND CONFIGURATION
+──────────────────────────────
+
+From:     orion@ofstraining.com (unchanged from 2026-08-17)
+Reply-To: jim.rosen@gevernova.com (unchanged from 2026-08-17)
+To:       jim.rosen@gevernova.com (diagnostic change from TPM emails)
+Subject:  Welcome to ORiON — set up your account (no [TEST] prefix)
+Body:     Exact template rendered above with placeholder link
+
+EXECUTION REQUIREMENTS
+──────────────────────
+
+Environment variables (GitHub Actions secrets):
+  - RESEND_API_KEY: re_* (Resend API token)
+  - ORION_SUPABASE_SERVICE_KEY: eyJ* (Supabase service role key)
+
+Command to run:
+  python verify_template_diagnostic.py
+
+Expected output:
+  - Full rendered text body (500+ characters)
+  - Partial rendered HTML body (first 500 chars)
+  - Resend message ID
+  - Send confirmation to jim.rosen@gevernova.com
+
+Verification after send:
+  - Check Resend dashboard for message delivery status
+  - Jim checks his inbox for arrival (reliable test vs. filter theory)
+
+CHANGES TO CANONICAL SCRIPT
+───────────────────────────
+
+send_tpm_onboarding.py: UNMODIFIED
+  - Used as library via import (render functions only)
+  - No changes to function signatures or behavior
+  - No changes to template copy
+  - No changes to secret handling
+
+NOTES
+─────
+
+The diagnostic tests a specific theory:
+  - Either the template triggers mail filters (phishing signature)
+  - Or the TPM recipient group is filtered by their provider
+
+By sending the identical template to jim.rosen@gevernova.com (mailbox
+known to receive from orion@ofstraining.com daily) and observing whether
+it arrives, we isolate the problem:
+
+  ✓ Email arrives to Jim → template is innocent, TPM mailboxes are filtered
+  ✗ Email does NOT arrive to Jim → template matches phishing signature,
+                                   external sender + password-set link is
+                                   the problem
+
+This is the only test that separates the two theories given the current data.
+
+---
+Template verified 2026-08-20 by comparing rendered output against:
+  1. Script comments (verbatim copy, lines 189-190)
+  2. Decision doc verification (2026-08-14-tpm-onboarding-email.md)
+  3. Live render with canonical functions (no duplication)
