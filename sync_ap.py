@@ -569,7 +569,7 @@ def main(dry_run: bool = False):
     # Load existing Delivery (action_items) rows keyed by ap_number
     try:
         existing_resp = db.table('action_items') \
-            .select('id, ap_number, owner_id, status, due_date, start_date, priority, ap_pending_update, ap_pending_since') \
+            .select('id, ap_number, owner_id, status, due_date, start_date, priority, ap_pending_update, ap_pending_since, ap_orphaned') \
             .eq('source', 'ap_import') \
             .execute()
         existing_delivery = {
@@ -585,7 +585,7 @@ def main(dry_run: bool = False):
     # Load existing P&C (pc_projects) rows keyed by ap_number
     try:
         existing_pc_resp = db.table('pc_projects') \
-            .select('id, ap_number, owner_id, title, description, status, category, start_date, target_end_date, target_date_moves, ap_pending_update, ap_pending_since') \
+            .select('id, ap_number, owner_id, title, description, status, category, start_date, target_end_date, target_date_moves, ap_pending_update, ap_pending_since, ap_orphaned') \
             .eq('source', 'ap_synced') \
             .execute()
         existing_pc = {
@@ -977,6 +977,50 @@ def main(dry_run: bool = False):
                 if dry_run:
                     print(f"[DRY RUN] INSERT   {ap_num:14} P&C      — owner {owner_id}, status {pc_status}")
 
+    # ── Orphan detection (bug c4494694) ─────────────────────────
+    # A row whose ap_number is absent from the FULL child fetch (active AND
+    # inactive) was deleted from the tracker — distinct from Complete/
+    # Cancelled/On Hold, which remain in the sheet and take the status-only
+    # close path above. Detection FLAGS (ap_orphaned + ap_orphaned_since),
+    # never deletes and never auto-closes (Jim's ruling, 2026-08-20): the
+    # row carries notes, history, and ap_change_log references, and the
+    # source being wrong is at least as likely as the row being wrong. A
+    # reappearing ap_number (row restored, or a Smartsheet restructure that
+    # briefly dropped the Is Child flag) clears the flag automatically.
+    # Detection keys on the CHILD row's own AP number only — a deleted
+    # child whose parent still exists is an orphan; the parent is not the
+    # row this table mirrors.
+    sheet_ap_numbers = {t['ap_number'] for t in tasks if t['ap_number']}
+    to_orphan_delivery   = []  # (id, ap_number)
+    to_unorphan_delivery = []  # (id, ap_number)
+    to_orphan_pc         = []
+    to_unorphan_pc       = []
+    if not sheet_ap_numbers:
+        # tasks is non-empty here (checked at fetch), so an empty AP-number
+        # set means every child row lost its AP# — sheet damage, not mass
+        # deletion. Never mass-flag on that.
+        log.error("Orphan detection skipped — child fetch produced zero AP numbers")
+    else:
+        for ap, r in existing_delivery.items():
+            if ap not in sheet_ap_numbers and not r.get('ap_orphaned'):
+                to_orphan_delivery.append((r['id'], ap))
+            elif ap in sheet_ap_numbers and r.get('ap_orphaned'):
+                to_unorphan_delivery.append((r['id'], ap))
+        for ap, r in existing_pc.items():
+            if ap not in sheet_ap_numbers and not r.get('ap_orphaned'):
+                to_orphan_pc.append((r['id'], ap))
+            elif ap in sheet_ap_numbers and r.get('ap_orphaned'):
+                to_unorphan_pc.append((r['id'], ap))
+        if dry_run:
+            for item_id, ap in to_orphan_delivery:
+                print(f"[DRY RUN] ORPHAN   {ap:14} delivery — not in tracker, would flag ap_orphaned")
+            for item_id, ap in to_orphan_pc:
+                print(f"[DRY RUN] ORPHAN   {ap:14} P&C      — not in tracker, would flag ap_orphaned")
+            for item_id, ap in to_unorphan_delivery:
+                print(f"[DRY RUN] UNORPHAN {ap:14} delivery — back in tracker, would clear ap_orphaned")
+            for item_id, ap in to_unorphan_pc:
+                print(f"[DRY RUN] UNORPHAN {ap:14} P&C      — back in tracker, would clear ap_orphaned")
+
     if unmapped_leads:
         log.info(f"Lead emails that don't resolve in users or portal_users(tpm) (skipped): {sorted(unmapped_leads)}")
     if ambiguous_leads:
@@ -998,6 +1042,10 @@ def main(dry_run: bool = False):
             f"ambiguous lead: {skipped_ambiguous}, owner is viewer: {skipped_viewer}, "
             f"pending Smartsheet update: {skipped_pending}, unchanged: {skipped_unchanged}"
         )
+        orphan_summary = (
+            f"Orphans  — would flag: {len(to_orphan_delivery)} delivery + {len(to_orphan_pc)} P&C, "
+            f"would clear: {len(to_unorphan_delivery)} delivery + {len(to_unorphan_pc)} P&C"
+        )
         titles_summary = (
             f"AP titles — captured from Smartsheet: {len(parent_titles)}, "
             f"would write (new/changed): {len(titles_to_write)}, "
@@ -1009,6 +1057,7 @@ def main(dry_run: bool = False):
         print(delivery_summary)
         print(pc_summary)
         print(skip_summary)
+        print(orphan_summary)
         print(titles_summary)
         for t in titles_to_write:
             print(f"[DRY RUN] TITLE    {t['ap_number']:14} \"{t['title']}\" end {t['end_date']} (row {t['source_row_id']})")
@@ -1121,6 +1170,46 @@ def main(dry_run: bool = False):
         except Exception as e:
             log.error(f"P&C close failed for {ap_num}: {e}")
 
+    # ── Orphan flag writes (bug c4494694) — flag/clear ONLY. Never a
+    # status write, never a delete; the row's own trigger will bump
+    # last_updated/updated_at (unavoidable at the app layer), but no field
+    # this script owns changes besides the two orphan columns. ───────
+    orphaned_delivery = 0
+    orphaned_pc       = 0
+    unorphaned        = 0
+    _orphan_now = datetime.now(timezone.utc).isoformat()
+    for item_id, ap_num in to_orphan_delivery:
+        try:
+            db.table('action_items') \
+                .update({'ap_orphaned': True, 'ap_orphaned_since': _orphan_now}) \
+                .eq('id', item_id) \
+                .execute()
+            orphaned_delivery += 1
+            log.warning(f"{ap_num}: ORPHANED (Delivery) — ap_number no longer in the tracker; flagged, not touched")
+        except Exception as e:
+            log.error(f"Orphan flag failed for {ap_num} (Delivery): {e}")
+    for item_id, ap_num in to_orphan_pc:
+        try:
+            db.table('pc_projects') \
+                .update({'ap_orphaned': True, 'ap_orphaned_since': _orphan_now}) \
+                .eq('id', item_id) \
+                .execute()
+            orphaned_pc += 1
+            log.warning(f"{ap_num}: ORPHANED (P&C) — ap_number no longer in the tracker; flagged, not touched")
+        except Exception as e:
+            log.error(f"Orphan flag failed for {ap_num} (P&C): {e}")
+    for table, pairs in (('action_items', to_unorphan_delivery), ('pc_projects', to_unorphan_pc)):
+        for item_id, ap_num in pairs:
+            try:
+                db.table(table) \
+                    .update({'ap_orphaned': False, 'ap_orphaned_since': None}) \
+                    .eq('id', item_id) \
+                    .execute()
+                unorphaned += 1
+                log.info(f"{ap_num}: back in the tracker — ap_orphaned cleared ({table})")
+            except Exception as e:
+                log.error(f"Orphan clear failed for {ap_num} ({table}): {e}")
+
     # ── End-date change events (diffed pre-gate; deliberately AFTER the
     # child sync, and BEFORE the ap_titles upsert: if the stored end_date
     # advanced but the event insert had failed, the event would be lost
@@ -1202,6 +1291,7 @@ def main(dry_run: bool = False):
         f"skipped: {skipped_total}, "
         f"pending Smartsheet updates: {len(pending)}, "
         f"escalated: {len(escalations)}, "
+        f"orphans flagged: {orphaned_delivery + orphaned_pc}, orphans cleared: {unorphaned}, "
         f"WIP flags set: {wip_flagged} | "
         f"AP titles: captured {len(parent_titles)}, written {titles_written}, "
         f"end-date events: {len(date_events)} detected, {date_events_written} written"
@@ -1286,6 +1376,7 @@ def main(dry_run: bool = False):
                     f'pc_inserted={inserted_pc} pc_updated={updated_pc} '
                     f'pc_closed={closed_pc} '
                     f'pc_pending_cleared={cleared_pending_pc} skipped={skipped_total} '
+                    f'orphans_flagged={orphaned_delivery + orphaned_pc} orphans_cleared={unorphaned} '
                     f'titles_captured={len(parent_titles)} titles_written={titles_written} '
                     f'date_events_detected={len(date_events)} date_events_written={date_events_written} '
                     f'date_baselines={date_baselines} '

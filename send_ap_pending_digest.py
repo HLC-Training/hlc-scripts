@@ -110,6 +110,32 @@ def fetch_pending_pc_rows(db) -> list[dict]:
     return rows
 
 
+def fetch_orphaned_delivery_rows(db) -> list[dict]:
+    resp = db.table('action_items') \
+        .select('id, ap_number, action_text, status, due_date, ap_orphaned_since, owner_id') \
+        .eq('source', 'ap_import') \
+        .eq('ap_orphaned', True) \
+        .execute()
+    rows = resp.data or []
+    for r in rows:
+        r['module'] = 'delivery'
+    return rows
+
+
+def fetch_orphaned_pc_rows(db) -> list[dict]:
+    resp = db.table('pc_projects') \
+        .select('id, ap_number, title, status, target_end_date, ap_orphaned_since, owner_id') \
+        .eq('source', 'ap_synced') \
+        .eq('ap_orphaned', True) \
+        .execute()
+    rows = resp.data or []
+    for r in rows:
+        r['module']   = 'pc'
+        r['action_text'] = r.pop('title')
+        r['due_date'] = r.pop('target_end_date')
+    return rows
+
+
 def fetch_owner_names(db, delivery_owner_ids: set, pc_owner_ids: set) -> dict:
     # users and portal_users are different tables with table-scoped uuids —
     # merging by id carries no collision risk.
@@ -177,8 +203,26 @@ def esc(value) -> str:
     return html.escape(str(value)) if value not in (None, '') else '—'
 
 
-def build_subject(count: int) -> str:
-    return f"ORiON — AP updates pending your review ({count} item{'s' if count != 1 else ''})"
+def build_subject(count: int, orphan_count: int = 0) -> str:
+    subject = f"ORiON — AP updates pending your review ({count} item{'s' if count != 1 else ''})"
+    if orphan_count:
+        subject += f" + {orphan_count} removed from tracker"
+    return subject
+
+
+def enrich_orphans(rows: list[dict], owner_names: dict) -> list[dict]:
+    now = datetime.now(timezone.utc)
+    enriched = []
+    for r in rows:
+        since = parse_timestamp(r['ap_orphaned_since']) if r.get('ap_orphaned_since') else None
+        enriched.append({
+            **r,
+            'owner_name':     owner_names.get(r.get('owner_id'), 'Unknown'),
+            'orphaned_since': since,
+            'orphan_age':     (now - since).days if since else None,
+        })
+    enriched.sort(key=lambda r: r['orphan_age'] if r['orphan_age'] is not None else -1, reverse=True)
+    return enriched
 
 
 def module_label(module: str) -> str:
@@ -198,11 +242,57 @@ def reason_lines(r: dict, escaped: bool) -> list[str]:
     ]
 
 
-def build_html_body(rows: list[dict]) -> str:
+def build_orphan_html_section(orphans: list[dict]) -> str:
+    if not orphans:
+        return ""
     intro = (
-        f"<p>{len(rows)} AP item(s) have been edited in ORiON and are "
-        f"waiting for the matching update in the Action Plan Tracker.</p>"
+        f"<p style=\"margin-top:24px;\"><strong>Removed from the tracker — needs review "
+        f"({len(orphans)} item{'s' if len(orphans) != 1 else ''}).</strong> "
+        "These AP items are still open in ORiON but their AP number is no longer "
+        "in the Action Plan Tracker (the row was deleted). Nothing has been "
+        "changed in ORiON — please review whether the deletion was intentional "
+        "and either close the ORiON item or restore the tracker row.</p>"
     )
+    header = (
+        "<tr>"
+        "<th>Module</th><th>AP #</th><th>Action</th><th>Status</th><th>Owner</th>"
+        "<th>Due Date</th><th>Not in tracker since</th>"
+        "</tr>"
+    )
+    body_rows = []
+    for r in orphans:
+        since_str = r['orphaned_since'].strftime('%Y-%m-%d') if r['orphaned_since'] else '—'
+        if r['orphan_age'] is not None:
+            since_str += f" ({r['orphan_age']}d)"
+        body_rows.append(
+            "<tr>"
+            f"<td>{esc(module_label(r['module']))}</td>"
+            f"<td>{esc(r['ap_number'])}</td>"
+            f"<td>{esc(r['action_text'])}</td>"
+            f"<td>{esc(r['status'])}</td>"
+            f"<td>{esc(r['owner_name'])}</td>"
+            f"<td>{esc(r['due_date'])}</td>"
+            f"<td>{esc(since_str)}</td>"
+            "</tr>"
+        )
+    table = (
+        '<table cellpadding="6" cellspacing="0" '
+        'style="border-collapse:collapse;font-family:Calibri,Arial,sans-serif;font-size:13px;">'
+        f"{header}{''.join(body_rows)}"
+        "</table>"
+    )
+    return intro + table
+
+
+def build_html_body(rows: list[dict], orphans: list[dict] | None = None) -> str:
+    orphans = orphans or []
+    if not rows:
+        intro = ""
+    else:
+        intro = (
+            f"<p>{len(rows)} AP item(s) have been edited in ORiON and are "
+            f"waiting for the matching update in the Action Plan Tracker.</p>"
+        )
     header = (
         "<tr>"
         "<th>Module</th><th>AP #</th><th>Action</th><th>Status</th><th>Owner</th>"
@@ -231,26 +321,34 @@ def build_html_body(rows: list[dict]) -> str:
             f"<td>{reason_cell}</td>"
             "</tr>"
         )
-    table = (
-        '<table cellpadding="6" cellspacing="0" '
-        'style="border-collapse:collapse;font-family:Calibri,Arial,sans-serif;font-size:13px;">'
-        f"{header}{''.join(body_rows)}"
-        "</table>"
-    )
+    if rows:
+        table = (
+            '<table cellpadding="6" cellspacing="0" '
+            'style="border-collapse:collapse;font-family:Calibri,Arial,sans-serif;font-size:13px;">'
+            f"{header}{''.join(body_rows)}"
+            "</table>"
+        )
+        legend = f"<p style=\"font-size:12px;color:#555555;\">⚠ = pending more than {AGE_CALLOUT_DAYS} days</p>"
+    else:
+        table = ""
+        legend = ""
     style = (
         "table, th, td { border: 1px solid #999999; }"
         "th { background-color: #eeeeee; text-align: left; }"
     )
-    legend = f"<p style=\"font-size:12px;color:#555555;\">⚠ = pending more than {AGE_CALLOUT_DAYS} days</p>"
-    return f"<html><head><style>{style}</style></head><body>{intro}{table}{legend}</body></html>"
+    orphan_section = build_orphan_html_section(orphans)
+    return f"<html><head><style>{style}</style></head><body>{intro}{table}{legend}{orphan_section}</body></html>"
 
 
-def build_text_body(rows: list[dict]) -> str:
-    lines = [
-        f"{len(rows)} AP item(s) have been edited in ORiON and are waiting "
-        "for the matching update in the Action Plan Tracker.",
-        "",
-    ]
+def build_text_body(rows: list[dict], orphans: list[dict] | None = None) -> str:
+    orphans = orphans or []
+    lines = []
+    if rows:
+        lines += [
+            f"{len(rows)} AP item(s) have been edited in ORiON and are waiting "
+            "for the matching update in the Action Plan Tracker.",
+            "",
+        ]
     for r in rows:
         pending_since_str = r['pending_since'].strftime('%Y-%m-%d') if r['pending_since'] else '—'
         age_str = f"{r['age_days']} days" if r['age_days'] is not None else 'unknown'
@@ -265,6 +363,24 @@ def build_text_body(rows: list[dict]) -> str:
         for rl in reason_lines(r, escaped=False):
             lines.append(f"  Reason: {rl}")
         lines.append("")
+    if orphans:
+        lines += [
+            f"REMOVED FROM THE TRACKER — NEEDS REVIEW ({len(orphans)} item{'s' if len(orphans) != 1 else ''})",
+            "These AP items are still open in ORiON but their AP number is no",
+            "longer in the Action Plan Tracker (the row was deleted). Nothing has",
+            "been changed in ORiON — please review whether the deletion was",
+            "intentional and either close the ORiON item or restore the tracker row.",
+            "",
+        ]
+        for r in orphans:
+            since_str = r['orphaned_since'].strftime('%Y-%m-%d') if r['orphaned_since'] else '—'
+            age_str = f" ({r['orphan_age']}d)" if r['orphan_age'] is not None else ""
+            lines.append(f"[{module_label(r['module'])}] {r['ap_number']} — {r['action_text']}")
+            lines.append(
+                f"  Status: {r['status'] or '—'} | Owner: {r['owner_name']} | "
+                f"Due: {r['due_date'] or '—'} | Not in tracker since: {since_str}{age_str}"
+            )
+            lines.append("")
     return "\n".join(lines)
 
 
@@ -317,26 +433,28 @@ def main():
     delivery_rows = fetch_pending_delivery_rows(db)
     pc_rows = fetch_pending_pc_rows(db)
     rows = delivery_rows + pc_rows
-    if not rows:
-        log.info("No AP rows flagged ap_pending_update (Delivery or P&C) — nothing to send.")
+    orphan_rows = fetch_orphaned_delivery_rows(db) + fetch_orphaned_pc_rows(db)
+    if not rows and not orphan_rows:
+        log.info("No AP rows flagged ap_pending_update or ap_orphaned (Delivery or P&C) — nothing to send.")
         print("No flagged rows — digest skipped.")
         return
 
-    delivery_owner_ids = {r['owner_id'] for r in delivery_rows if r.get('owner_id')}
-    pc_owner_ids = {r['owner_id'] for r in pc_rows if r.get('owner_id')}
+    delivery_owner_ids = {r['owner_id'] for r in delivery_rows + [o for o in orphan_rows if o['module'] == 'delivery'] if r.get('owner_id')}
+    pc_owner_ids = {r['owner_id'] for r in pc_rows + [o for o in orphan_rows if o['module'] == 'pc'] if r.get('owner_id')}
     owner_names = fetch_owner_names(db, delivery_owner_ids, pc_owner_ids)
     reasons_by_item = fetch_change_log_reasons(db, rows)
     enriched = enrich_rows(rows, owner_names, reasons_by_item)
+    enriched_orphans = enrich_orphans(orphan_rows, owner_names)
 
-    subject = build_subject(len(enriched))
-    html_body = build_html_body(enriched)
-    text_body = build_text_body(enriched)
+    subject = build_subject(len(enriched), len(enriched_orphans))
+    html_body = build_html_body(enriched, enriched_orphans)
+    text_body = build_text_body(enriched, enriched_orphans)
     flagged_count = sum(1 for r in enriched if r['flagged'])
 
     if args.dry_run:
         print(f"Subject: {subject}\n")
         print(text_body)
-        log.info(f"[DRY RUN] {len(enriched)} row(s), {flagged_count} over {AGE_CALLOUT_DAYS}d — not sent.")
+        log.info(f"[DRY RUN] {len(enriched)} row(s), {flagged_count} over {AGE_CALLOUT_DAYS}d, {len(enriched_orphans)} orphan(s) — not sent.")
         return
 
     to_email = args.to or JENNIFER_EMAIL
