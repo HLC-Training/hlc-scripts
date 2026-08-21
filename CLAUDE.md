@@ -1,5 +1,7 @@
 # hlc-scripts
 
+Last updated: 2026-08-21 (added Session Protocol with forced doc-fix rule)
+
 Scheduled sync and automation scripts for the SAM COS and ORiON systems.
 
 ## What lives here
@@ -30,6 +32,11 @@ updated for the 2026-08-07 migration.
 ARGUS is the always-on automation hub and runs the Task Scheduler jobs.
 Python must be invoked by full path (`...\Python312\python.exe`). Bare
 `python` does not resolve under Task Scheduler.
+
+## Session Protocol
+1. **Start:** `git remote -v` (must be HLC-Training/hlc-scripts) → `git pull origin main` → `/diff` + `git log`. In that order, every session.
+2. Build in small commits with clear messages.
+3. **Close:** commit → push. Close-step fact check (forced): if this session changed a fact any living reference doc states — a runtime, schema value, file path, URL, repo location, enum, or role list — fix that doc's claim in the same commit, citing its live source. Living docs = CLAUDE.md, `knowledge/reference/*`, `knowledge/contacts/*`, `knowledge/runbooks/*`; NOT the dated `decisions/*` or `learnings/*` history. Forced, not deferred — a logged doc-fix is the drift this prevents. A fact in another repo's doc you can't reach: `/add-dir` or tell Jim same-day.
 
 ## Before changing anything here
 
