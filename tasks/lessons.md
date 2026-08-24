@@ -475,3 +475,25 @@ re-approve the exclusion — verify independently whether a *different*,
 durable reason also holds (here: check the tracker's actual columns, not
 the sync code), and if it does, rewrite the reason in place so the next
 session inherits the real one instead of the expired one.
+
+## 2026-08-24 — A pagination loop keyed on an assumed response field fails silently to page 1 forever
+
+Bug 0644145e: fetch_child_ap_tasks() terminated on
+`data.get("totalPages", 1)` — a field Smartsheet's GET /sheets/{id}
+response does not return (it returns totalRowCount). The .get() default
+of 1 always won, so every run since the script existed read exactly rows
+1–500 of the 709-row tracker: ~78 active rows never evaluated, zero
+errors, green runs throughout. Both the 108-row gap and the ap_titles
+gap were this one loop. Two rules: (1) never loop on a response field
+you haven't seen in a real response — the default you pass .get() is the
+behavior you ship when the assumption is wrong, and a default that
+terminates the loop makes the failure silent; (2) terminate pagination
+on ground truth the response demonstrably carries (a short page), with
+the count field as cross-check and a loud post-loop mismatch warning.
+
+Verification shape that worked: dry-run the fix branch via workflow
+dispatch, then DELTA it against the prior fix's own dry-run log — the
+new rows classified exactly (63 insert + 7 unmapped-lead + 8 viewer-lead
+= 78 page-2 actives, none unaccounted), and identical summary counts
+everywhere else proved zero effect outside the newly-reachable rows.
+A gap "explained" without that arithmetic closing to zero is a guess.

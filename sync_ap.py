@@ -200,7 +200,16 @@ def fetch_child_ap_tasks() -> tuple[list[dict], list[dict]]:
     page_size = 500
     page      = 1
     all_rows  = []
+    total_row_count = None
 
+    # Termination keys on what the GET /sheets/{id} response actually
+    # contains: a short page (fewer rows than pageSize) means the sheet is
+    # exhausted, and totalRowCount — the field the response really returns —
+    # is cross-checked as a secondary stop and a post-loop audit. The old
+    # loop broke on `totalPages`, a field this response does NOT return, so
+    # .get()'s default of 1 always won and no run ever read past row 500 of
+    # the 709-row tracker (bug 0644145e — ~78 active rows silently never
+    # evaluated, the bulk of the 108-row gap and the ap_titles gap).
     while True:
         data = ss_get(
             f"/sheets/{SHEET_ID}",
@@ -212,12 +221,27 @@ def fetch_child_ap_tasks() -> tuple[list[dict], list[dict]]:
         )
         rows = data.get("rows", [])
         all_rows.extend(rows)
-        total_pages = data.get("totalPages", 1)
-        if page >= total_pages:
+        total_row_count = data.get("totalRowCount", total_row_count)
+        log.info(
+            f"Smartsheet: page {page} returned {len(rows)} row(s) — "
+            f"{len(all_rows)} fetched so far, totalRowCount={total_row_count}"
+        )
+        if len(rows) < page_size:
+            break
+        if total_row_count is not None and len(all_rows) >= total_row_count:
             break
         page += 1
 
-    log.info(f"Smartsheet: fetched {len(all_rows)} total rows")
+    if total_row_count is not None and len(all_rows) != total_row_count:
+        # Loud, not fatal: rows added/deleted between page fetches can
+        # legitimately move the count; orphan detection downstream is the
+        # reason a silent shortfall here would be dangerous.
+        log.warning(
+            f"Smartsheet: fetched {len(all_rows)} rows but the response "
+            f"reported totalRowCount={total_row_count} — sheet may have "
+            f"changed mid-fetch"
+        )
+    log.info(f"Smartsheet: fetched {len(all_rows)} total rows across {page} page(s)")
 
     child_tasks   = []
     parent_titles = []
@@ -252,10 +276,14 @@ def fetch_child_ap_tasks() -> tuple[list[dict], list[dict]]:
             # Non-top-level parents (AP-0621-1 etc.) and blank AP# summary
             # rows are expected sheet structure — no log, no capture.
 
-        # Child tasks only
+        # Child tasks only. Is Child alone qualifies a row as a syncable
+        # task — a row that is BOTH Is Child and Is Parent (a middle node
+        # in a 3-level hierarchy, e.g. AP-214-7 under AP-214) is still a
+        # real task with its own Lead/status/dates, and dropping it here
+        # silently excluded 15 active rows across 7 AP families (bug
+        # 59cd7d7b). Is Parent gates ONLY the title-capture branch above,
+        # where distinguishing top-level parents is legitimate.
         if is_child != "1.0" and is_child != "1":
-            continue
-        if is_parent == "1.0" or is_parent == "1":
             continue
 
         status_raw = cells.get(COL_STATUS, "")
