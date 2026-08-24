@@ -11,7 +11,13 @@ In P&C, "project" (pc_projects) is the naming convention for what
 Delivery calls an action item — same concept, different table and
 different word. Weekday mornings (~6:00 America/Chicago), Michele gets
 ONE combined ORiON-branded email covering every TPM's P&C projects,
-grouped by TPM owner, with up to five sections:
+grouped by TPM owner, with up to six sections:
+  0. "Awaiting your review" — pc_projects rows in status 'submitted',
+     with their business-day wait computed from submitted_at (Submission
+     Tracking Loop, 2026-08-24 — orion-pll knowledge/decisions/
+     2026-08-24-pc-submission-tracking-loop.md). Rendered FIRST and
+     deliberately uncapped: it is the belt-and-suspenders backup to the
+     in-app inbox badge, and the queue must never truncate.
   1. "New projects" — pc_projects rows created since the last digest
      actually sent.
   2. "Coming up in the next two weeks" — non-terminal projects with
@@ -172,7 +178,7 @@ def fetch_projects(db, owner_ids: list[str]) -> list[dict]:
     # TPM so build_digest can be unit-tested against synthesized rows
     # without a second live query shape.
     resp = db.table('pc_projects') \
-        .select('id, owner_id, title, status, created_at, target_end_date') \
+        .select('id, owner_id, title, status, created_at, submitted_at, target_end_date') \
         .in_('owner_id', owner_ids) \
         .execute()
     return resp.data or []
@@ -232,6 +238,24 @@ def parse_date(raw) -> date | None:
     return date.fromisoformat(raw) if raw else None
 
 
+def business_days_since(raw_ts: str, today: date) -> int:
+    """Weekdays in (timestamp's Chicago day, today] — the SAME definition
+    as orion-pll lib/business-days.ts (Submission Tracking Loop,
+    2026-08-24): same-day = 0, Friday→Monday = 1, holidays not excluded
+    (the clock informs judgment, it doesn't declare 'stuck'). Keep the two
+    implementations in lockstep — the loop's core promise is one identical
+    number on every surface."""
+    start = parse_timestamp(raw_ts).astimezone(CHICAGO).date()
+    if today <= start:
+        return 0
+    n, d = 0, start
+    while d < today:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            n += 1
+    return n
+
+
 # ─── DIGEST ASSEMBLY ────────────────────────────────────────────
 def build_digest(tpm: dict, projects: list[dict], approaching_items: list[dict],
                  incomplete_items: list[dict],
@@ -264,11 +288,24 @@ def build_digest(tpm: dict, projects: list[dict], approaching_items: list[dict],
     )
     incomplete_all = sorted(own_incomplete, key=lambda p: p['title'])
 
-    if not new_items and not due_soon and not overdue_all and not approaching_all and not incomplete_all:
+    # Submission Tracking Loop (2026-08-24, orion-pll decision
+    # 2026-08-24-pc-submission-tracking-loop.md): projects sitting in
+    # 'submitted' awaiting Michele's approve/reject. Belt-and-suspenders
+    # backup to the in-app inbox badge — deliberately UNCAPPED, unlike the
+    # other sections: this is the queue the loop exists to keep visible,
+    # so it must never truncate. Oldest wait first.
+    pending_review = sorted(
+        (p for p in own if p.get('status') == 'submitted'),
+        key=lambda p: p.get('submitted_at') or p['created_at'],
+    )
+
+    if not new_items and not due_soon and not overdue_all and not approaching_all \
+            and not incomplete_all and not pending_review:
         return None
 
     return {
         'tpm':                  tpm,
+        'pending_review':       pending_review,
         'new_items':            new_items,
         'due_soon':             due_soon,
         'overdue':              overdue_all[:OVERDUE_CAP],
@@ -420,7 +457,21 @@ def build_html_body(results: list[dict], today: date) -> str:
         "ORiON keeps this list honest."
     )
 
+    def pending_meta(p) -> str:
+        ts = p.get('submitted_at') or p['created_at']
+        n = business_days_since(ts, today)
+        return (f"Submitted {fmt_logged(ts)} &middot; "
+                f"waiting {n} business day{'s' if n != 1 else ''}")
+
     sections = [
+        # First on purpose — this is her action queue; everything below is
+        # informational. Same business-day number as the inbox badge and
+        # the submitter's login prompt (Submission Tracking Loop).
+        section_html("Awaiting your review", section_blocks(
+            results, 'pending_review', pending_meta),
+            intro="Submissions waiting on your approve or reject decision "
+                  "&mdash; the same queue as the ORiON inbox, with the same "
+                  "wait the submitter sees."),
         section_html("New projects", section_blocks(
             results, 'new_items',
             lambda p: f"Logged {fmt_logged(p['created_at'])} &middot; {esc(p.get('status'))}"
@@ -547,6 +598,17 @@ def build_text_body(results: list[dict], today: date) -> str:
         "ORiON keeps this list honest.",
         "",
     ]
+    def pending_meta_text(p) -> str:
+        ts = p.get('submitted_at') or p['created_at']
+        n = business_days_since(ts, today)
+        return (f"Submitted {fmt_logged(ts)} | "
+                f"waiting {n} business day{'s' if n != 1 else ''}")
+
+    lines += text_section("Awaiting your review", results, 'pending_review',
+                          pending_meta_text,
+                          intro="Submissions waiting on your approve or reject decision "
+                                "-- the same queue as the ORiON inbox, with the same "
+                                "wait the submitter sees.")
     lines += text_section("New projects", results, 'new_items',
                           lambda p: f"Logged {fmt_logged(p['created_at'])} | {p.get('status')}")
     lines += text_section("Coming up in the next two weeks", results, 'due_soon',
@@ -703,6 +765,7 @@ def _advance_watermark(db, watermark: datetime, live: bool, results: list[dict],
         'tpms': {
             r['tpm']['name']: (
                 {'suppressed': True} if r['digest'] is None else {
+                    'pending_review': len(r['digest']['pending_review']),
                     'new':      len(r['digest']['new_items']),
                     'due_soon': len(r['digest']['due_soon']),
                     'overdue':  len(r['digest']['overdue']),
