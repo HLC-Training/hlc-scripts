@@ -20,16 +20,9 @@ jobs:
       - name: Install dependencies
         run: pip install smartsheet-python-sdk supabase requests
 
-      # BRANCH-ONLY: --dry-run hard-coded for the 59cd7d7b verification runs.
-      # Revert this step to `python sync_ap.py` before merging to main —
-      # the live write is a separate go, gated on Jim.
-      - name: Run sync (DRY RUN)
+      - name: Run sync
         env:
           SMARTSHEET_API_TOKEN: ${{ secrets.SMARTSHEET_API_TOKEN }}
           ORION_SUPABASE_SERVICE_KEY: ${{ secrets.ORION_SUPABASE_SERVICE_KEY }}
           SAMCOS_SERVICE_KEY: ${{ secrets.SAMCOS_SERVICE_KEY }}
-        run: python sync_ap.py --dry-run
-
-      - name: Show dry-run log
-        if: always()
-        run: cat sync_ap.log
+        run: python sync_ap.py
