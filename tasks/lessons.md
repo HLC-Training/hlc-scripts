@@ -497,3 +497,37 @@ new rows classified exactly (63 insert + 7 unmapped-lead + 8 viewer-lead
 = 78 page-2 actives, none unaccounted), and identical summary counts
 everywhere else proved zero effect outside the newly-reachable rows.
 A gap "explained" without that arithmetic closing to zero is a guess.
+
+## 2026-08-24 — A dry run validates selection, not the write path: the first live run hit a third bug the dry run structurally could not see
+
+From the 59cd7d7b/0644145e live-write session. The combined dry run
+predicted 70 inserts and the live run delivered 45: Smartsheet surfaces
+formula errors as literal cell text (`DATEONLY()` on a blank Current
+Start yields "#INVALID DATA TYPE"), `parse_due_date`'s blind `[:10]`
+slice shipped "#INVALID D" as a date, and Postgres rejected the entire
+25-row batch it rode in — 25 good rows dropped by one bad cell, error
+swallowed by `except: log.error`, exit 0, fresh heartbeat. Three
+compounding lessons:
+
+1. **A dry run only exercises the paths it runs.** `--dry-run` returns
+   before the INSERT, so data-validity failures in the write itself are
+   invisible to it by construction. A dry-run-verified prediction is a
+   contract for *selection*, not for *landing*. The live-run gate
+   ("exactly 70 or STOP") is what caught this — keep that gate.
+2. **Batch writes are all-or-nothing; per-row fallback bounds the blast
+   radius.** One poisoned row cost 24 innocent batch-mates. The fix:
+   on batch failure, retry per row, count and name the failures.
+3. **Validate values that cross a type boundary at the boundary.** Any
+   cell text that must become a Postgres date gets parsed as a date
+   before it ships; junk means "no date" (None + warning), not "no row".
+
+Also: positional bookkeeping lies under partial failure. The WIP check
+sliced `to_insert_delivery[:inserted_delivery]` — correct only if
+inserts succeed in list order — and flagged an owner whose rows had ALL
+failed. Key follow-on effects to the rows that actually landed, never to
+an index into what was attempted.
+
+Meta-pattern, now twice in one week: the dry-run gate caught pagination
+hiding behind is_parent, and the live-run gate caught date-poisoning
+hiding behind both. Every layer of verification found a bug the previous
+layer could not have found. The gates are not ceremony.

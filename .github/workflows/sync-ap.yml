@@ -26,3 +26,11 @@ jobs:
           ORION_SUPABASE_SERVICE_KEY: ${{ secrets.ORION_SUPABASE_SERVICE_KEY }}
           SAMCOS_SERVICE_KEY: ${{ secrets.SAMCOS_SERVICE_KEY }}
         run: python sync_ap.py
+
+      # The script logs detail (per-row errors, page fetches) to sync_ap.log
+      # and prints only the summary line to stdout. Without this step a
+      # failed insert is invisible from the Actions UI — the 2026-08-24
+      # batch failure had to be reconstructed from Supabase API logs.
+      - name: Show sync log
+        if: always()
+        run: cat sync_ap.log
