@@ -376,13 +376,26 @@ def resolve_owner(email: str, email_to_id: dict, portal_email_to_id: dict, viewe
 
 
 def parse_due_date(finish_raw: str | None) -> str | None:
-    """Extract YYYY-MM-DD from Smartsheet ISO datetime string."""
+    """Extract YYYY-MM-DD from Smartsheet ISO datetime string.
+
+    The slice is validated as a real calendar date before it's returned.
+    Smartsheet surfaces formula errors as literal cell text — DATEONLY() on a
+    blank Current Start yields "#INVALID DATA TYPE" — and passing the sliced
+    literal ("#INVALID D") through to Postgres poisoned an entire 25-row
+    insert batch on the first live run of 2026-08-24 (25 of 31 Delivery
+    inserts silently dropped). An unusable date means the row has no date,
+    not that the row is unsyncable: return None, warn with the raw value so
+    the sheet-side data problem stays visible in the log.
+    """
     if not finish_raw:
         return None
+    candidate = str(finish_raw)[:10]
     try:
-        return finish_raw[:10]
-    except Exception:
+        datetime.strptime(candidate, '%Y-%m-%d')
+    except ValueError:
+        log.warning(f"Unparseable date cell value {finish_raw!r} — treating as unset")
         return None
+    return candidate
 
 
 def days_since(iso_ts: str | None) -> float | None:
@@ -1109,15 +1122,30 @@ def main(dry_run: bool = False):
         print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | DRY RUN complete — no writes were made.")
         return
 
-    # Insert new Delivery items in batches of 25
+    # Insert new Delivery items in batches of 25. A failed batch falls back
+    # to per-row inserts: on 2026-08-24 one row with a junk date killed its
+    # 24 batch-mates wholesale (batch INSERT is all-or-nothing at the API),
+    # and the swallowed error left the run reporting green. The fallback
+    # bounds the blast radius of a bad row to itself and names it in the log.
     inserted_delivery = 0
+    failed_inserts_delivery = 0
+    inserted_delivery_items = []   # rows that actually landed — WIP check keys on these
     for i in range(0, len(to_insert_delivery), 25):
         batch = to_insert_delivery[i:i + 25]
         try:
             db.table('action_items').insert(batch).execute()
             inserted_delivery += len(batch)
+            inserted_delivery_items.extend(batch)
         except Exception as e:
-            log.error(f"Delivery insert batch failed: {e}")
+            log.error(f"Delivery insert batch failed ({len(batch)} rows) — retrying per row: {e}")
+            for item in batch:
+                try:
+                    db.table('action_items').insert(item).execute()
+                    inserted_delivery += 1
+                    inserted_delivery_items.append(item)
+                except Exception as row_e:
+                    failed_inserts_delivery += 1
+                    log.error(f"Delivery insert failed for {item['ap_number']}: {row_e}")
 
     # Apply Delivery updates
     updated_delivery = 0
@@ -1156,15 +1184,24 @@ def main(dry_run: bool = False):
         except Exception as e:
             log.error(f"Delivery close failed for {ap_num}: {e}")
 
-    # Insert new P&C items in batches of 25
+    # Insert new P&C items in batches of 25 — same per-row fallback
+    # discipline as the Delivery inserts above.
     inserted_pc = 0
+    failed_inserts_pc = 0
     for i in range(0, len(to_insert_pc), 25):
         batch = to_insert_pc[i:i + 25]
         try:
             db.table('pc_projects').insert(batch).execute()
             inserted_pc += len(batch)
         except Exception as e:
-            log.error(f"P&C insert batch failed: {e}")
+            log.error(f"P&C insert batch failed ({len(batch)} rows) — retrying per row: {e}")
+            for item in batch:
+                try:
+                    db.table('pc_projects').insert(item).execute()
+                    inserted_pc += 1
+                except Exception as row_e:
+                    failed_inserts_pc += 1
+                    log.error(f"P&C insert failed for {item['ap_number']}: {row_e}")
 
     # Apply P&C updates
     updated_pc = 0
@@ -1281,9 +1318,12 @@ def main(dry_run: bool = False):
     if titles_written:
         log.info(f"AP titles written: {titles_written} (of {len(parent_titles)} captured)")
 
-    # Check for WIP overages caused by new Delivery inserts (Delivery only)
-    if inserted_delivery > 0:
-        new_owner_ids = {item['owner_id'] for item in to_insert_delivery[:inserted_delivery]}
+    # Check for WIP overages caused by new Delivery inserts (Delivery only).
+    # Keys on the rows that actually landed, not a positional slice of the
+    # insert list — with a failed batch those two diverge, and on 2026-08-24
+    # the slice flagged an owner whose rows were ALL in the failed batch.
+    if inserted_delivery_items:
+        new_owner_ids = {item['owner_id'] for item in inserted_delivery_items}
         wip_flagged = check_and_flag_wip_overages(db, new_owner_ids, log)
         if wip_flagged:
             log.warning(f"{wip_flagged} PLL(s) flagged for WIP review on next login")
@@ -1327,6 +1367,8 @@ def main(dry_run: bool = False):
         f"WIP flags set: {wip_flagged} | "
         f"AP titles: captured {len(parent_titles)}, written {titles_written}, "
         f"end-date events: {len(date_events)} detected, {date_events_written} written"
+        + (f" [INSERT FAILURES: {failed_inserts_delivery} Delivery, {failed_inserts_pc} P&C]"
+           if (failed_inserts_delivery or failed_inserts_pc) else "")
         + (" [TITLE/DATE CAPTURE FAILED]" if title_capture_failed else "")
     )
     log.info(summary)
@@ -1412,6 +1454,7 @@ def main(dry_run: bool = False):
                     f'titles_captured={len(parent_titles)} titles_written={titles_written} '
                     f'date_events_detected={len(date_events)} date_events_written={date_events_written} '
                     f'date_baselines={date_baselines} '
+                    f'insert_failures={failed_inserts_delivery + failed_inserts_pc} '
                     f'title_capture_failed={title_capture_failed}'
                 ),
             }, on_conflict='key').execute()
@@ -1428,6 +1471,23 @@ def main(dry_run: bool = False):
     # knowledge/decisions/2026-08-10-ap-title-capture.md.
     if title_capture_failed:
         msg = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | AP title/end-date capture FAILED — exiting non-zero (child sync completed; see log)"
+        log.error(msg)
+        print(msg)
+        sys.exit(1)
+
+    # ── Insert failures → non-zero exit, same discipline ────────────
+    # Same shape as the title-capture block above, for the same reason: the
+    # 2026-08-24 live run dropped a whole insert batch, reported green, and
+    # sent a fresh heartbeat — the exact exit-0-lie the hardened paths exist
+    # to prevent. Runs after both heartbeats so the heartbeat still carries
+    # the honest insert_failures count for the health dashboard.
+    if failed_inserts_delivery or failed_inserts_pc:
+        msg = (
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
+            f"{failed_inserts_delivery + failed_inserts_pc} insert(s) FAILED "
+            f"({failed_inserts_delivery} Delivery, {failed_inserts_pc} P&C) — "
+            f"exiting non-zero (rest of sync completed; failed rows named in log)"
+        )
         log.error(msg)
         print(msg)
         sys.exit(1)
