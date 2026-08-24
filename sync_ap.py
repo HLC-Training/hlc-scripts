@@ -252,10 +252,14 @@ def fetch_child_ap_tasks() -> tuple[list[dict], list[dict]]:
             # Non-top-level parents (AP-0621-1 etc.) and blank AP# summary
             # rows are expected sheet structure — no log, no capture.
 
-        # Child tasks only
+        # Child tasks only. Is Child alone qualifies a row as a syncable
+        # task — a row that is BOTH Is Child and Is Parent (a middle node
+        # in a 3-level hierarchy, e.g. AP-214-7 under AP-214) is still a
+        # real task with its own Lead/status/dates, and dropping it here
+        # silently excluded 15 active rows across 7 AP families (bug
+        # 59cd7d7b). Is Parent gates ONLY the title-capture branch above,
+        # where distinguishing top-level parents is legitimate.
         if is_child != "1.0" and is_child != "1":
-            continue
-        if is_parent == "1.0" or is_parent == "1":
             continue
 
         status_raw = cells.get(COL_STATUS, "")
