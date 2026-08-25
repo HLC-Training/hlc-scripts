@@ -498,6 +498,21 @@ new rows classified exactly (63 insert + 7 unmapped-lead + 8 viewer-lead
 everywhere else proved zero effect outside the newly-reachable rows.
 A gap "explained" without that arithmetic closing to zero is a guess.
 
+## "Missing" P&C projects were a view-legibility problem, not a sync defect
+
+2026-08-25: Ankita reported completed/core projects (AP-214, AP-0368) missing
+from the P&C Project List. Nothing was missing or deleted — completed rows are
+retained (19 complete pc_projects live at the time). Two view causes: she owned
+no open rows under AP-214 (all Kelly's), and her active AP-0368-6 rendered under
+the AP-0370 program header with no header of its own, distinguished only by an
+indent. Root: ORiON stores individually-owned child rows, not the Smartsheet
+umbrella parent, and the list groups children under program headers that may not
+be in the filtered set. Also: assist is dropped at sync (no assist column reaches
+ORiON), so "show my assist items" is a build, not a filter. Both logged deferred
+on one action item as a single P&C-list UI pass. Do not reopen sync_ap.py for
+either off a single request. Aside: ap_number zero-padding is inconsistent
+(AP-214-7 vs AP-0368-4) — a one-format search misses the other.
+
 ## 2026-08-24 — A dry run validates selection, not the write path: the first live run hit a third bug the dry run structurally could not see
 
 From the 59cd7d7b/0644145e live-write session. The combined dry run
