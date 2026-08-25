@@ -96,6 +96,7 @@ COL_BUCKET      = 982369741000580    # Bucket
 COL_SOURCE      = 3288805485006724   # Source (AP origin context)
 COL_IS_CHILD    = 4351693839093636   # Is Child (1 = task-level row)
 COL_IS_PARENT   = 7602491737984900   # Is Parent
+COL_NO_REPORT_OUT = 5308689965338500 # No report-out at this level (CHECKBOX) → no_report_out
 
 # ─── MAPPINGS ────────────────────────────────────────────────────
 # Smartsheet Overall Status → ORiON (Delivery / action_items) status
@@ -307,6 +308,7 @@ def fetch_child_ap_tasks() -> tuple[list[dict], list[dict]]:
             "sqdcg_raw":    cells.get(COL_SQDCG),
             "bucket":       cells.get(COL_BUCKET),
             "source_raw":   cells.get(COL_SOURCE),
+            "no_report_out_raw": cells.get(COL_NO_REPORT_OUT),
         })
 
     n_active = sum(1 for t in child_tasks if t["active"])
@@ -417,6 +419,20 @@ def map_category(sqdcg_raw: str | None) -> str | None:
         if char in SQDCG_MAP:
             return SQDCG_MAP[char]
     return None
+
+
+def map_no_report_out(raw) -> bool:
+    """Map the 'No report-out at this level' CHECKBOX cell to a boolean.
+
+    Inverse of map_category's blank rule (decision
+    2026-08-25-sync-no-report-out-flag.md): this is a checkbox, not a
+    picklist, so Smartsheet reports "unchecked" as a blank/absent cell, not
+    as an explicit False — and blank IS the answer here, not a data gap.
+    checked (True) -> True; blank/absent/False -> False. Never None: a
+    no_report_out column that could land NULL would make the Report-Out
+    view unable to tell "reports out" from "unknown."
+    """
+    return bool(raw)
 
 
 # ─── WIP CHECK (Delivery only — pc_projects has no WIP concept) ─
@@ -670,7 +686,7 @@ def main(dry_run: bool = False):
     # Load existing Delivery (action_items) rows keyed by ap_number
     try:
         existing_resp = db.table('action_items') \
-            .select('id, ap_number, owner_id, status, due_date, start_date, priority, ap_pending_update, ap_pending_since, ap_orphaned') \
+            .select('id, ap_number, owner_id, status, due_date, start_date, priority, ap_pending_update, ap_pending_since, ap_orphaned, no_report_out') \
             .eq('source', 'ap_import') \
             .execute()
         existing_delivery = {
@@ -686,7 +702,7 @@ def main(dry_run: bool = False):
     # Load existing P&C (pc_projects) rows keyed by ap_number
     try:
         existing_pc_resp = db.table('pc_projects') \
-            .select('id, ap_number, owner_id, title, description, status, category, start_date, target_end_date, target_date_moves, ap_pending_update, ap_pending_since, ap_orphaned') \
+            .select('id, ap_number, owner_id, title, description, status, category, start_date, target_end_date, target_date_moves, ap_pending_update, ap_pending_since, ap_orphaned, no_report_out') \
             .eq('source', 'ap_synced') \
             .execute()
         existing_pc = {
@@ -873,6 +889,7 @@ def main(dry_run: bool = False):
         due_date   = parse_due_date(task['finish_raw'])
         start_date = parse_due_date(task['start_raw'])
         category   = map_category(task['sqdcg_raw'])
+        no_report_out = map_no_report_out(task['no_report_out_raw'])
 
         if destination == 'delivery':
             # Mirror of the P&C guard below: an inactive row let through the
@@ -908,6 +925,13 @@ def main(dry_run: bool = False):
                     fields['due_date'] = due_date
                 if start_date is not None and start_date != ex.get('start_date'):
                     fields['start_date'] = start_date
+                # No guard here (decision 2026-08-25-sync-no-report-out-flag.md):
+                # this is a real computed boolean, never None, so the
+                # None-clobber class of guard above doesn't apply — and an
+                # unchecked box is a genuine user action that must propagate
+                # both ways (true->false included), unlike a cleared date.
+                if no_report_out != ex.get('no_report_out'):
+                    fields['no_report_out'] = no_report_out
                 # priority is intentionally NOT re-forced here (bug aaaa96ea,
                 # 2026-08-20) — mirrors the P&C shape below. A PLL may re-tier
                 # an AP item deliberately (ORiON-side reason gate covers it);
@@ -975,6 +999,7 @@ def main(dry_run: bool = False):
                     'priority':            'Tier 2',
                     'source':              'ap_import',
                     'ap_number':           ap_num,
+                    'no_report_out':       no_report_out,
                     'ap_pending_update':   False,
                     'vault_synced':        True,
                     'created_date':        datetime.now().strftime('%Y-%m-%d'),
@@ -1032,6 +1057,11 @@ def main(dry_run: bool = False):
                     # change, never on insert, and never touch original_target_date
                     # again after insert (that baseline is app-write-only).
                     fields['target_date_moves'] = (ex.get('target_date_moves') or 0) + 1
+                # No guard here — same reasoning as the Delivery side above:
+                # a real computed boolean, never None, and a toggle in either
+                # direction is a genuine Smartsheet edit that must propagate.
+                if no_report_out != ex.get('no_report_out'):
+                    fields['no_report_out'] = no_report_out
                 # priority is intentionally NOT re-forced here — Michele re-tiers
                 # P&C items in the UI and that choice should stick between syncs.
 
@@ -1091,6 +1121,7 @@ def main(dry_run: bool = False):
                     'start_date':            start_date,
                     'target_end_date':       due_date,
                     'original_target_date':  due_date,
+                    'no_report_out':         no_report_out,
                 })
                 if dry_run:
                     print(f"[DRY RUN] INSERT   {ap_num:14} P&C      — owner {owner_id}, status {pc_status}")

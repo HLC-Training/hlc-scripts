@@ -565,3 +565,21 @@ identity that closes on the day you test it can still be structurally wrong
 for a row-shape the test day didn't contain. Same class as the 8/12
 "enumerate an exit-path class from the code, not the report" lesson, one
 level up: enumerate per-exit *inflows*, not just the exits.
+
+## 2026-08-25 — A checkbox inverts the picklist's blank rule
+
+From the no-report-out flag build (decision
+2026-08-25-sync-no-report-out-flag.md, action item 8858295f). The 8/11
+category ruling established "blank Smartsheet cell → `None`, no invented
+default" for `SQDCG`, a sparse `MULTI_PICKLIST` where blank genuinely means
+"nobody filled this in yet." Applying that same rule to a `CHECKBOX`
+column would have been wrong: Smartsheet reports an unchecked box as a
+blank/absent cell too, but for a checkbox blank IS the answer — it means
+"unchecked," a real value, not a data gap. The correct mapping was
+`bool(raw)` (checked → `True`, blank/absent/`False` → `False`, never
+`None`), the opposite blank-handling from the picklist case despite both
+sources looking identical at the Smartsheet-API layer (an absent cell in
+the row's `cells` array either way). Before reusing a blank-handling rule
+from one column type on another, ask what blank actually *means* for the
+new column's type — a picklist's blank is a gap; a checkbox's blank is a
+value.
