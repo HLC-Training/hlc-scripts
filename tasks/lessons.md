@@ -546,3 +546,22 @@ ORiON), so "show my assist items" is a build, not a filter. Both logged deferred
 on one action item as a single P&C-list UI pass. Do not reopen sync_ap.py for
 either off a single request. Aside: ap_number zero-padding is inconsistent
 (AP-214-7 vs AP-0368-4) — a one-format search misses the other.
+
+## 2026-08-25 — A fall-through counter at a shared exit must exclude rows another bucket already counted
+
+From the Phase 1 accounting build (action item 9278f68e). The brief said
+"increment `skipped_inactive_noop` immediately before the `continue`" at the
+inactive/non-pending exit — but that continue is also the exit for rows that
+just QUEUED a status-only close, and those are already counted via
+closed_delivery/closed_pc. An unconditional increment would double-count
+every closed row and drive the identity residual negative — and today's dry
+run would not have caught it, because today's sheet queued zero closes
+(residual stays 0 either way until the first close-day). The fix: snapshot
+`len(to_close_delivery)+len(to_close_pc)` before the close checks and count
+noop only when nothing was queued. General rule: before wiring a catch-all
+counter at an exit point, enumerate every path that reaches that exit and
+check which ones some other bucket already counts — a reconciliation
+identity that closes on the day you test it can still be structurally wrong
+for a row-shape the test day didn't contain. Same class as the 8/12
+"enumerate an exit-path class from the code, not the report" lesson, one
+level up: enumerate per-exit *inflows*, not just the exits.

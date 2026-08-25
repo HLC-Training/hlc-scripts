@@ -484,6 +484,66 @@ def build_delivery_notes(task: dict) -> str | None:
 
 
 # ─── MAIN ───────────────────────────────────────────────────────
+def build_sync_accounting(*, child_tasks_total, inserted_delivery, updated_delivery,
+                          inserted_pc, updated_pc, skipped_unchanged, cleared_pending,
+                          cleared_pending_pc, closed_delivery, closed_pc, skipped_pending,
+                          skipped_no_ap, skipped_ambiguous, skipped_viewer, skipped_unmapped,
+                          skipped_inactive_noop, skipped_inactive_wrongtable,
+                          failed_inserts_delivery, failed_inserts_pc,
+                          parent_titles_total, titles_new_or_changed, titles_written,
+                          date_baselines, date_events_detected, date_events_written,
+                          title_capture_failed):
+    """
+    Machine-readable per-run accounting — Phase 1 of the reconciliation
+    monitor (decision 2026-08-25-ap-sync-reconciliation-monitor-design.md,
+    action item 9278f68e). Two SEPARATE identities, never folded together:
+    the child stream must sum to child_tasks_total; the parent-titles stream
+    is reported alongside with its own numbers. child_identity_residual is
+    emitted, not acted on — the Phase 2 monitor interprets it. Keyword-only
+    on purpose: both call sites (dry-run prediction, live actuals) are forced
+    to supply every field, so the emitted shape cannot drift between them.
+    Note `escalations` is an overlay on skipped_pending, not a disposition —
+    it must never appear as a term here.
+    """
+    child = {
+        'child_tasks_total':           child_tasks_total,
+        'inserted_delivery':           inserted_delivery,
+        'updated_delivery':            updated_delivery,
+        'inserted_pc':                 inserted_pc,
+        'updated_pc':                  updated_pc,
+        'skipped_unchanged':           skipped_unchanged,
+        'cleared_pending':             cleared_pending,
+        'cleared_pending_pc':          cleared_pending_pc,
+        'closed_delivery':             closed_delivery,
+        'closed_pc':                   closed_pc,
+        'skipped_pending':             skipped_pending,
+        'skipped_no_ap':               skipped_no_ap,
+        'skipped_ambiguous':           skipped_ambiguous,
+        'skipped_viewer':              skipped_viewer,
+        'skipped_unmapped':            skipped_unmapped,
+        'skipped_inactive_noop':       skipped_inactive_noop,
+        'skipped_inactive_wrongtable': skipped_inactive_wrongtable,
+        'failed_inserts_delivery':     failed_inserts_delivery,
+        'failed_inserts_pc':           failed_inserts_pc,
+    }
+    child['child_identity_residual'] = child_tasks_total - sum(
+        v for k, v in child.items() if k != 'child_tasks_total'
+    )
+    return {
+        'as_of': datetime.now(timezone.utc).isoformat(),
+        'child': child,
+        'parent_titles': {
+            'parent_titles_total':   parent_titles_total,
+            'titles_new_or_changed': titles_new_or_changed,
+            'titles_written':        titles_written,
+            'date_baselines':        date_baselines,
+            'date_events_detected':  date_events_detected,
+            'date_events_written':   date_events_written,
+            'title_capture_failed':  title_capture_failed,
+        },
+    }
+
+
 def main(dry_run: bool = False):
     log.info("=" * 56)
     log.info(f"ORiON AP sync starting{' (DRY RUN)' if dry_run else ''}")
@@ -714,6 +774,11 @@ def main(dry_run: bool = False):
     skipped_viewer       = 0
     skipped_unchanged    = 0
     skipped_pending      = 0
+    # Reconciliation-monitor Phase 1 (decision 2026-08-25): the two
+    # previously-uncounted child-loop exits, counted so the identity
+    # len(child_tasks) == sum(all dispositions) can close (action 9278f68e).
+    skipped_inactive_noop       = 0  # inactive, non-pending, no close queued
+    skipped_inactive_wrongtable = 0  # inactive, pending on one table, resolved to the other
     unmapped_leads       = set()
     ambiguous_leads      = set()
     viewer_leads         = set()
@@ -735,6 +800,10 @@ def main(dry_run: bool = False):
             delivery_pending = bool(existing_delivery.get(ap_num, {}).get('ap_pending_update'))
             pc_pending = bool(existing_pc.get(ap_num, {}).get('ap_pending_update'))
             if not delivery_pending and not pc_pending:
+                # A close queued below already counts the row (closed_delivery /
+                # closed_pc); skipped_inactive_noop must cover only the rows that
+                # queue nothing here, or closed rows would count twice.
+                _closes_before = len(to_close_delivery) + len(to_close_pc)
                 # Status-only close (bug e6b35596 + its Delivery sibling):
                 # Complete/Cancelled/On Hold set in Smartsheet must reach an
                 # existing ORiON row even though inactive rows never
@@ -756,6 +825,8 @@ def main(dry_run: bool = False):
                     to_close_pc.append((pc_ex['id'], pc_close_status, ap_num))
                     if dry_run:
                         print(f"[DRY RUN] CLOSE    {ap_num:14} P&C      — {pc_ex.get('status')} -> {pc_close_status} (Smartsheet: {task['status_raw']})")
+                if len(to_close_delivery) + len(to_close_pc) == _closes_before:
+                    skipped_inactive_noop += 1
                 continue
 
         if not ap_num or not task['action_text']:
@@ -809,6 +880,7 @@ def main(dry_run: bool = False):
             # create or modify a Delivery row, even if the Lead now resolves
             # to a PLL.
             if not task['active'] and not existing_delivery.get(ap_num, {}).get('ap_pending_update'):
+                skipped_inactive_wrongtable += 1
                 continue
 
             status = STATUS_MAP.get(task['status_raw'], 'Open')
@@ -917,6 +989,7 @@ def main(dry_run: bool = False):
             # that isn't itself a pending P&C row must never create or
             # modify a P&C project, even if the Lead now resolves to a TPM.
             if not task['active'] and not existing_pc.get(ap_num, {}).get('ap_pending_update'):
+                skipped_inactive_wrongtable += 1
                 continue
 
             pc_status = PC_STATUS_MAP.get(task['status_raw'])
@@ -1118,6 +1191,37 @@ def main(dry_run: bool = False):
             print(f"Escalated ({len(escalations)}) — pending > {ESCALATION_DAYS} days and still diverging:")
             for e in escalations:
                 print(f"  [{e['module']:8}] {e['ap_number']:14} {e['days_flagged']:>3}d  {e['owner']}  — {e['divergence']}")
+        # Dry-run accounting: predicted dispositions (queue lengths; nothing
+        # is written, so written/failed counters are their would-be values).
+        accounting = build_sync_accounting(
+            child_tasks_total=len(tasks),
+            inserted_delivery=len(to_insert_delivery),
+            updated_delivery=len(to_update_delivery),
+            inserted_pc=len(to_insert_pc),
+            updated_pc=len(to_update_pc),
+            skipped_unchanged=skipped_unchanged,
+            cleared_pending=len(to_clear_pending),
+            cleared_pending_pc=len(to_clear_pending_pc),
+            closed_delivery=len(to_close_delivery),
+            closed_pc=len(to_close_pc),
+            skipped_pending=skipped_pending,
+            skipped_no_ap=skipped_no_ap,
+            skipped_ambiguous=skipped_ambiguous,
+            skipped_viewer=skipped_viewer,
+            skipped_unmapped=skipped_unmapped,
+            skipped_inactive_noop=skipped_inactive_noop,
+            skipped_inactive_wrongtable=skipped_inactive_wrongtable,
+            failed_inserts_delivery=0,
+            failed_inserts_pc=0,
+            parent_titles_total=len(parent_titles),
+            titles_new_or_changed=len(titles_to_write),
+            titles_written=len(titles_to_write) if not title_capture_failed else 0,
+            date_baselines=date_baselines,
+            date_events_detected=len(date_events),
+            date_events_written=len(date_events) if not title_capture_failed else 0,
+            title_capture_failed=title_capture_failed,
+        )
+        print(f"ACCOUNTING {json.dumps(accounting)}")
         print("-" * 72)
         print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | DRY RUN complete — no writes were made.")
         return
@@ -1461,6 +1565,57 @@ def main(dry_run: bool = False):
             log.info("Health heartbeat sent to SAM COS")
         except Exception as _e:
             log.warning(f"Health heartbeat failed (non-critical): {_e}")
+
+        # ── Structured accounting → sibling context_store key ───────
+        # Phase 1 of the reconciliation monitor (decision doc 2026-08-25,
+        # action item 9278f68e): the sync emits its own books durably so the
+        # Phase 2 monitor can audit len(child_tasks) == sum(dispositions)
+        # without re-deriving the inclusion rule. A SIBLING key on purpose —
+        # the main heartbeat's value is a bare timestamp the health dashboard
+        # parses for staleness, and must stay that way.
+        try:
+            accounting = build_sync_accounting(
+                child_tasks_total=len(tasks),
+                inserted_delivery=inserted_delivery,
+                updated_delivery=updated_delivery,
+                inserted_pc=inserted_pc,
+                updated_pc=updated_pc,
+                skipped_unchanged=skipped_unchanged,
+                cleared_pending=cleared_pending,
+                cleared_pending_pc=cleared_pending_pc,
+                closed_delivery=closed_delivery,
+                closed_pc=closed_pc,
+                skipped_pending=skipped_pending,
+                skipped_no_ap=skipped_no_ap,
+                skipped_ambiguous=skipped_ambiguous,
+                skipped_viewer=skipped_viewer,
+                skipped_unmapped=skipped_unmapped,
+                skipped_inactive_noop=skipped_inactive_noop,
+                skipped_inactive_wrongtable=skipped_inactive_wrongtable,
+                failed_inserts_delivery=failed_inserts_delivery,
+                failed_inserts_pc=failed_inserts_pc,
+                parent_titles_total=len(parent_titles),
+                titles_new_or_changed=len(titles_to_write),
+                titles_written=titles_written,
+                date_baselines=date_baselines,
+                date_events_detected=len(date_events),
+                date_events_written=date_events_written,
+                title_capture_failed=title_capture_failed,
+            )
+            sc.table('context_store').upsert({
+                'key':    'health:github:orion_ap_sync:accounting',
+                'value':  json.dumps(accounting),
+                'domain': 'system',
+                'notes':  (
+                    'Structured per-run accounting for the AP sync (Phase 1, '
+                    'decision 2026-08-25-ap-sync-reconciliation-monitor-design.md). '
+                    'child_identity_residual is emitted, not acted on — the Phase 2 '
+                    'monitor interprets it.'
+                ),
+            }, on_conflict='key').execute()
+            log.info(f"Accounting emitted to SAM COS (child_identity_residual={accounting['child']['child_identity_residual']})")
+        except Exception as _e:
+            log.warning(f"Accounting emit failed (non-critical): {_e}")
 
     # ── Title-capture failure → non-zero exit, LAST ─────────────────
     # Runs after every write phase and both heartbeats: the child sync (the
