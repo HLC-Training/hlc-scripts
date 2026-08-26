@@ -1,13 +1,20 @@
 # hlc-scripts
 
-Last updated: 2026-08-21 (added Session Protocol with forced doc-fix rule)
+Last updated: 2026-08-26 (sync_ap.py re-plumb — ap_tracker mirror landing)
 
 Scheduled sync and automation scripts for the SAM COS and ORiON systems.
 
 ## What lives here
 
 - `sync_ap.py` — Smartsheet AP tracker to ORiON Supabase (`czdkctjbejnwuopigxta`).
-  One-way, Delivery and P&C scoped. Runs on GitHub Actions.
+  Still one-way and Delivery/P&C-scoped, but since 2026-08-26 in-scope rows
+  land FIRST in the `ap_tracker` mirror table (full-row shape, loop-prevention
+  sync state) and the module tables (`action_items`/`pc_projects`) are
+  projections of that landing zone (orion-pll decision 69ba45bd). The
+  ORiON→Smartsheet push path exists only as a gated placeholder
+  (`push_row_to_smartsheet` — AP Manager flag checked in code because
+  service_role bypasses RLS); the live write-back is the Ops-tab UI brief.
+  Runs on GitHub Actions.
 - `sync_repo_docs.py` — repo reasoning docs to SAM COS Supabase. Vendored
   identically into four repos; samcos is canonical.
 

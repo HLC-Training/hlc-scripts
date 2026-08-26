@@ -583,3 +583,25 @@ the row's `cells` array either way). Before reusing a blank-handling rule
 from one column type on another, ask what blank actually *means* for the
 new column's type — a picklist's blank is a gap; a checkbox's blank is a
 value.
+
+## 2026-08-26 — Write the evidence row before the write that destroys the evidence
+
+From the ap_tracker mirror re-plumb (Ops Phase 2 foundation, action item
+25275aa2). The mirror's loop-prevention state machine clears a row's
+`orion_dirty` flag on upsert; a genuinely-newer Smartsheet change also
+records the losing ORiON edit to `ap_change_log`. The first live conflict
+test ran the upsert first and the conflict insert second — the insert
+failed on a CHECK constraint (`ap_change_log_module_check` didn't admit
+'ops'), and by then the upsert had already cleared the dirty state, which
+was the ONLY place the losing edit existed. Result: a lost conflict
+record, unrecoverable by rerun (the next diff sees nothing). The exit-code
+discipline caught it (non-zero, named error), but ordering was the real
+bug. Fix: conflict rows insert FIRST; if that insert fails, the conflicted
+rows' upserts are withheld so their dirty state survives to the next run.
+This is the same events-before-titles ordering already in this script's
+end-date capture (2026-08-10) — the general rule: when write A records an
+event and write B advances the state that makes the event detectable,
+A must land before B, and a failed A must suppress B. A duplicate event on
+retry is absorbable; an advanced state with no recorded event is a lie.
+Also: any new `module` value logging to ap_change_log needs its CHECK
+widened first — it admitted only delivery/pc until today.

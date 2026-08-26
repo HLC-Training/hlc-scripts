@@ -17,6 +17,19 @@ Flow:
     action_items (Delivery); TPM leads route to pc_projects (P&C). A lead
     resolving in both, resolving only to a viewer, or resolving in neither,
     is skipped and logged rather than guessed.
+  - In-scope rows (the ones that route to a module, or that already hold a
+    module row) land FIRST in the ap_tracker mirror table (full-row shape,
+    keyed on smartsheet_row_id — decision 69ba45bd, 2026-08-26); the module
+    tables below are projections of that landing zone. The mirror carries
+    the loop-prevention state (orion_written_value/orion_written_at/
+    orion_dirty + the row-level Smartsheet modifiedAt) for the future
+    ORiON→Smartsheet write-back: an ORiON write stamps the row dirty; the
+    next sync clears the flag on an echo (sheet == written value, nothing
+    logged), ingests + conflict-logs a genuinely newer Smartsheet change
+    (last-write-wins, decision 93113ee9), and protects the row when
+    Smartsheet hasn't caught up yet. The live write-back itself is NOT
+    wired here — push_row_to_smartsheet() is a gated placeholder until the
+    Ops-tab UI brief (decision bb18653e).
   - Upserts into the appropriate table on ap_number (insert new, update changed).
   - Top-level parent/summary rows (Is Parent, AP# like "AP-0621") are read in
     the same fetch and their "Improvement" text and "Current Finish" date are
@@ -97,6 +110,45 @@ COL_SOURCE      = 3288805485006724   # Source (AP origin context)
 COL_IS_CHILD    = 4351693839093636   # Is Child (1 = task-level row)
 COL_IS_PARENT   = 7602491737984900   # Is Parent
 COL_NO_REPORT_OUT = 5308689965338500 # No report-out at this level (CHECKBOX) → no_report_out
+
+# ─── MIRROR COLUMN IDs (ap_tracker full-row capture, Ops Phase 2) ───
+# The remaining sheet columns, captured only into the ap_tracker mirror
+# (decision 69ba45bd). The module sync above never reads these.
+COL_AP_ID          = 6603493652778884  # AP ID#
+COL_AUTONUM        = 8566302296985476  # AutoNum
+COL_UNIQUE_ID      = 403527972376452   # UniqueID
+COL_PARENT_ID      = 3240146395942788  # Parent ID
+COL_PARENTID       = 2510806431518596  # ParentID (distinct sheet column)
+COL_PARENT_LEVEL   = 5248404384075652  # Parent_Level
+COL_CHILD_NUM      = 7014406058889092  # Child#
+COL_ASSIST         = 7737769182056324  # Assist
+COL_TDM_AMB        = 6762592903401348  # TDM Ambassador (CONTACT_LIST)
+COL_OWNER          = 8300719135477636  # Owner (CONTACT_LIST)
+COL_CURRENT_STATUS = 8412869321510788  # Current Status (sheet picklist)
+COL_CURRENT_START  = 5394148738944900  # Current Start
+COL_PREV_FINISH    = 7800627084873604  # Previous Finish Date
+COL_MOVE_CANCEL    = 7174133144833924  # Move/Cancel Pending Discussion (CHECKBOX)
+COL_ORIG_START     = 2108269647843204  # Original Start
+COL_ORIG_FINISH    = 5899404933549956  # Original Finish
+COL_HOURS_SAVED    = 5079137159253892  # Hours Saved per Year
+COL_IMPACTED_TRNG  = 5286202654805892  # Impacted Trng Roles
+COL_IMPACTED_NON   = 3034402841120644  # Impacted Non Training Roles
+COL_KPI            = 4437592226090884  # KPI Connection
+COL_ORIG_REQUESTER = 6843756061609860  # Original Requester
+COL_COMMENTS       = 3647605119864708  # Comments
+COL_ONE_PAGER      = 8151204747235204  # One-pager Link
+COL_DURATION       = 7645948552630148  # Duration
+COL_PREDECESSORS   = 2016449018417028  # Predecessors
+COL_STARTING_MONTH = 3679394665287556  # is starting this month (CHECKBOX)
+COL_DUE_THIS_MONTH = 3206058314256260  # is due this month (CHECKBOX)
+COL_DUE_NEXT_MONTH = 7709657941626756  # Is due next month (CHECKBOX)
+COL_DUE_LAST_MONTH = 6983934885973892  # Is due last month (CHECKBOX)
+COL_AT_RISK        = 6520048645787524  # At Risk (CHECKBOX)
+COL_PLL_LEAD       = 6296898674921348  # PLL Lead?
+COL_FINISH_DATE_ONLY = 1211657396457348  # Finish Date (date only)
+COL_CREATED_CELL   = 1831243593502596  # Created (DATETIME)
+COL_MODIFIED_CELL  = 604393216184196   # Modified (DATETIME)
+COL_CREATED_BY     = 4844025737334660  # Created By (CONTACT_LIST)
 
 # ─── MAPPINGS ────────────────────────────────────────────────────
 # Smartsheet Overall Status → ORiON (Delivery / action_items) status
@@ -309,6 +361,9 @@ def fetch_child_ap_tasks() -> tuple[list[dict], list[dict]]:
             "bucket":       cells.get(COL_BUCKET),
             "source_raw":   cells.get(COL_SOURCE),
             "no_report_out_raw": cells.get(COL_NO_REPORT_OUT),
+            # Full-row capture for the ap_tracker mirror — same fetch, same
+            # pass; main() decides which rows actually land (in-scope only).
+            "mirror":       build_mirror_capture(row, cells, raw, display_raw),
         })
 
     n_active = sum(1 for t in child_tasks if t["active"])
@@ -400,6 +455,110 @@ def parse_due_date(finish_raw: str | None) -> str | None:
     return candidate
 
 
+def parse_iso_ts(iso_ts: str | None) -> datetime | None:
+    """Parse a Smartsheet/Supabase ISO timestamp ('Z' or offset form) to an
+    aware datetime; None if unset/unparseable. Used by the loop-prevention
+    comparison, where a string compare would be wrong across the two
+    formats ('...Z' vs '...+00:00')."""
+    if not iso_ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(iso_ts).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+
+
+def build_mirror_capture(row: dict, cells: dict, raw: dict, display_raw: dict) -> dict:
+    """Full-row capture of one Smartsheet child row for the ap_tracker
+    mirror (decision 69ba45bd — the mirror holds the FULL sheet shape;
+    which rows get landed stays scoped in main()). Keys match ap_tracker
+    columns 1:1 so the dict IS the upsert payload (minus sync-state, which
+    the write planner appends). Contact columns keep raw value + display,
+    same discipline as the Lead handling above. Never touches the module
+    (child_tasks) capture — that projection stays byte-identical."""
+    def txt(col):
+        v = cells.get(col)
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    def contact(col):
+        v = (str(raw.get(col)).strip() if raw.get(col) is not None else None) or None
+        d = (str(display_raw.get(col)).strip() if display_raw.get(col) is not None else None) or None
+        return v, d
+
+    def flag01(col):
+        return str(cells.get(col, "0")).strip() in ("1", "1.0")
+
+    lead_v, lead_d = contact(COL_LEAD)
+    tdm_v, tdm_d = contact(COL_TDM_AMB)
+    owner_v, owner_d = contact(COL_OWNER)
+    creator_v, creator_d = contact(COL_CREATED_BY)
+
+    return {
+        'smartsheet_row_id':     row.get('id'),
+        'smartsheet_row_number': row.get('rowNumber'),
+        'smartsheet_created_at': row.get('createdAt'),
+        # Row-level modifiedAt — the loop-prevention timestamp (decision
+        # e217604f at row grain; cell-level modified time is not in the
+        # GET /sheets fetch).
+        'smartsheet_modified_at': row.get('modifiedAt'),
+        'ap_number':      txt(COL_AP_NUM),
+        'ap_id_number':   txt(COL_AP_ID),
+        'autonum':        txt(COL_AUTONUM),
+        'unique_id':      txt(COL_UNIQUE_ID),
+        'parent_id':      txt(COL_PARENT_ID),
+        'parentid':       txt(COL_PARENTID),
+        'parent_level':   txt(COL_PARENT_LEVEL),
+        'child_number':   txt(COL_CHILD_NUM),
+        'is_parent':      flag01(COL_IS_PARENT),
+        'is_child':       flag01(COL_IS_CHILD),
+        'lead_value':     lead_v,
+        'lead_display':   lead_d,
+        'assist':         txt(COL_ASSIST),
+        'tdm_ambassador_value':   tdm_v,
+        'tdm_ambassador_display': tdm_d,
+        'owner_value':    owner_v,
+        'owner_display':  owner_d,
+        'created_by_value':   creator_v,
+        'created_by_display': creator_d,
+        'improvement':    txt(COL_IMPROVEMENT),
+        'description':    txt(COL_DESCRIPTION),
+        'sqdcgp':         txt(COL_SQDCG),
+        'bucket':         txt(COL_BUCKET),
+        'source':         txt(COL_SOURCE),
+        'overall_status': txt(COL_STATUS),
+        'no_report_out':  map_no_report_out(cells.get(COL_NO_REPORT_OUT)),
+        'current_status_sheet': txt(COL_CURRENT_STATUS),
+        'current_start':  parse_due_date(cells.get(COL_CURRENT_START)),
+        'current_finish': parse_due_date(cells.get(COL_FINISH)),
+        'previous_finish_date': parse_due_date(cells.get(COL_PREV_FINISH)),
+        'original_start':  parse_due_date(cells.get(COL_ORIG_START)),
+        'original_finish': parse_due_date(cells.get(COL_ORIG_FINISH)),
+        'start_date_only':  parse_due_date(cells.get(COL_START)),
+        'finish_date_only': parse_due_date(cells.get(COL_FINISH_DATE_ONLY)),
+        'duration':       txt(COL_DURATION),
+        'predecessors':   txt(COL_PREDECESSORS),
+        'created_at_cell':  parse_iso_ts(cells.get(COL_CREATED_CELL)).isoformat() if parse_iso_ts(cells.get(COL_CREATED_CELL)) else None,
+        'modified_at_cell': parse_iso_ts(cells.get(COL_MODIFIED_CELL)).isoformat() if parse_iso_ts(cells.get(COL_MODIFIED_CELL)) else None,
+        'move_cancel_pending':    bool(raw.get(COL_MOVE_CANCEL)),
+        'is_starting_this_month': bool(raw.get(COL_STARTING_MONTH)),
+        'is_due_this_month':      bool(raw.get(COL_DUE_THIS_MONTH)),
+        'is_due_next_month':      bool(raw.get(COL_DUE_NEXT_MONTH)),
+        'is_due_last_month':      bool(raw.get(COL_DUE_LAST_MONTH)),
+        'at_risk':        bool(raw.get(COL_AT_RISK)),
+        'pll_lead':       txt(COL_PLL_LEAD),
+        'hours_saved_per_year':        txt(COL_HOURS_SAVED),
+        'impacted_trng_roles':         txt(COL_IMPACTED_TRNG),
+        'impacted_non_training_roles': txt(COL_IMPACTED_NON),
+        'kpi_connection':     txt(COL_KPI),
+        'original_requester': txt(COL_ORIG_REQUESTER),
+        'comments':       txt(COL_COMMENTS),
+        'one_pager_link': txt(COL_ONE_PAGER),
+    }
+
+
 def days_since(iso_ts: str | None) -> float | None:
     """Days elapsed since a Supabase timestamptz ISO string; None if unset/unparseable."""
     if not iso_ts:
@@ -489,6 +648,143 @@ def check_and_flag_wip_overages(db, owner_ids: set, log) -> int:
     return len(over_ids)
 
 
+# ─── AP TRACKER MIRROR (Ops Phase 2 foundation) ─────────────────
+def plan_mirror_writes(existing_mirror: dict, mirror_candidates: dict, dry_run: bool):
+    """
+    Loop-prevention planner for the ap_tracker mirror (decision e217604f:
+    (a) per-row sync state + (c) timestamp cursor; conflict rule 93113ee9).
+
+    For each candidate row (keyed by smartsheet_row_id):
+      - existing row with orion_dirty set:
+          * every field in orion_written_value matches the fresh sheet
+            value  -> ECHO: our own (future) write came back; clear the
+            flag on the upsert, log NOTHING to ap_change_log.
+          * fields differ AND the row's Smartsheet modifiedAt is AFTER
+            orion_written_at -> REAL post-write change: ingest the sheet
+            values (last-write-wins), clear the flag, and record one
+            ap_change_log conflict row per differing field (old = what
+            ORiON wrote / the losing edit, new = the Smartsheet value).
+            Surfacing these to Jen's review queue is second-brief UI.
+          * fields differ but Smartsheet is NOT newer -> Smartsheet hasn't
+            seen the ORiON write yet: PROTECT — skip the upsert entirely,
+            keep the dirty flag.
+      - anything else -> plain upsert; the payload carries
+        orion_dirty=false / orion_written_* = null, which is a no-op for
+        rows that were never dirty. (Known Phase 2 limit: a dirty stamp
+        landing between this run's read and write would be cleared — the
+        live ORiON write path arrives in the second brief, which owns
+        closing that race.)
+
+    Returns (to_upsert, conflict_rows, conflicted_row_ids, echo_cleared,
+    conflicts_ingested, protected_pending). conflicted_row_ids maps the
+    conflict rows back to their mirror payloads: the write phase inserts
+    conflict rows BEFORE the upserts, and on a failed conflict insert it
+    withholds those rows' upserts so the dirty state (and therefore the
+    conflict evidence) survives to the next run — same events-before-titles
+    ordering discipline as the end-date capture below (a cleared flag with
+    no logged conflict is a lost record; a duplicate conflict row on retry
+    is absorbable).
+    """
+    to_upsert       = []
+    conflict_rows   = []
+    conflicted_row_ids = set()
+    echo_cleared    = 0
+    conflicts_ingested = 0
+    protected_pending  = 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for row_id in sorted(mirror_candidates):
+        task    = mirror_candidates[row_id]
+        payload = dict(task['mirror'])
+        ap_num  = payload.get('ap_number')
+        ex      = existing_mirror.get(row_id)
+
+        if ex and ex.get('orion_dirty'):
+            written = ex.get('orion_written_value') or {}
+            diffs = {
+                k: payload.get(k)
+                for k in written
+                if payload.get(k) != written.get(k)
+            }
+            if not diffs:
+                echo_cleared += 1
+                log.info(f"{ap_num}: mirror echo — Smartsheet reflects the ORiON write; clearing dirty flag, logging nothing")
+                if dry_run:
+                    print(f"[DRY RUN] ECHO     {str(ap_num):14} mirror — ORiON write reflected, would clear dirty flag")
+            else:
+                sheet_mod  = parse_iso_ts(payload.get('smartsheet_modified_at'))
+                written_at = parse_iso_ts(ex.get('orion_written_at'))
+                if sheet_mod and written_at and sheet_mod > written_at:
+                    conflicts_ingested += 1
+                    conflicted_row_ids.add(row_id)
+                    for k, newv in diffs.items():
+                        conflict_rows.append({
+                            'module':    'ops',
+                            'item_id':   ex['id'],
+                            'ap_number': ap_num,
+                            'field':     k,
+                            'old_value': None if written.get(k) is None else str(written.get(k)),
+                            'new_value': None if newv is None else str(newv),
+                            'reason':    'conflict: Smartsheet changed after ORiON write — last-write-wins (Smartsheet kept), losing ORiON edit recorded (decision 93113ee9)',
+                            'changed_by': None,
+                        })
+                    log.warning(f"{ap_num}: mirror conflict — Smartsheet changed after ORiON write ({sorted(diffs)}); ingesting Smartsheet values, conflict logged")
+                    if dry_run:
+                        print(f"[DRY RUN] CONFLICT {str(ap_num):14} mirror — Smartsheet newer on {sorted(diffs)}, would ingest + log")
+                else:
+                    protected_pending += 1
+                    log.info(f"{ap_num}: mirror pending — Smartsheet not yet caught up to ORiON write; protecting row, no upsert")
+                    if dry_run:
+                        print(f"[DRY RUN] PROTECT  {str(ap_num):14} mirror — ORiON write pending mirror-out, row skipped")
+                    continue
+
+        payload['orion_dirty']         = False
+        payload['orion_written_value'] = None
+        payload['orion_written_at']    = None
+        payload['last_synced_at']      = now_iso
+        to_upsert.append(payload)
+
+    return to_upsert, conflict_rows, conflicted_row_ids, echo_cleared, conflicts_ingested, protected_pending
+
+
+def user_is_ap_manager(db, user_id: str) -> bool:
+    """True iff portal_users.is_ap_manager is set for user_id. The push
+    gate below depends on this being checked HERE, in code: the sync and
+    any future push run as service_role, which BYPASSES RLS, so the
+    is_ap_manager() RLS predicate on ap_tracker cannot gate an external
+    write on its own (decision 46da36f0, layer 3)."""
+    try:
+        resp = db.table('portal_users').select('is_ap_manager').eq('id', user_id).execute()
+    except Exception as e:
+        log.error(f"AP Manager flag lookup failed for {user_id}: {e}")
+        return False
+    rows = resp.data or []
+    return bool(rows and rows[0].get('is_ap_manager'))
+
+
+def push_row_to_smartsheet(db, acting_user_id: str, ap_number: str, fields: dict):
+    """ORiON → Smartsheet push path — GATE ONLY in this brief.
+
+    The AP Manager check is live; the write itself is deliberately NOT
+    wired here. The live immediate-write (Ops-tab edit -> Smartsheet write
+    + ap_tracker dirty-flag stamp in the same action) is the second
+    (Ops-tab UI) brief's scope — see decision bb18653e (write-back
+    phasing). Anything that would fire a real Smartsheet write from this
+    file before that brief is out of scope by ruling, not oversight.
+    """
+    if not user_is_ap_manager(db, acting_user_id):
+        raise PermissionError(
+            f"user {acting_user_id} is not an AP Manager — ORiON→Smartsheet "
+            f"writes are gated on portal_users.is_ap_manager (decision 46da36f0)"
+        )
+    raise NotImplementedError(
+        "ORiON→Smartsheet write-back is wired in the Ops-tab UI brief "
+        "(second brief). This placeholder exists so the push path is born "
+        "gated: service_role bypasses RLS, so the flag must be enforced in "
+        "code here, not only in ap_tracker's RLS policies."
+    )
+
+
 def build_delivery_notes(task: dict) -> str | None:
     """Combine description and bucket context for an action_items row."""
     notes_parts = []
@@ -508,7 +804,10 @@ def build_sync_accounting(*, child_tasks_total, inserted_delivery, updated_deliv
                           failed_inserts_delivery, failed_inserts_pc,
                           parent_titles_total, titles_new_or_changed, titles_written,
                           date_baselines, date_events_detected, date_events_written,
-                          title_capture_failed):
+                          title_capture_failed,
+                          mirror_candidates_total, mirror_upserted, mirror_echo_cleared,
+                          mirror_conflicts_ingested, mirror_protected_pending,
+                          mirror_conflict_rows_logged, mirror_failed):
     """
     Machine-readable per-run accounting — Phase 1 of the reconciliation
     monitor (decision 2026-08-25-ap-sync-reconciliation-monitor-design.md,
@@ -556,6 +855,18 @@ def build_sync_accounting(*, child_tasks_total, inserted_delivery, updated_deliv
             'date_events_detected':  date_events_detected,
             'date_events_written':   date_events_written,
             'title_capture_failed':  title_capture_failed,
+        },
+        # Third stream (Ops Phase 2): the ap_tracker mirror landing. Its own
+        # identity — candidates = upserted + protected_pending (+ failed);
+        # echo/conflict counts are overlays on upserted rows, never terms.
+        'mirror': {
+            'mirror_candidates_total':     mirror_candidates_total,
+            'mirror_upserted':             mirror_upserted,
+            'mirror_echo_cleared':         mirror_echo_cleared,
+            'mirror_conflicts_ingested':   mirror_conflicts_ingested,
+            'mirror_protected_pending':    mirror_protected_pending,
+            'mirror_conflict_rows_logged': mirror_conflict_rows_logged,
+            'mirror_failed':               mirror_failed,
         },
     }
 
@@ -715,6 +1026,29 @@ def main(dry_run: bool = False):
         log.error(f"Failed to load existing P&C AP items: {e}")
         sys.exit(1)
 
+    # Load existing ap_tracker mirror rows (Ops Phase 2, decision 69ba45bd)
+    # keyed by smartsheet_row_id — the loop-prevention planner needs each
+    # row's dirty state. A failed load must NOT block the child sync (same
+    # discipline as ap_titles): the mirror phase is skipped, mirror_failed
+    # marks the run, and the process exits non-zero at the very end —
+    # writing the mirror blind could clobber a pending ORiON write's dirty
+    # flag, which is worse than skipping a cycle.
+    mirror_load_failed = False
+    existing_mirror = {}
+    try:
+        mirror_resp = db.table('ap_tracker') \
+            .select('id, smartsheet_row_id, ap_number, orion_dirty, orion_written_value, orion_written_at') \
+            .execute()
+        existing_mirror = {
+            r['smartsheet_row_id']: r
+            for r in (mirror_resp.data or [])
+            if r.get('smartsheet_row_id') is not None
+        }
+        log.info(f"Existing ap_tracker mirror rows: {len(existing_mirror)}")
+    except Exception as e:
+        mirror_load_failed = True
+        log.error(f"Failed to load ap_tracker mirror — mirror landing skipped this run: {e}")
+
     # ── AP title diff (top-level parent rows → ap_titles) ───────
     # Diffed here (before the dry-run gate) so dry runs can report it;
     # the actual writes happen AFTER the child-row write phase below —
@@ -795,6 +1129,12 @@ def main(dry_run: bool = False):
     # len(child_tasks) == sum(all dispositions) can close (action 9278f68e).
     skipped_inactive_noop       = 0  # inactive, non-pending, no close queued
     skipped_inactive_wrongtable = 0  # inactive, pending on one table, resolved to the other
+    # ap_tracker landing set (Ops Phase 2) — the SAME in-scope rows the
+    # module sync handles today, nothing wider (STOP rule: ingest scope is
+    # not widened in this brief; the mirror table is merely shaped for the
+    # full sheet). Keyed by smartsheet_row_id so the two collection points
+    # below can't double-count a row.
+    mirror_candidates = {}
     unmapped_leads       = set()
     ambiguous_leads      = set()
     viewer_leads         = set()
@@ -813,6 +1153,11 @@ def main(dry_run: bool = False):
         # insert, since destination is resolved fresh per row and could in
         # principle land on the table that ISN'T the one holding the flag.
         if not task['active']:
+            # Mirror landing: an inactive row is in-scope iff a module row
+            # already exists for it (the close/pending-settle set) — the
+            # same rows that reach the modules today, nothing wider.
+            if ap_num and (ap_num in existing_delivery or ap_num in existing_pc):
+                mirror_candidates[task['mirror']['smartsheet_row_id']] = task
             delivery_pending = bool(existing_delivery.get(ap_num, {}).get('ap_pending_update'))
             pc_pending = bool(existing_pc.get(ap_num, {}).get('ap_pending_update'))
             if not delivery_pending and not pc_pending:
@@ -855,6 +1200,12 @@ def main(dry_run: bool = False):
         lead_display_for_log = lead_email or task['lead_display'] or task['lead_value'] or '(blank)'
 
         destination, owner_id = resolve_owner(lead_email or "", email_to_id, portal_email_to_id, viewer_emails)
+
+        # Mirror landing: an active row is in-scope iff it routes to a
+        # module (delivery/pc) — ambiguous/viewer/none skips stay out of
+        # the mirror exactly as they stay out of the module tables.
+        if task['active'] and destination in ('delivery', 'pc'):
+            mirror_candidates[task['mirror']['smartsheet_row_id']] = task
 
         if destination == 'ambiguous':
             ambiguous_leads.add(lead_email)
@@ -1170,6 +1521,20 @@ def main(dry_run: bool = False):
             for item_id, ap in to_unorphan_pc:
                 print(f"[DRY RUN] UNORPHAN {ap:14} P&C      — back in tracker, would clear ap_orphaned")
 
+    # ── Mirror landing plan (Ops Phase 2, decisions 69ba45bd/e217604f) ──
+    # Planned pre-gate so dry runs report it; the actual writes run FIRST
+    # in the write phase below — the mirror is the landing zone, the module
+    # tables are its projections.
+    if mirror_load_failed:
+        to_upsert_mirror, mirror_conflict_rows = [], []
+        mirror_conflicted_row_ids = set()
+        mirror_echo_cleared = mirror_conflicts_ingested = mirror_protected = 0
+    else:
+        (to_upsert_mirror, mirror_conflict_rows, mirror_conflicted_row_ids,
+         mirror_echo_cleared, mirror_conflicts_ingested,
+         mirror_protected) = plan_mirror_writes(
+            existing_mirror, mirror_candidates, dry_run)
+
     if unmapped_leads:
         log.info(f"Lead emails that don't resolve in users or portal_users(tpm) (skipped): {sorted(unmapped_leads)}")
     if ambiguous_leads:
@@ -1195,6 +1560,12 @@ def main(dry_run: bool = False):
             f"Orphans  — would flag: {len(to_orphan_delivery)} delivery + {len(to_orphan_pc)} P&C, "
             f"would clear: {len(to_unorphan_delivery)} delivery + {len(to_unorphan_pc)} P&C"
         )
+        mirror_summary = (
+            f"Mirror   — candidates: {len(mirror_candidates)}, would upsert: {len(to_upsert_mirror)}, "
+            f"echo-cleared: {mirror_echo_cleared}, conflicts ingested: {mirror_conflicts_ingested}, "
+            f"protected pending: {mirror_protected}, conflict rows to log: {len(mirror_conflict_rows)}"
+            + (" [MIRROR LOAD FAILED — landing skipped]" if mirror_load_failed else "")
+        )
         titles_summary = (
             f"AP titles — captured from Smartsheet: {len(parent_titles)}, "
             f"would write (new/changed): {len(titles_to_write)}, "
@@ -1207,6 +1578,7 @@ def main(dry_run: bool = False):
         print(pc_summary)
         print(skip_summary)
         print(orphan_summary)
+        print(mirror_summary)
         print(titles_summary)
         for t in titles_to_write:
             print(f"[DRY RUN] TITLE    {t['ap_number']:14} \"{t['title']}\" end {t['end_date']} (row {t['source_row_id']})")
@@ -1251,11 +1623,63 @@ def main(dry_run: bool = False):
             date_events_detected=len(date_events),
             date_events_written=len(date_events) if not title_capture_failed else 0,
             title_capture_failed=title_capture_failed,
+            mirror_candidates_total=len(mirror_candidates),
+            mirror_upserted=len(to_upsert_mirror),
+            mirror_echo_cleared=mirror_echo_cleared,
+            mirror_conflicts_ingested=mirror_conflicts_ingested,
+            mirror_protected_pending=mirror_protected,
+            mirror_conflict_rows_logged=len(mirror_conflict_rows),
+            mirror_failed=1 if mirror_load_failed else 0,
         )
         print(f"ACCOUNTING {json.dumps(accounting)}")
         print("-" * 72)
         print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | DRY RUN complete — no writes were made.")
         return
+
+    # ── Mirror write phase — FIRST (Ops Phase 2, decision 69ba45bd): the
+    # ap_tracker mirror is the landing zone AP data enters ORiON through;
+    # the module writes below are its projections. Batches of 25 with the
+    # same per-row fallback discipline as the module inserts. A mirror
+    # failure never blocks the module sync (regression bar: today's rows
+    # must keep reaching the modules) — it marks the run and exits
+    # non-zero at the very end instead.
+    mirror_upserted = 0
+    mirror_failed_writes = 0
+    mirror_conflict_rows_logged = 0
+    # Conflict rows FIRST (see plan_mirror_writes docstring): if this insert
+    # fails, the conflicted rows' upserts are withheld so their dirty state
+    # — the only evidence of the losing edit — survives to the next run.
+    if mirror_conflict_rows:
+        try:
+            db.table('ap_change_log').insert(mirror_conflict_rows).execute()
+            mirror_conflict_rows_logged = len(mirror_conflict_rows)
+        except Exception as e:
+            mirror_failed_writes += 1
+            log.error(f"Mirror conflict-log insert failed ({len(mirror_conflict_rows)} rows) — withholding {len(mirror_conflicted_row_ids)} conflicted row upsert(s) so the dirty state survives: {e}")
+            to_upsert_mirror = [
+                p for p in to_upsert_mirror
+                if p.get('smartsheet_row_id') not in mirror_conflicted_row_ids
+            ]
+    for i in range(0, len(to_upsert_mirror), 25):
+        batch = to_upsert_mirror[i:i + 25]
+        try:
+            db.table('ap_tracker').upsert(batch, on_conflict='smartsheet_row_id').execute()
+            mirror_upserted += len(batch)
+        except Exception as e:
+            log.error(f"Mirror upsert batch failed ({len(batch)} rows) — retrying per row: {e}")
+            for item in batch:
+                try:
+                    db.table('ap_tracker').upsert(item, on_conflict='smartsheet_row_id').execute()
+                    mirror_upserted += 1
+                except Exception as row_e:
+                    mirror_failed_writes += 1
+                    log.error(f"Mirror upsert failed for {item.get('ap_number')} (row {item.get('smartsheet_row_id')}): {row_e}")
+    if to_upsert_mirror or mirror_conflict_rows:
+        log.info(
+            f"Mirror: {mirror_upserted} upserted of {len(mirror_candidates)} candidate(s), "
+            f"{mirror_echo_cleared} echo-cleared, {mirror_conflicts_ingested} conflict(s) ingested, "
+            f"{mirror_protected} protected pending, {mirror_conflict_rows_logged} conflict row(s) logged"
+        )
 
     # Insert new Delivery items in batches of 25. A failed batch falls back
     # to per-row inserts: on 2026-08-24 one row with a junk date killed its
@@ -1501,10 +1925,14 @@ def main(dry_run: bool = False):
         f"orphans flagged: {orphaned_delivery + orphaned_pc}, orphans cleared: {unorphaned}, "
         f"WIP flags set: {wip_flagged} | "
         f"AP titles: captured {len(parent_titles)}, written {titles_written}, "
-        f"end-date events: {len(date_events)} detected, {date_events_written} written"
+        f"end-date events: {len(date_events)} detected, {date_events_written} written | "
+        f"mirror: {mirror_upserted}/{len(mirror_candidates)} upserted, "
+        f"{mirror_echo_cleared} echo, {mirror_conflicts_ingested} conflict, "
+        f"{mirror_protected} protected"
         + (f" [INSERT FAILURES: {failed_inserts_delivery} Delivery, {failed_inserts_pc} P&C]"
            if (failed_inserts_delivery or failed_inserts_pc) else "")
         + (" [TITLE/DATE CAPTURE FAILED]" if title_capture_failed else "")
+        + (" [MIRROR FAILED]" if (mirror_load_failed or mirror_failed_writes) else "")
     )
     log.info(summary)
     print(summary)
@@ -1590,7 +2018,10 @@ def main(dry_run: bool = False):
                     f'date_events_detected={len(date_events)} date_events_written={date_events_written} '
                     f'date_baselines={date_baselines} '
                     f'insert_failures={failed_inserts_delivery + failed_inserts_pc} '
-                    f'title_capture_failed={title_capture_failed}'
+                    f'title_capture_failed={title_capture_failed} '
+                    f'mirror_upserted={mirror_upserted} mirror_echo={mirror_echo_cleared} '
+                    f'mirror_conflicts={mirror_conflicts_ingested} mirror_protected={mirror_protected} '
+                    f'mirror_failed={int(mirror_load_failed) + mirror_failed_writes}'
                 ),
             }, on_conflict='key').execute()
             log.info("Health heartbeat sent to SAM COS")
@@ -1632,6 +2063,13 @@ def main(dry_run: bool = False):
                 date_events_detected=len(date_events),
                 date_events_written=date_events_written,
                 title_capture_failed=title_capture_failed,
+                mirror_candidates_total=len(mirror_candidates),
+                mirror_upserted=mirror_upserted,
+                mirror_echo_cleared=mirror_echo_cleared,
+                mirror_conflicts_ingested=mirror_conflicts_ingested,
+                mirror_protected_pending=mirror_protected,
+                mirror_conflict_rows_logged=mirror_conflict_rows_logged,
+                mirror_failed=int(mirror_load_failed) + mirror_failed_writes,
             )
             sc.table('context_store').upsert({
                 'key':    'health:github:orion_ap_sync:accounting',
@@ -1673,6 +2111,23 @@ def main(dry_run: bool = False):
             f"{failed_inserts_delivery + failed_inserts_pc} insert(s) FAILED "
             f"({failed_inserts_delivery} Delivery, {failed_inserts_pc} P&C) — "
             f"exiting non-zero (rest of sync completed; failed rows named in log)"
+        )
+        log.error(msg)
+        print(msg)
+        sys.exit(1)
+
+    # ── Mirror failures → non-zero exit, same discipline ────────────
+    # The module sync completed (its heartbeat reflects that), but a run
+    # that failed to land the mirror must not report green — the mirror is
+    # the landing zone the Ops module reads (decision 69ba45bd), and a
+    # silently stale mirror is the same exit-0 lie as the 2026-08-24
+    # insert-batch incident.
+    if mirror_load_failed or mirror_failed_writes:
+        msg = (
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
+            f"ap_tracker mirror FAILED "
+            f"({'load failed' if mirror_load_failed else f'{mirror_failed_writes} write failure(s)'}) — "
+            f"exiting non-zero (module sync completed; see log)"
         )
         log.error(msg)
         print(msg)
