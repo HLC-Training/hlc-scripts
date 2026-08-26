@@ -27,9 +27,12 @@ Flow:
     next sync clears the flag on an echo (sheet == written value, nothing
     logged), ingests + conflict-logs a genuinely newer Smartsheet change
     (last-write-wins, decision 93113ee9), and protects the row when
-    Smartsheet hasn't caught up yet. The live write-back itself is NOT
-    wired here — push_row_to_smartsheet() is a gated placeholder until the
-    Ops-tab UI brief (decision bb18653e).
+    Smartsheet hasn't caught up yet. The live write-back is NOT here and
+    never will be: it shipped 2026-08-26 in the orion-pll app
+    (lib/smartsheet.ts + app/(protected)/operations/ap-actions.ts), which
+    stamps the dirty state and pushes at save time — this script's job is
+    only to recognize those pushes as echoes on the next run.
+    push_row_to_smartsheet() below stays a gate-demonstrating placeholder.
   - Upserts into the appropriate table on ap_number (insert new, update changed).
   - Top-level parent/summary rows (Is Parent, AP# like "AP-0621") are read in
     the same fetch and their "Improvement" text and "Current Finish" date are
@@ -763,14 +766,16 @@ def user_is_ap_manager(db, user_id: str) -> bool:
 
 
 def push_row_to_smartsheet(db, acting_user_id: str, ap_number: str, fields: dict):
-    """ORiON → Smartsheet push path — GATE ONLY in this brief.
+    """ORiON → Smartsheet push path — GATE-ONLY PLACEHOLDER, permanently.
 
-    The AP Manager check is live; the write itself is deliberately NOT
-    wired here. The live immediate-write (Ops-tab edit -> Smartsheet write
-    + ap_tracker dirty-flag stamp in the same action) is the second
-    (Ops-tab UI) brief's scope — see decision bb18653e (write-back
-    phasing). Anything that would fire a real Smartsheet write from this
-    file before that brief is out of scope by ruling, not oversight.
+    The LIVE immediate-write shipped 2026-08-26 in the orion-pll app
+    (lib/smartsheet.ts + app/(protected)/operations/ap-actions.ts): the
+    push fires from a user's save in the Ops tab, so it cannot live in
+    this cron script. This placeholder is kept only as the executable
+    statement of the gate rule for any future push added HERE: service_role
+    bypasses RLS, so portal_users.is_ap_manager must be enforced in code
+    at the push step (decision 46da36f0) — exactly as the app's server
+    action does.
     """
     if not user_is_ap_manager(db, acting_user_id):
         raise PermissionError(
@@ -778,10 +783,9 @@ def push_row_to_smartsheet(db, acting_user_id: str, ap_number: str, fields: dict
             f"writes are gated on portal_users.is_ap_manager (decision 46da36f0)"
         )
     raise NotImplementedError(
-        "ORiON→Smartsheet write-back is wired in the Ops-tab UI brief "
-        "(second brief). This placeholder exists so the push path is born "
-        "gated: service_role bypasses RLS, so the flag must be enforced in "
-        "code here, not only in ap_tracker's RLS policies."
+        "The live ORiON→Smartsheet write-back lives in the orion-pll app "
+        "(lib/smartsheet.ts), not in this script. sync_ap.py is strictly "
+        "Smartsheet→ORiON; do not wire a sheet write here."
     )
 
 
