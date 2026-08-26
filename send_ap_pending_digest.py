@@ -48,6 +48,8 @@ SUPABASE_URL         = "https://czdkctjbejnwuopigxta.supabase.co"
 ORION_SUPABASE_SERVICE_KEY = os.environ.get("ORION_SUPABASE_SERVICE_KEY", "")
 RESEND_API_KEY       = os.environ.get("RESEND_API_KEY", "")
 
+ORION_URL            = "https://orion.ofstraining.com"
+
 RESEND_API_URL = "https://api.resend.com/emails"
 FROM_EMAIL     = "orion@ofstraining.com"
 
@@ -242,6 +244,19 @@ def reason_lines(r: dict, escaped: bool) -> list[str]:
     ]
 
 
+def build_links_section() -> str:
+    smartsheet_url = "https://app.smartsheet.com/sheets/JGw3fHfjgF57PqF8Jm4Q7f74V6FcgxC97FQ36fj1"
+    orion_ops_url = f"{ORION_URL}/operations"
+    return (
+        "<p style=\"margin-top:24px;\">"
+        f"<a href=\"{smartsheet_url}\" style=\"margin-right:16px;color:#0066cc;text-decoration:none;\">"
+        "Open the AP Tracker in Smartsheet</a> | "
+        f"<a href=\"{orion_ops_url}\" style=\"margin-left:16px;color:#0066cc;text-decoration:none;\">"
+        "Review in ORiON</a>"
+        "</p>"
+    )
+
+
 def build_orphan_html_section(orphans: list[dict]) -> str:
     if not orphans:
         return ""
@@ -336,8 +351,9 @@ def build_html_body(rows: list[dict], orphans: list[dict] | None = None) -> str:
         "table, th, td { border: 1px solid #999999; }"
         "th { background-color: #eeeeee; text-align: left; }"
     )
+    links_section = build_links_section()
     orphan_section = build_orphan_html_section(orphans)
-    return f"<html><head><style>{style}</style></head><body>{intro}{table}{legend}{orphan_section}</body></html>"
+    return f"<html><head><style>{style}</style></head><body>{intro}{table}{legend}{links_section}{orphan_section}</body></html>"
 
 
 def build_text_body(rows: list[dict], orphans: list[dict] | None = None) -> str:
