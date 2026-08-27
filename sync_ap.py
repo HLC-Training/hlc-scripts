@@ -6,17 +6,30 @@ Smartsheet Action Plan → ORiON sync. Runs on ARGUS on a schedule.
 
 Flow:
   - Smartsheet is the SOURCE OF TRUTH. This script never writes to it.
-  - Reads child-level AP tasks from the OFS Training Action Plan Tracker
-    (active statuses drive the sync; inactive rows are read to settle
-    pending flags and to close out existing rows whose Smartsheet status
-    went On Hold / Complete / Cancelled — see fetch_child_ap_tasks).
+  - Reads EVERY AP-numbered row from the OFS Training Action Plan Tracker —
+    children, mid-nodes, umbrella parents, standalones, all statuses (see
+    fetch_ap_rows; widened 2026-08-27, action item 37bc44dd / bug 3e1cdc00 —
+    before that only is_child rows were fetched, so childless top-level APs
+    never reached ORiON).
   - Each row's Lead cell is resolved to an email (linked contact value, then
     the ap_lead_aliases table, then a name match against users/portal_users —
     see resolve_lead_email), then that email is resolved against BOTH users
     (PLLs/admins) and portal_users (TPMs). PLL/admin leads route to
     action_items (Delivery); TPM leads route to pc_projects (P&C). A lead
     resolving in both, resolving only to a viewer, or resolving in neither,
-    is skipped and logged rather than guessed.
+    is skipped as an OWNER and logged rather than guessed.
+  - Membership is FAMILY-SCOPED (2026-08-27 ruling): a family (all rows
+    sharing a top-level AP-#### prefix) or a standalone is in-scope iff at
+    least one member's Lead routes to a module. Every row of an in-scope
+    family mirrors and projects — a member whose own lead is unresolved or
+    out-of-scope projects with owner_id NULL plus the raw Smartsheet lead
+    display text (ap_lead_display). Pure parents (is_parent AND NOT
+    is_child) project as family headers into EVERY module their family
+    occupies (split families get the header in both tables). Families with
+    zero routed members (Customer/Internal/Ops-led) stay out — that
+    population's widening is deferred.
+  - ALL statuses project, Complete/Cancelled included — ORiON is becoming
+    the system of record and holds terminal history.
   - In-scope rows (the ones that route to a module, or that already hold a
     module row) land FIRST in the ap_tracker mirror table (full-row shape,
     keyed on smartsheet_row_id — decision 69ba45bd, 2026-08-26); the module
@@ -68,6 +81,7 @@ import uuid
 import logging
 import argparse
 import requests
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from supabase import create_client
@@ -186,6 +200,19 @@ ACTIVE_STATUSES = {"Not Started", "In Progress"}
 # expected in the sheet and are not titles we capture.
 TOP_LEVEL_AP_RE = re.compile(r"^AP-\d+$")
 
+# Family key: the top-level AP prefix of any ap_number ("AP-0621-3-2" ->
+# "AP-0621"). Family-scoped membership (2026-08-27 ruling, 37bc44dd): a
+# family — every row sharing a family key — or a standalone is in-scope iff
+# at least one member's Lead routes to a module. The per-row Lead rule still
+# decides each row's OWNER; the family decides MEMBERSHIP. Matches the
+# TypeScript side's TOP_LEVEL_AP in orion-pll lib/ap-grouping.ts.
+FAMILY_RE = re.compile(r"^(AP-\d+)")
+
+
+def family_key(ap_number: str | None) -> str | None:
+    m = FAMILY_RE.match((ap_number or "").strip())
+    return m.group(1) if m else None
+
 # SQDCG → ORiON category (first letter wins; G = Growth = Strategy)
 SQDCG_MAP = {
     "S": "Safety",
@@ -221,14 +248,22 @@ def ss_get(path: str, params: dict = None) -> dict:
     return resp.json()
 
 
-def fetch_child_ap_tasks() -> tuple[list[dict], list[dict]]:
+def fetch_ap_rows() -> tuple[list[dict], list[dict]]:
     """
     Fetch all rows from the AP sheet and return
-    (child_tasks, parent_titles):
+    (tasks, parent_titles):
 
-    child_tasks — every child-level task, active AND inactive — regardless
-    of who the Lead is or whether they resolve to anyone in ORiON. Owner
-    resolution and routing (Delivery vs P&C vs skip) happens in main().
+    tasks — EVERY row that carries an AP number (children, mid-nodes,
+    umbrella parents, standalones), active AND inactive — regardless of
+    who the Lead is or whether they resolve to anyone in ORiON. Widened
+    from is_child-only rows 2026-08-27 (action item 37bc44dd, bug
+    3e1cdc00): a childless top-level AP used to be invisible to ORiON.
+    Each task carries its shape flags (is_child / is_parent) and family
+    key (top-level AP-#### prefix). Blank-AP rows are kept only when
+    is_child is set — so main()'s skipped_no_ap accounting stays identical
+    to the pre-widening behavior — and other blank-AP rows (structural
+    summary lines) are skipped here with a count in the log. Owner
+    resolution, family scoping, and routing happen in main().
 
     parent_titles — one dict per TOP-LEVEL parent/summary row (Is Parent
     set, AP# like "AP-0621" with no sub-segments): the AP number, the
@@ -240,15 +275,14 @@ def fetch_child_ap_tasks() -> tuple[list[dict], list[dict]]:
     top-level numbers only. A top-level parent with a blank title is
     logged and skipped, never captured as an empty string.
 
-    Inactive rows (Complete / Cancelled / On Hold) are included for two
-    purposes only: (a) a row whose ap_pending_update flag is set can be
-    recognized as caught-up once Jennifer applies the change in Smartsheet
-    (e.g. ORiON "Done" vs Smartsheet "Complete" map to the same status and
-    must clear the flag), and (b) an existing non-pending row whose
-    Smartsheet status went inactive gets a status-only close write, so
-    Complete/Cancelled/On Hold actually reaches ORiON (bug e6b35596).
-    main() restricts inactive rows to exactly those paths — they never
-    insert, never touch any field beyond status on a close, and never
+    Inactive rows (Complete / Cancelled / On Hold) are all captured. For
+    IN-SCOPE families they now project fully — all statuses, terminal
+    history included (2026-08-27 ruling). For out-of-scope rows the
+    pre-widening restrictions still hold in main(): (a) a row whose
+    ap_pending_update flag is set can be recognized as caught-up once
+    Jennifer applies the change in Smartsheet, and (b) an existing
+    non-pending row whose Smartsheet status went inactive gets a
+    status-only close write (bug e6b35596) — they never insert and never
     touch the skip counters.
 
     Smartsheet rows are retrieved via GET /sheets/{id} with pagination.
@@ -299,9 +333,10 @@ def fetch_child_ap_tasks() -> tuple[list[dict], list[dict]]:
         )
     log.info(f"Smartsheet: fetched {len(all_rows)} total rows across {page} page(s)")
 
-    child_tasks   = []
+    tasks         = []
     parent_titles = []
     seen_title_aps = set()
+    skipped_structural = 0
     for row in all_rows:
         cells       = {c["columnId"]: c.get("displayValue") or c.get("value") for c in row.get("cells", [])}
         raw         = {c["columnId"]: c.get("value") for c in row.get("cells", [])}
@@ -312,7 +347,7 @@ def fetch_child_ap_tasks() -> tuple[list[dict], list[dict]]:
 
         # Title capture from TOP-LEVEL parent rows — read-only side channel,
         # runs before the child filters and never short-circuits them, so
-        # child_tasks comes out byte-identical to the pre-capture behavior.
+        # the task capture below is unaffected by it.
         if is_parent == "1.0" or is_parent == "1":
             p_ap    = str(cells.get(COL_AP_NUM) or "").strip()
             p_title = str(cells.get(COL_IMPROVEMENT) or "").strip()
@@ -332,14 +367,17 @@ def fetch_child_ap_tasks() -> tuple[list[dict], list[dict]]:
             # Non-top-level parents (AP-0621-1 etc.) and blank AP# summary
             # rows are expected sheet structure — no log, no capture.
 
-        # Child tasks only. Is Child alone qualifies a row as a syncable
-        # task — a row that is BOTH Is Child and Is Parent (a middle node
-        # in a 3-level hierarchy, e.g. AP-214-7 under AP-214) is still a
-        # real task with its own Lead/status/dates, and dropping it here
-        # silently excluded 15 active rows across 7 AP families (bug
-        # 59cd7d7b). Is Parent gates ONLY the title-capture branch above,
-        # where distinguishing top-level parents is legitimate.
-        if is_child != "1.0" and is_child != "1":
+        # EVERY AP-numbered row is a task now (2026-08-27 widening,
+        # 37bc44dd): children, mid-nodes (both flags — bug 59cd7d7b),
+        # umbrella parents, standalones. Blank-AP rows are kept only when
+        # is_child is set (so main()'s skipped_no_ap counting matches the
+        # pre-widening accounting identity); other blank-AP rows are
+        # structural summary lines, skipped here with one counter.
+        is_child_flag  = is_child in ("1", "1.0")
+        is_parent_flag = is_parent in ("1", "1.0")
+        ap_txt = str(cells.get(COL_AP_NUM) or "").strip()
+        if not ap_txt and not is_child_flag:
+            skipped_structural += 1
             continue
 
         status_raw = cells.get(COL_STATUS, "")
@@ -350,9 +388,12 @@ def fetch_child_ap_tasks() -> tuple[list[dict], list[dict]]:
         lead_value   = (raw.get(COL_LEAD) or "").strip()
         lead_display = (display_raw.get(COL_LEAD) or "").strip()
 
-        child_tasks.append({
+        tasks.append({
             "active":       status_raw in ACTIVE_STATUSES,
             "ap_number":    cells.get(COL_AP_NUM, ""),
+            "is_child":     is_child_flag,
+            "is_parent":    is_parent_flag,
+            "family":       family_key(ap_txt),
             "action_text":  cells.get(COL_IMPROVEMENT, ""),
             "notes":        cells.get(COL_DESCRIPTION),
             "lead_value":   lead_value,
@@ -369,10 +410,18 @@ def fetch_child_ap_tasks() -> tuple[list[dict], list[dict]]:
             "mirror":       build_mirror_capture(row, cells, raw, display_raw),
         })
 
-    n_active = sum(1 for t in child_tasks if t["active"])
-    log.info(f"Smartsheet: {len(child_tasks)} child-level tasks found ({n_active} active)")
+    n_active = sum(1 for t in tasks if t["active"])
+    n_parent = sum(1 for t in tasks if t["is_parent"] and not t["is_child"])
+    n_mid    = sum(1 for t in tasks if t["is_parent"] and t["is_child"])
+    n_stand  = sum(1 for t in tasks if not t["is_parent"] and not t["is_child"])
+    log.info(
+        f"Smartsheet: {len(tasks)} AP rows captured ({n_active} active; "
+        f"{n_parent} pure parents, {n_mid} mid-nodes, {n_stand} standalones, "
+        f"{len(tasks) - n_parent - n_mid - n_stand} children; "
+        f"{skipped_structural} structural blank-AP rows skipped)"
+    )
     log.info(f"Smartsheet: {len(parent_titles)} top-level AP titles found on parent rows")
-    return child_tasks, parent_titles
+    return tasks, parent_titles
 
 
 def resolve_lead_email(lead_value: str, lead_display: str, alias_map: dict, name_to_email: dict) -> str | None:
@@ -478,7 +527,7 @@ def build_mirror_capture(row: dict, cells: dict, raw: dict, display_raw: dict) -
     columns 1:1 so the dict IS the upsert payload (minus sync-state, which
     the write planner appends). Contact columns keep raw value + display,
     same discipline as the Lead handling above. Never touches the module
-    (child_tasks) capture — that projection stays byte-identical."""
+    (tasks) capture — that projection is built separately."""
     def txt(col):
         v = cells.get(col)
         if v is None:
@@ -615,11 +664,16 @@ def check_and_flag_wip_overages(db, owner_ids: set, log) -> int:
 
     today = datetime.now().date()
     try:
+        # Pure family parents (ap_is_parent AND NOT ap_is_child) are
+        # headers, not work — excluded from capacity math (Task 5 of the
+        # 2026-08-27 widening). Mid-nodes (both flags), standalones, and
+        # leaves all count.
         resp = db.table('action_items') \
             .select('id, owner_id, start_date, due_date') \
             .in_('owner_id', list(owner_ids)) \
             .eq('priority', 'Tier 2') \
             .in_('status', ['Open', 'In Progress']) \
+            .or_('ap_is_parent.eq.false,ap_is_child.eq.true') \
             .execute()
     except Exception as e:
         log.error(f"WIP check failed for owners {sorted(owner_ids)}: {e}")
@@ -799,13 +853,251 @@ def build_delivery_notes(task: dict) -> str | None:
     return " | ".join(notes_parts) if notes_parts else None
 
 
+# ─── SHARED PROJECTION PATH (Task 3, 2026-08-27 family-scope widening) ──
+# One parameterized mirror→module path. A module is: a table, a status
+# vocab, field builders, and (Delivery only, expressed outside this file's
+# planner via the WIP check) a workload concept. Both modules flow through
+# plan_module_projection(); the per-module differences live in the spec
+# dicts built in main().
+
+def is_pure_parent(task: dict) -> bool:
+    """Umbrella/summary row: Is Parent set, Is Child not. Mid-nodes (both
+    flags) are real tasks and are treated as leaves everywhere except the
+    UI's indentation."""
+    return bool(task['is_parent']) and not bool(task['is_child'])
+
+
+def module_row_key(ap_number: str, pure_parent: bool) -> tuple:
+    """Module rows key on (ap_number, pure_parent) — NOT bare ap_number.
+    Three sheet families (AP-036/AP-093/AP-174) have a parent row AND a
+    child row sharing one flat AP number; bare-ap keying would make one
+    twin invisible to the diff and re-insert it every run. Legacy module
+    rows are all leaves (ap_is_parent false), so they key (ap, False) and
+    keep matching — including AP-175, the pre-existing flat is_child row
+    the backfill must not double-insert."""
+    return (ap_number, pure_parent)
+
+
+def map_module_status(status_map: dict, status_raw, default: str, ap_num: str, label: str) -> str:
+    """Map a Smartsheet Overall Status to a module status, tolerating case
+    drift ('Not started' exists in the sheet) and blank cells. All statuses
+    project now, so an unmappable value must still land somewhere legal —
+    default with a warning rather than dropping the row or writing an
+    illegal CHECK value."""
+    if status_raw:
+        s = str(status_raw).strip()
+        if s in status_map:
+            return status_map[s]
+        for k, v in status_map.items():
+            if k.lower() == s.lower():
+                return v
+    log.warning(f"{ap_num}: unmapped Overall Status {status_raw!r} — defaulting to {default!r} ({label})")
+    return default
+
+
+def compute_shared_fields(task: dict) -> dict:
+    """Module-independent computed fields for one row's projection."""
+    return {
+        'due_date':      parse_due_date(task['finish_raw']),
+        'start_date':    parse_due_date(task['start_raw']),
+        'category':      map_category(task['sqdcg_raw']),
+        'no_report_out': map_no_report_out(task['no_report_out_raw']),
+        # Raw Smartsheet lead text — the owner fallback for rows whose lead
+        # resolves to no portal user (owner_id null). Stored on every row;
+        # the UI only surfaces it when owner_id is null.
+        'lead_display':  (task['lead_display'] or task['lead_value'] or '').strip() or None,
+    }
+
+
+def _shape_meta_diff(task: dict, ex: dict, shared: dict) -> dict:
+    """Projection-metadata diff, shared by both modules: shape flags + lead
+    display text. Kept SEPARATE from the content diff on purpose — the
+    pending-settle logic judges divergence on content fields only, and the
+    first widened run flips ap_is_child on every legacy row; that flip must
+    never hold a pending flag open or escalate as a PLL's diverging change."""
+    meta = {}
+    if bool(task['is_parent']) != bool(ex.get('ap_is_parent')):
+        meta['ap_is_parent'] = bool(task['is_parent'])
+    if bool(task['is_child']) != bool(ex.get('ap_is_child')):
+        meta['ap_is_child'] = bool(task['is_child'])
+    if shared['lead_display'] != (ex.get('ap_lead_display') or None):
+        meta['ap_lead_display'] = shared['lead_display']
+    return meta
+
+
+def build_delivery_insert(task: dict, owner_id, shared: dict, status: str) -> dict:
+    return {
+        'id':                str(uuid.uuid4()),
+        'owner_id':          owner_id,
+        'action_text':       task['action_text'],
+        'notes':             build_delivery_notes(task),
+        'status':            status,
+        'start_date':        shared['start_date'],
+        'due_date':          shared['due_date'],
+        'category':          shared['category'],
+        'priority':          'Tier 2',
+        'source':            'ap_import',
+        'ap_number':         task['ap_number'],
+        'no_report_out':     shared['no_report_out'],
+        'ap_pending_update': False,
+        'vault_synced':      True,
+        'ap_is_parent':      bool(task['is_parent']),
+        'ap_is_child':       bool(task['is_child']),
+        'ap_lead_display':   shared['lead_display'],
+        'created_date':      datetime.now().strftime('%Y-%m-%d'),
+        'last_updated':      datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def build_delivery_diff(task: dict, ex: dict, owner_id, shared: dict, status: str) -> tuple[dict, dict]:
+    """(content_fields, meta_fields) for a Delivery row. Content rules are
+    byte-identical to the pre-widening diff: dates guarded against blank
+    clobber (bug 74ebd314), no_report_out unguarded (real boolean), priority
+    never re-forced (bug aaaa96ea), action_text/notes/category deliberately
+    not synced on update (pre-existing module asymmetry, preserved)."""
+    fields = {}
+    if owner_id != ex.get('owner_id'):
+        fields['owner_id'] = owner_id
+    if status != ex['status']:
+        fields['status'] = status
+    if shared['due_date'] is not None and shared['due_date'] != ex.get('due_date'):
+        fields['due_date'] = shared['due_date']
+    if shared['start_date'] is not None and shared['start_date'] != ex.get('start_date'):
+        fields['start_date'] = shared['start_date']
+    if shared['no_report_out'] != ex.get('no_report_out'):
+        fields['no_report_out'] = shared['no_report_out']
+    return fields, _shape_meta_diff(task, ex, shared)
+
+
+def build_pc_insert(task: dict, owner_id, shared: dict, status: str) -> dict:
+    return {
+        'id':                   str(uuid.uuid4()),
+        'title':                task['action_text'],
+        'description':          task['notes'],
+        'owner_id':             owner_id,
+        'status':               status,
+        'source':               'ap_synced',
+        'ap_number':            task['ap_number'],
+        'priority':             'Tier 3',
+        'category':             shared['category'],
+        'start_date':           shared['start_date'],
+        'target_end_date':      shared['due_date'],
+        'original_target_date': shared['due_date'],
+        'no_report_out':        shared['no_report_out'],
+        'ap_is_parent':         bool(task['is_parent']),
+        'ap_is_child':          bool(task['is_child']),
+        'ap_lead_display':      shared['lead_display'],
+    }
+
+
+def build_pc_diff(task: dict, ex: dict, owner_id, shared: dict, status: str) -> tuple[dict, dict]:
+    """(content_fields, meta_fields) for a P&C row. Content rules preserved:
+    category guarded against None-clobber (bug b75a59f6), dates guarded
+    (bug 6f43d355) with the target_date_moves increment on real moves,
+    title/description synced (cleared description is intent, ruled 8/12)."""
+    fields = {}
+    if owner_id != ex.get('owner_id'):
+        fields['owner_id'] = owner_id
+    if task['action_text'] != ex.get('title'):
+        fields['title'] = task['action_text']
+    if task['notes'] != ex.get('description'):
+        fields['description'] = task['notes']
+    if status != ex.get('status'):
+        fields['status'] = status
+    if shared['category'] is not None and shared['category'] != ex.get('category'):
+        fields['category'] = shared['category']
+    if shared['start_date'] is not None and shared['start_date'] != ex.get('start_date'):
+        fields['start_date'] = shared['start_date']
+    if shared['due_date'] is not None and shared['due_date'] != ex.get('target_end_date'):
+        fields['target_end_date'] = shared['due_date']
+        fields['target_date_moves'] = (ex.get('target_date_moves') or 0) + 1
+    if shared['no_report_out'] != ex.get('no_report_out'):
+        fields['no_report_out'] = shared['no_report_out']
+    return fields, _shape_meta_diff(task, ex, shared)
+
+
+def plan_module_projection(task: dict, mod: dict, owner_id, shared: dict,
+                           dry_run: bool, escalations: list, id_to_name: dict,
+                           lead_display_for_log: str, secondary: bool) -> str:
+    """Plan one row's projection into one module. Returns the disposition:
+    'insert' | 'update' | 'unchanged' | 'clear_pending' | 'skip_pending'.
+
+    Queue entries carry the `secondary` flag (a pure parent projecting into
+    the second module of a split family) so the write phase can attribute
+    each op to the primary row-disposition stream (the accounting identity
+    counts ROWS once) or the split_projection overlay stream.
+
+    Pending-settle semantics are the pre-widening ones, verbatim: content
+    diff empty -> clear the flag and touch nothing else this run (metadata
+    lands on the next run's normal update); content diff non-empty -> skip,
+    protect, escalate past ESCALATION_DAYS."""
+    ap_num = task['ap_number']
+    ex = mod['existing'].get(module_row_key(ap_num, is_pure_parent(task)))
+    status = map_module_status(mod['status_map'], task['status_raw'], mod['default_status'], ap_num, mod['label'])
+
+    if ex is None:
+        payload = mod['build_insert'](task, owner_id, shared, status)
+        payload['_secondary'] = secondary
+        mod['to_insert'].append(payload)
+        if dry_run:
+            print(f"[DRY RUN] INSERT   {ap_num:14} {mod['plabel']} — owner {owner_id or shared['lead_display'] or '(none)'}, status {status}")
+        return 'insert'
+
+    content, meta = mod['build_diff'](task, ex, owner_id, shared, status)
+
+    if ex.get('ap_pending_update'):
+        if not content:
+            mod['to_clear_pending'].append((ex['id'], ap_num, secondary))
+            log.info(f"{ap_num}: Smartsheet caught up ({mod['label']}) — clearing ap_pending_update")
+            if dry_run:
+                print(f"[DRY RUN] CLEAR    {ap_num:14} {mod['plabel']} — Smartsheet caught up, pending flag cleared")
+            return 'clear_pending'
+        log.info(f"Skipping {ap_num} — {mod['label']} pending update awaiting Smartsheet change")
+        if dry_run:
+            print(f"[DRY RUN] SKIP     {ap_num:14} {mod['plabel']} — pending update awaiting Smartsheet change")
+        pending_days = days_since(ex.get('ap_pending_since'))
+        if pending_days is not None and pending_days > ESCALATION_DAYS:
+            divergence = ", ".join(
+                f"{k}: {ex.get(k)!r} -> {v!r}" for k, v in content.items()
+            )
+            escalations.append({
+                'module':       mod['esc_module'],
+                'ap_number':    ap_num,
+                'owner':        id_to_name.get(ex.get('owner_id')) or lead_display_for_log,
+                'days_flagged': round(pending_days),
+                'divergence':   divergence,
+            })
+            log.warning(
+                f"ESCALATED: {ap_num} ({mod['label']}) pending {round(pending_days)}d "
+                f"(> {ESCALATION_DAYS}d) and still diverging — {divergence}"
+            )
+            if dry_run:
+                print(f"[DRY RUN] ESCALATE {ap_num:14} {mod['plabel']} — pending {round(pending_days)}d, {divergence}")
+        return 'skip_pending'
+
+    fields = {**content, **meta}
+    if fields:
+        if 'owner_id' in content:
+            log.info(f"{ap_num}: lead reassigned in Smartsheet — owner updated ({mod['label']})")
+        fields[mod['ts_field']] = datetime.now(timezone.utc).isoformat()
+        mod['to_update'].append((ex['id'], fields, ap_num, secondary))
+        if dry_run:
+            print(f"[DRY RUN] UPDATE   {ap_num:14} {mod['plabel']} — {', '.join(k for k in fields if k != mod['ts_field'])}")
+        return 'update'
+    if dry_run:
+        print(f"[DRY RUN] SKIP     {ap_num:14} {mod['plabel']} — no changes")
+    return 'unchanged'
+
+
 # ─── MAIN ───────────────────────────────────────────────────────
 def build_sync_accounting(*, child_tasks_total, inserted_delivery, updated_delivery,
                           inserted_pc, updated_pc, skipped_unchanged, cleared_pending,
                           cleared_pending_pc, closed_delivery, closed_pc, skipped_pending,
                           skipped_no_ap, skipped_ambiguous, skipped_viewer, skipped_unmapped,
                           skipped_inactive_noop, skipped_inactive_wrongtable,
+                          skipped_split_unresolved,
                           failed_inserts_delivery, failed_inserts_pc,
+                          split_projection,
                           parent_titles_total, titles_new_or_changed, titles_written,
                           date_baselines, date_events_detected, date_events_written,
                           title_capture_failed,
@@ -815,14 +1107,19 @@ def build_sync_accounting(*, child_tasks_total, inserted_delivery, updated_deliv
     """
     Machine-readable per-run accounting — Phase 1 of the reconciliation
     monitor (decision 2026-08-25-ap-sync-reconciliation-monitor-design.md,
-    action item 9278f68e). Two SEPARATE identities, never folded together:
-    the child stream must sum to child_tasks_total; the parent-titles stream
-    is reported alongside with its own numbers. child_identity_residual is
-    emitted, not acted on — the Phase 2 monitor interprets it. Keyword-only
-    on purpose: both call sites (dry-run prediction, live actuals) are forced
-    to supply every field, so the emitted shape cannot drift between them.
-    Note `escalations` is an overlay on skipped_pending, not a disposition —
-    it must never appear as a term here.
+    action item 9278f68e). Separate identities, never folded together:
+    the child stream must sum to child_tasks_total (since the 2026-08-27
+    widening, "child" is a historical name — the stream covers EVERY
+    captured AP row, all shapes, each counted ONCE by its primary-module
+    disposition); the parent-titles stream is reported alongside with its
+    own numbers. child_identity_residual is emitted, not acted on — the
+    Phase 2 monitor interprets it. Keyword-only on purpose: both call
+    sites (dry-run prediction, live actuals) are forced to supply every
+    field, so the emitted shape cannot drift between them.
+    Overlays that must never appear as child terms: `escalations` (an
+    overlay on skipped_pending) and `split_projection` (a pure parent's
+    projection into the SECOND module of a split family — its own stream,
+    because the row already counted once under its primary module).
     """
     child = {
         'child_tasks_total':           child_tasks_total,
@@ -842,6 +1139,7 @@ def build_sync_accounting(*, child_tasks_total, inserted_delivery, updated_deliv
         'skipped_unmapped':            skipped_unmapped,
         'skipped_inactive_noop':       skipped_inactive_noop,
         'skipped_inactive_wrongtable': skipped_inactive_wrongtable,
+        'skipped_split_unresolved':    skipped_split_unresolved,
         'failed_inserts_delivery':     failed_inserts_delivery,
         'failed_inserts_pc':           failed_inserts_pc,
     }
@@ -860,6 +1158,10 @@ def build_sync_accounting(*, child_tasks_total, inserted_delivery, updated_deliv
             'date_events_written':   date_events_written,
             'title_capture_failed':  title_capture_failed,
         },
+        # Split-family stream (2026-08-27 widening): a pure parent's
+        # projection ops into the SECOND module its family occupies. Not
+        # part of the child identity — those rows already counted once.
+        'split_projection': split_projection,
         # Third stream (Ops Phase 2): the ap_tracker mirror landing. Its own
         # identity — candidates = upserted + protected_pending (+ failed);
         # echo/conflict counts are overlays on upserted rows, never terms.
@@ -979,9 +1281,9 @@ def main(dry_run: bool = False):
         if p.get('name') and p.get('email'):
             name_to_email[p['name'].strip().lower()] = p['email'].strip().lower()
 
-    # Fetch active AP tasks from Smartsheet
+    # Fetch all AP rows from Smartsheet
     try:
-        tasks, parent_titles = fetch_child_ap_tasks()
+        tasks, parent_titles = fetch_ap_rows()
     except Exception as e:
         # Exit non-zero (closes bug 306cea89 / lessons.md "exit 0 on a failed
         # fetch is a lie the whole system believes") — a plain `return` here
@@ -994,37 +1296,41 @@ def main(dry_run: bool = False):
         sys.exit(1)
 
     if not tasks:
-        log.info("No active AP tasks found.")
-        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | AP sync complete — no active tasks found.")
+        log.info("No AP rows found.")
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | AP sync complete — no AP rows found.")
         return
 
-    # Load existing Delivery (action_items) rows keyed by ap_number
+    # Load existing Delivery (action_items) rows keyed by
+    # (ap_number, pure_parent) — see module_row_key for why bare ap_number
+    # stopped being a safe key when parents started projecting.
     try:
         existing_resp = db.table('action_items') \
-            .select('id, ap_number, owner_id, status, due_date, start_date, priority, ap_pending_update, ap_pending_since, ap_orphaned, no_report_out') \
+            .select('id, ap_number, owner_id, status, due_date, start_date, priority, ap_pending_update, ap_pending_since, ap_orphaned, no_report_out, ap_is_parent, ap_is_child, ap_lead_display') \
             .eq('source', 'ap_import') \
             .execute()
         existing_delivery = {
-            r['ap_number']: r
+            module_row_key(r['ap_number'], bool(r.get('ap_is_parent')) and not bool(r.get('ap_is_child'))): r
             for r in (existing_resp.data or [])
             if r.get('ap_number')
         }
+        existing_delivery_aps = {r['ap_number'] for r in (existing_resp.data or []) if r.get('ap_number')}
         log.info(f"Existing Delivery AP items in Supabase: {len(existing_delivery)}")
     except Exception as e:
         log.error(f"Failed to load existing Delivery AP items: {e}")
         sys.exit(1)
 
-    # Load existing P&C (pc_projects) rows keyed by ap_number
+    # Load existing P&C (pc_projects) rows — same keying.
     try:
         existing_pc_resp = db.table('pc_projects') \
-            .select('id, ap_number, owner_id, title, description, status, category, start_date, target_end_date, target_date_moves, ap_pending_update, ap_pending_since, ap_orphaned, no_report_out') \
+            .select('id, ap_number, owner_id, title, description, status, category, start_date, target_end_date, target_date_moves, ap_pending_update, ap_pending_since, ap_orphaned, no_report_out, ap_is_parent, ap_is_child, ap_lead_display') \
             .eq('source', 'ap_synced') \
             .execute()
         existing_pc = {
-            r['ap_number']: r
+            module_row_key(r['ap_number'], bool(r.get('ap_is_parent')) and not bool(r.get('ap_is_child'))): r
             for r in (existing_pc_resp.data or [])
             if r.get('ap_number')
         }
+        existing_pc_aps = {r['ap_number'] for r in (existing_pc_resp.data or []) if r.get('ap_number')}
         log.info(f"Existing P&C AP items in Supabase: {len(existing_pc)}")
     except Exception as e:
         log.error(f"Failed to load existing P&C AP items: {e}")
@@ -1113,13 +1419,13 @@ def main(dry_run: bool = False):
         log.error(f"AP title capture: failed to load existing ap_titles — no titles/events will be written this run: {e}")
 
     to_insert_delivery = []
-    to_update_delivery = []  # list of (id, fields_to_update, ap_number)
-    to_clear_pending   = []  # list of (id, ap_number) — Smartsheet caught up, clear flag only
-    to_close_delivery  = []  # list of (id, new_status, ap_number) — row went inactive in Smartsheet
+    to_update_delivery = []  # list of (id, fields_to_update, ap_number, secondary)
+    to_clear_pending   = []  # list of (id, ap_number, secondary) — Smartsheet caught up, clear flag only
+    to_close_delivery  = []  # list of (id, new_status, ap_number) — out-of-scope row went inactive in Smartsheet
     to_insert_pc       = []
-    to_update_pc       = []  # list of (id, fields_to_update, ap_number)
-    to_clear_pending_pc = []  # list of (id, ap_number) — Smartsheet caught up, clear flag only
-    to_close_pc        = []  # list of (id, new_status, ap_number) — row went inactive in Smartsheet
+    to_update_pc       = []  # list of (id, fields_to_update, ap_number, secondary)
+    to_clear_pending_pc = []  # list of (id, ap_number, secondary) — Smartsheet caught up, clear flag only
+    to_close_pc        = []  # list of (id, new_status, ap_number) — out-of-scope row went inactive in Smartsheet
     escalations        = []  # pending > ESCALATION_DAYS and still diverging
 
     skipped_no_ap        = 0
@@ -1128,42 +1434,158 @@ def main(dry_run: bool = False):
     skipped_viewer       = 0
     skipped_unchanged    = 0
     skipped_pending      = 0
+    cleared_pending_planned    = 0  # primary clear_pending dispositions (accounting)
+    cleared_pending_pc_planned = 0
     # Reconciliation-monitor Phase 1 (decision 2026-08-25): the two
-    # previously-uncounted child-loop exits, counted so the identity
-    # len(child_tasks) == sum(all dispositions) can close (action 9278f68e).
-    skipped_inactive_noop       = 0  # inactive, non-pending, no close queued
-    skipped_inactive_wrongtable = 0  # inactive, pending on one table, resolved to the other
-    # ap_tracker landing set (Ops Phase 2) — the SAME in-scope rows the
-    # module sync handles today, nothing wider (STOP rule: ingest scope is
-    # not widened in this brief; the mirror table is merely shaped for the
-    # full sheet). Keyed by smartsheet_row_id so the two collection points
-    # below can't double-count a row.
+    # previously-uncounted loop exits, counted so the identity
+    # len(tasks) == sum(all dispositions) can close (action 9278f68e).
+    skipped_inactive_noop       = 0  # out-of-scope inactive, non-pending, no close queued
+    skipped_inactive_wrongtable = 0  # preserved counter; the in-scope path no longer produces it
+    # Family-scope widening (2026-08-27): an unresolved-lead LEAF inside a
+    # family whose members span BOTH modules has no ruled projection target
+    # — mirrored but not projected, loudly. Zero such rows exist today.
+    skipped_split_unresolved    = 0
+    # Primary-row dispositions planned per module (the accounting identity
+    # counts each ROW exactly once; a pure parent's projection into the
+    # second module of a split family is tracked in the secondary stream).
+    planned_primary_insert = {'delivery': 0, 'pc': 0}
+    planned_primary_update = {'delivery': 0, 'pc': 0}
+    sec_planned = {'insert': 0, 'update': 0, 'unchanged': 0, 'clear_pending': 0, 'skip_pending': 0}
+    # ap_tracker landing set: every row of every in-scope family/standalone
+    # (2026-08-27 widening — the mirror holds the complete in-scope tree),
+    # plus any out-of-scope row that still holds a module row (legacy
+    # close/settle set). Keyed by smartsheet_row_id.
     mirror_candidates = {}
     unmapped_leads       = set()
     ambiguous_leads      = set()
     viewer_leads         = set()
 
+    # ── Routing pre-pass + family scoping (Task 2) ──────────────
+    # Route every row once, then decide family membership: a family (or
+    # standalone) is in-scope iff >=1 member routes to a module. fam_modules
+    # holds the set of modules each in-scope family occupies — a pure parent
+    # projects into every one of them (split families get the header in
+    # both tables, ruling b).
+    fam_modules = defaultdict(set)
+    for task in tasks:
+        task['lead_email'] = resolve_lead_email(task['lead_value'], task['lead_display'], alias_map, name_to_email)
+        destination, owner_id = resolve_owner(task['lead_email'] or "", email_to_id, portal_email_to_id, viewer_emails)
+        task['destination'] = destination
+        task['owner_id'] = owner_id
+        if task['family'] and destination in ('delivery', 'pc'):
+            fam_modules[task['family']].add(destination)
+    in_scope_families = set(fam_modules)
+    n_split = sum(1 for mods in fam_modules.values() if len(mods) > 1)
+    log.info(
+        f"Family scoping: {len(in_scope_families)} in-scope families/standalones "
+        f"({n_split} split across both modules); "
+        f"{len({t['family'] for t in tasks if t['family']}) - len(in_scope_families)} families with zero routed members stay out"
+    )
+
+    module_specs = {
+        'delivery': {
+            'label': 'delivery', 'plabel': 'delivery', 'esc_module': 'delivery',
+            'existing': existing_delivery, 'status_map': STATUS_MAP, 'default_status': 'Open',
+            'build_insert': build_delivery_insert, 'build_diff': build_delivery_diff,
+            'ts_field': 'last_updated',
+            'to_insert': to_insert_delivery, 'to_update': to_update_delivery,
+            'to_clear_pending': to_clear_pending,
+        },
+        'pc': {
+            'label': 'P&C', 'plabel': 'P&C     ', 'esc_module': 'pc',
+            'existing': existing_pc, 'status_map': PC_STATUS_MAP, 'default_status': 'approved',
+            'build_insert': build_pc_insert, 'build_diff': build_pc_diff,
+            'ts_field': 'updated_at',
+            'to_insert': to_insert_pc, 'to_update': to_update_pc,
+            'to_clear_pending': to_clear_pending_pc,
+        },
+    }
+
     for task in tasks:
         ap_num = task['ap_number']
+        in_scope = task['family'] in in_scope_families
 
-        # Inactive rows exist ONLY to settle a pending Delivery or P&C flag,
-        # or (non-pending) to close an existing row whose Smartsheet status
+        if in_scope:
+            # ── In-scope family: every member row mirrors and projects
+            # (Task 2/3). All statuses project — terminal history included.
+            mirror_candidates[task['mirror']['smartsheet_row_id']] = task
+            if not ap_num or not task['action_text']:
+                # Both module tables have NOT NULL text/title; a blank-text
+                # row still mirrors but cannot project.
+                skipped_no_ap += 1
+                continue
+
+            lead_display_for_log = task['lead_email'] or task['lead_display'] or task['lead_value'] or '(blank)'
+            if task['destination'] == 'ambiguous':
+                ambiguous_leads.add(task['lead_email'])
+                log.error(
+                    f"AMBIGUOUS LEAD: {ap_num} — {task['lead_email']} resolves in BOTH "
+                    f"users and portal_users(tpm). Projecting with owner_id=null + fallback; needs human review."
+                )
+
+            pure_parent = is_pure_parent(task)
+            if task['destination'] in ('delivery', 'pc'):
+                row_modules = sorted(fam_modules[task['family']]) if pure_parent else [task['destination']]
+                owner_id = task['owner_id']
+                primary_module = task['destination']
+            else:
+                # Unresolved / viewer / ambiguous lead on an in-scope-family
+                # row: owner_id null + display-text fallback (ruling a).
+                owner_id = None
+                fam_mods = sorted(fam_modules[task['family']])
+                if pure_parent or len(fam_mods) == 1:
+                    row_modules = fam_mods if pure_parent else fam_mods[:1]
+                else:
+                    skipped_split_unresolved += 1
+                    log.warning(
+                        f"{ap_num}: unresolved-lead leaf in split family {task['family']} "
+                        f"({fam_mods}) — no ruling covers this shape; mirrored, not projected"
+                    )
+                    continue
+                primary_module = row_modules[0]
+
+            shared = compute_shared_fields(task)
+            for m in row_modules:
+                secondary = (m != primary_module)
+                disposition = plan_module_projection(
+                    task, module_specs[m], owner_id, shared, dry_run,
+                    escalations, id_to_name, lead_display_for_log, secondary)
+                if secondary:
+                    sec_planned[disposition] += 1
+                elif disposition == 'insert':
+                    planned_primary_insert[m] += 1
+                elif disposition == 'update':
+                    planned_primary_update[m] += 1
+                elif disposition == 'unchanged':
+                    skipped_unchanged += 1
+                elif disposition == 'clear_pending':
+                    if m == 'delivery':
+                        cleared_pending_planned += 1
+                    else:
+                        cleared_pending_pc_planned += 1
+                elif disposition == 'skip_pending':
+                    skipped_pending += 1
+            continue
+
+        # ── Out-of-scope row (family has zero routed members, or blank-AP
+        # is_child row): the PRE-WIDENING behavior, preserved verbatim —
+        # inactive rows only settle/close, active rows only hit the skip
+        # counters, nothing inserts.
+
+        # Inactive out-of-scope rows exist ONLY to settle a pending flag or
+        # (non-pending) to close an existing row whose Smartsheet status
         # went inactive. New/unknown rows are still dropped exactly as if
-        # never fetched (no counters, no logs). Pending rows continue into
-        # the main loop so the settle diff keeps sole authority over the
-        # flag; each destination branch below re-checks its own table's
-        # pending flag before doing anything with an inactive row — this
-        # top-level check must not be trusted alone to prevent an inactive
-        # insert, since destination is resolved fresh per row and could in
-        # principle land on the table that ISN'T the one holding the flag.
+        # never fetched (no counters, no logs). Pending rows continue past
+        # this block to the skip counters, exactly as before the widening.
         if not task['active']:
-            # Mirror landing: an inactive row is in-scope iff a module row
-            # already exists for it (the close/pending-settle set) — the
-            # same rows that reach the modules today, nothing wider.
-            if ap_num and (ap_num in existing_delivery or ap_num in existing_pc):
+            # Mirror landing (legacy set): an out-of-scope inactive row
+            # still mirrors iff a module row already exists for it (the
+            # close/pending-settle set).
+            if ap_num and (ap_num in existing_delivery_aps or ap_num in existing_pc_aps):
                 mirror_candidates[task['mirror']['smartsheet_row_id']] = task
-            delivery_pending = bool(existing_delivery.get(ap_num, {}).get('ap_pending_update'))
-            pc_pending = bool(existing_pc.get(ap_num, {}).get('ap_pending_update'))
+            row_k = module_row_key(ap_num, is_pure_parent(task))
+            delivery_pending = bool(existing_delivery.get(row_k, {}).get('ap_pending_update'))
+            pc_pending = bool(existing_pc.get(row_k, {}).get('ap_pending_update'))
             if not delivery_pending and not pc_pending:
                 # A close queued below already counts the row (closed_delivery /
                 # closed_pc); skipped_inactive_noop must cover only the rows that
@@ -1171,20 +1593,18 @@ def main(dry_run: bool = False):
                 _closes_before = len(to_close_delivery) + len(to_close_pc)
                 # Status-only close (bug e6b35596 + its Delivery sibling):
                 # Complete/Cancelled/On Hold set in Smartsheet must reach an
-                # existing ORiON row even though inactive rows never
-                # otherwise sync. Update-only (never insert), and deliberately
-                # independent of lead resolution — a cleared Lead cell must
-                # not leave a finished row showing active forever. Only
-                # status moves: the row is inactive in the source, so nothing
-                # else should change on the way out (in particular, a
-                # cleared SQDCG must not null category — see bug b75a59f6).
-                d_ex = existing_delivery.get(ap_num)
+                # existing ORiON row even though out-of-scope inactive rows
+                # never otherwise sync. Update-only (never insert), and
+                # deliberately independent of lead resolution — a cleared
+                # Lead cell must not leave a finished row showing active
+                # forever. Only status moves (bug b75a59f6 reasoning).
+                d_ex = existing_delivery.get(row_k)
                 d_status = STATUS_MAP.get(task['status_raw'])
                 if d_ex and d_status and d_ex.get('status') != d_status:
                     to_close_delivery.append((d_ex['id'], d_status, ap_num))
                     if dry_run:
                         print(f"[DRY RUN] CLOSE    {ap_num:14} delivery — {d_ex.get('status')} -> {d_status} (Smartsheet: {task['status_raw']})")
-                pc_ex = existing_pc.get(ap_num)
+                pc_ex = existing_pc.get(row_k)
                 pc_close_status = PC_STATUS_MAP.get(task['status_raw'])
                 if pc_ex and pc_close_status and pc_ex.get('status') != pc_close_status:
                     to_close_pc.append((pc_ex['id'], pc_close_status, ap_num))
@@ -1198,18 +1618,16 @@ def main(dry_run: bool = False):
             skipped_no_ap += 1
             continue
 
-        lead_email = resolve_lead_email(task['lead_value'], task['lead_display'], alias_map, name_to_email)
+        lead_email = task['lead_email']
         # For logging when nothing resolved, fall back to whatever raw text the
         # Lead cell actually had, so "TDM TBD" / free text is still visible.
         lead_display_for_log = lead_email or task['lead_display'] or task['lead_value'] or '(blank)'
 
-        destination, owner_id = resolve_owner(lead_email or "", email_to_id, portal_email_to_id, viewer_emails)
-
-        # Mirror landing: an active row is in-scope iff it routes to a
-        # module (delivery/pc) — ambiguous/viewer/none skips stay out of
-        # the mirror exactly as they stay out of the module tables.
-        if task['active'] and destination in ('delivery', 'pc'):
-            mirror_candidates[task['mirror']['smartsheet_row_id']] = task
+        # A routed destination is impossible here — a delivery/pc route
+        # would have put this row's family in scope. Only the skip-class
+        # destinations remain, preserved verbatim from the pre-widening
+        # behavior.
+        destination = task['destination']
 
         if destination == 'ambiguous':
             ambiguous_leads.add(lead_email)
@@ -1233,267 +1651,24 @@ def main(dry_run: bool = False):
                 print(f"[DRY RUN] SKIP     {ap_num:14} owner is viewer ({lead_email}) — not a valid Delivery owner")
             continue
 
-        if destination == 'none':
-            skipped_unmapped += 1
-            if lead_email:
-                unmapped_leads.add(lead_email)
-            if dry_run:
-                print(f"[DRY RUN] SKIP     {ap_num:14} lead does not resolve in users or portal_users(tpm) ({lead_display_for_log})")
-            continue
-
-        due_date   = parse_due_date(task['finish_raw'])
-        start_date = parse_due_date(task['start_raw'])
-        category   = map_category(task['sqdcg_raw'])
-        no_report_out = map_no_report_out(task['no_report_out_raw'])
-
-        if destination == 'delivery':
-            # Mirror of the P&C guard below: an inactive row let through the
-            # top-level filter by the OTHER table's pending flag must never
-            # create or modify a Delivery row, even if the Lead now resolves
-            # to a PLL.
-            if not task['active'] and not existing_delivery.get(ap_num, {}).get('ap_pending_update'):
-                skipped_inactive_wrongtable += 1
-                continue
-
-            status = STATUS_MAP.get(task['status_raw'], 'Open')
-            notes  = build_delivery_notes(task)
-
-            if ap_num in existing_delivery:
-                ex = existing_delivery[ap_num]
-
-                # Field diff runs BEFORE the pending check — the same fields
-                # dict decides both "normal update" and "Smartsheet caught up",
-                # so the reset condition and the update condition cannot drift.
-                fields = {}
-                if owner_id != ex.get('owner_id'):
-                    fields['owner_id'] = owner_id
-                if status != ex['status']:
-                    fields['status'] = status
-                # Guard (bug 74ebd314): a blank/cleared Smartsheet date cell must
-                # not null a stored Delivery date. Same accident-when-blank ruling
-                # as the P&C side (6f43d355) — a blank date reads as accident, not
-                # intent, and the failure is silent unrecoverable data loss. Note:
-                # `fields` also drives the ap_pending_update caught-up/divergence
-                # logic below, so guarding here also (correctly) stops a blanked
-                # cell from registering as a diverging change the PLL flagged.
-                if due_date is not None and due_date != ex.get('due_date'):
-                    fields['due_date'] = due_date
-                if start_date is not None and start_date != ex.get('start_date'):
-                    fields['start_date'] = start_date
-                # No guard here (decision 2026-08-25-sync-no-report-out-flag.md):
-                # this is a real computed boolean, never None, so the
-                # None-clobber class of guard above doesn't apply — and an
-                # unchecked box is a genuine user action that must propagate
-                # both ways (true->false included), unlike a cleared date.
-                if no_report_out != ex.get('no_report_out'):
-                    fields['no_report_out'] = no_report_out
-                # priority is intentionally NOT re-forced here (bug aaaa96ea,
-                # 2026-08-20) — mirrors the P&C shape below. A PLL may re-tier
-                # an AP item deliberately (ORiON-side reason gate covers it);
-                # only the initial Tier 2 import assumption is forced, once,
-                # on insert. Re-forcing on every sync silently discarded that
-                # choice within 30 minutes with no error and no record.
-
-                if ex.get('ap_pending_update'):
-                    if not fields:
-                        # Smartsheet caught up — the change the PLL flagged is
-                        # now reflected here. Clear the flag, touch nothing else.
-                        to_clear_pending.append((ex['id'], ap_num))
-                        log.info(f"{ap_num}: Smartsheet caught up — clearing ap_pending_update")
-                        if dry_run:
-                            print(f"[DRY RUN] CLEAR    {ap_num:14} delivery — Smartsheet caught up, pending flag cleared")
-                    else:
-                        # Still diverging — keep protecting the PLL's change.
-                        skipped_pending += 1
-                        log.info(f"Skipping {ap_num} — pending update awaiting Smartsheet change")
-                        if dry_run:
-                            print(f"[DRY RUN] SKIP     {ap_num:14} delivery — pending update awaiting Smartsheet change")
-                        pending_days = days_since(ex.get('ap_pending_since'))
-                        if pending_days is not None and pending_days > ESCALATION_DAYS:
-                            # ASCII arrow on purpose — this string is printed
-                            # on Windows consoles (cp1252) as well as pushed.
-                            divergence = ", ".join(
-                                f"{k}: {ex.get(k)!r} -> {v!r}" for k, v in fields.items()
-                            )
-                            escalations.append({
-                                'module':       'delivery',
-                                'ap_number':    ap_num,
-                                'owner':        id_to_name.get(ex.get('owner_id')) or lead_display_for_log,
-                                'days_flagged': round(pending_days),
-                                'divergence':   divergence,
-                            })
-                            log.warning(
-                                f"ESCALATED: {ap_num} pending {round(pending_days)}d "
-                                f"(> {ESCALATION_DAYS}d) and still diverging — {divergence}"
-                            )
-                            if dry_run:
-                                print(f"[DRY RUN] ESCALATE {ap_num:14} delivery — pending {round(pending_days)}d, {divergence}")
-                    continue
-
-                if fields:
-                    if 'owner_id' in fields:
-                        log.info(f"{ap_num}: lead reassigned in Smartsheet — owner updated")
-                    fields['last_updated'] = datetime.now(timezone.utc).isoformat()
-                    to_update_delivery.append((ex['id'], fields, ap_num))
-                    if dry_run:
-                        print(f"[DRY RUN] UPDATE   {ap_num:14} delivery — {', '.join(k for k in fields if k != 'last_updated')}")
-                else:
-                    skipped_unchanged += 1
-                    if dry_run:
-                        print(f"[DRY RUN] SKIP     {ap_num:14} delivery — no changes")
-            else:
-                to_insert_delivery.append({
-                    'id':                  str(uuid.uuid4()),
-                    'owner_id':            owner_id,
-                    'action_text':         task['action_text'],
-                    'notes':               notes,
-                    'status':              status,
-                    'start_date':          start_date,
-                    'due_date':            due_date,
-                    'category':            category,
-                    'priority':            'Tier 2',
-                    'source':              'ap_import',
-                    'ap_number':           ap_num,
-                    'no_report_out':       no_report_out,
-                    'ap_pending_update':   False,
-                    'vault_synced':        True,
-                    'created_date':        datetime.now().strftime('%Y-%m-%d'),
-                    'last_updated':        datetime.now(timezone.utc).isoformat(),
-                })
-                if dry_run:
-                    print(f"[DRY RUN] INSERT   {ap_num:14} delivery — owner {owner_id}, status {status}")
-
-        elif destination == 'pc':
-            # Inactive rows are fetched solely to settle a pending Delivery
-            # or P&C flag (see the top-level filter above) — an inactive row
-            # that isn't itself a pending P&C row must never create or
-            # modify a P&C project, even if the Lead now resolves to a TPM.
-            if not task['active'] and not existing_pc.get(ap_num, {}).get('ap_pending_update'):
-                skipped_inactive_wrongtable += 1
-                continue
-
-            pc_status = PC_STATUS_MAP.get(task['status_raw'])
-            title       = task['action_text']
-            description = task['notes']
-
-            if ap_num in existing_pc:
-                ex = existing_pc[ap_num]
-
-                # Field diff runs BEFORE the pending check — same discipline
-                # as Delivery (572a1936): the reset condition and the update
-                # condition share one fields dict so they can't drift apart.
-                fields = {}
-                if owner_id != ex.get('owner_id'):
-                    fields['owner_id'] = owner_id
-                if title != ex.get('title'):
-                    fields['title'] = title
-                if description != ex.get('description'):
-                    fields['description'] = description
-                if pc_status != ex.get('status'):
-                    fields['status'] = pc_status
-                # Guard (bug b75a59f6): never write a computed None over an
-                # existing non-null category — SQDCG is sparsely populated in
-                # the sheet, and a blank/cleared cell must not silently null
-                # a hand-set value. A real (non-null) change still syncs.
-                if category is not None and category != ex.get('category'):
-                    fields['category'] = category
-                # Guard (bug 6f43d355): a blank/cleared Smartsheet cell must not
-                # null a stored date. Dates read as accident when blank, unlike
-                # category (sparse source) and unlike description (mirrored:
-                # a cleared description is intent, ruled 8/12). The target_end_date
-                # guard also stops the phantom target_date_moves increment that a
-                # None-write would record as a schedule slip that never happened.
-                if start_date is not None and start_date != ex.get('start_date'):
-                    fields['start_date'] = start_date
-                if due_date is not None and due_date != ex.get('target_end_date'):
-                    fields['target_end_date'] = due_date
-                    # target_date_moves feeds the P&C timeline's drift view —
-                    # increment the CURRENT value on every real target_end_date
-                    # change, never on insert, and never touch original_target_date
-                    # again after insert (that baseline is app-write-only).
-                    fields['target_date_moves'] = (ex.get('target_date_moves') or 0) + 1
-                # No guard here — same reasoning as the Delivery side above:
-                # a real computed boolean, never None, and a toggle in either
-                # direction is a genuine Smartsheet edit that must propagate.
-                if no_report_out != ex.get('no_report_out'):
-                    fields['no_report_out'] = no_report_out
-                # priority is intentionally NOT re-forced here — Michele re-tiers
-                # P&C items in the UI and that choice should stick between syncs.
-
-                if ex.get('ap_pending_update'):
-                    if not fields:
-                        # Smartsheet caught up — clear the flag, touch nothing else.
-                        to_clear_pending_pc.append((ex['id'], ap_num))
-                        log.info(f"{ap_num}: Smartsheet caught up (P&C) — clearing ap_pending_update")
-                        if dry_run:
-                            print(f"[DRY RUN] CLEAR    {ap_num:14} P&C      — Smartsheet caught up, pending flag cleared")
-                    else:
-                        # Still diverging — keep protecting the TPM's change.
-                        skipped_pending += 1
-                        log.info(f"Skipping {ap_num} — P&C pending update awaiting Smartsheet change")
-                        if dry_run:
-                            print(f"[DRY RUN] SKIP     {ap_num:14} P&C      — pending update awaiting Smartsheet change")
-                        pending_days = days_since(ex.get('ap_pending_since'))
-                        if pending_days is not None and pending_days > ESCALATION_DAYS:
-                            divergence = ", ".join(
-                                f"{k}: {ex.get(k)!r} -> {v!r}" for k, v in fields.items()
-                            )
-                            escalations.append({
-                                'module':       'pc',
-                                'ap_number':    ap_num,
-                                'owner':        id_to_name.get(ex.get('owner_id')) or lead_display_for_log,
-                                'days_flagged': round(pending_days),
-                                'divergence':   divergence,
-                            })
-                            log.warning(
-                                f"ESCALATED: {ap_num} (P&C) pending {round(pending_days)}d "
-                                f"(> {ESCALATION_DAYS}d) and still diverging — {divergence}"
-                            )
-                            if dry_run:
-                                print(f"[DRY RUN] ESCALATE {ap_num:14} P&C      — pending {round(pending_days)}d, {divergence}")
-                    continue
-
-                if fields:
-                    fields['updated_at'] = datetime.now(timezone.utc).isoformat()
-                    to_update_pc.append((ex['id'], fields, ap_num))
-                    if dry_run:
-                        print(f"[DRY RUN] UPDATE   {ap_num:14} P&C      — {', '.join(k for k in fields if k != 'updated_at')}")
-                else:
-                    skipped_unchanged += 1
-                    if dry_run:
-                        print(f"[DRY RUN] SKIP     {ap_num:14} P&C      — no changes")
-            else:
-                to_insert_pc.append({
-                    'id':                    str(uuid.uuid4()),
-                    'title':                 title,
-                    'description':           description,
-                    'owner_id':              owner_id,
-                    'status':                pc_status,
-                    'source':                'ap_synced',
-                    'ap_number':             ap_num,
-                    'priority':              'Tier 3',
-                    'category':              category,
-                    'start_date':            start_date,
-                    'target_end_date':       due_date,
-                    'original_target_date':  due_date,
-                    'no_report_out':         no_report_out,
-                })
-                if dry_run:
-                    print(f"[DRY RUN] INSERT   {ap_num:14} P&C      — owner {owner_id}, status {pc_status}")
+        skipped_unmapped += 1
+        if lead_email:
+            unmapped_leads.add(lead_email)
+        if dry_run:
+            print(f"[DRY RUN] SKIP     {ap_num:14} lead does not resolve in users or portal_users(tpm) ({lead_display_for_log})")
+        continue
 
     # ── Orphan detection (bug c4494694) ─────────────────────────
-    # A row whose ap_number is absent from the FULL child fetch (active AND
-    # inactive) was deleted from the tracker — distinct from Complete/
-    # Cancelled/On Hold, which remain in the sheet and take the status-only
-    # close path above. Detection FLAGS (ap_orphaned + ap_orphaned_since),
-    # never deletes and never auto-closes (Jim's ruling, 2026-08-20): the
-    # row carries notes, history, and ap_change_log references, and the
-    # source being wrong is at least as likely as the row being wrong. A
-    # reappearing ap_number (row restored, or a Smartsheet restructure that
-    # briefly dropped the Is Child flag) clears the flag automatically.
-    # Detection keys on the CHILD row's own AP number only — a deleted
-    # child whose parent still exists is an orphan; the parent is not the
-    # row this table mirrors.
+    # A row whose ap_number is absent from the FULL fetch (active AND
+    # inactive, EVERY shape — the fetch now captures parents and
+    # standalones too, so their module rows can never be mis-orphaned by
+    # the detector; Task 6 of the 2026-08-27 widening) was deleted from
+    # the tracker — distinct from Complete/Cancelled/On Hold, which remain
+    # in the sheet and take a status/close path. Detection FLAGS
+    # (ap_orphaned + ap_orphaned_since), never deletes and never
+    # auto-closes (Jim's ruling, 2026-08-20). The sheet set is scope-blind
+    # on purpose: a family dropping out of scope must not orphan its
+    # existing module rows — the rows still exist in the sheet.
     sheet_ap_numbers = {t['ap_number'] for t in tasks if t['ap_number']}
     to_orphan_delivery   = []  # (id, ap_number)
     to_unorphan_delivery = []  # (id, ap_number)
@@ -1501,16 +1676,18 @@ def main(dry_run: bool = False):
     to_unorphan_pc       = []
     if not sheet_ap_numbers:
         # tasks is non-empty here (checked at fetch), so an empty AP-number
-        # set means every child row lost its AP# — sheet damage, not mass
+        # set means every row lost its AP# — sheet damage, not mass
         # deletion. Never mass-flag on that.
-        log.error("Orphan detection skipped — child fetch produced zero AP numbers")
+        log.error("Orphan detection skipped — fetch produced zero AP numbers")
     else:
-        for ap, r in existing_delivery.items():
+        for r in existing_delivery.values():
+            ap = r['ap_number']
             if ap not in sheet_ap_numbers and not r.get('ap_orphaned'):
                 to_orphan_delivery.append((r['id'], ap))
             elif ap in sheet_ap_numbers and r.get('ap_orphaned'):
                 to_unorphan_delivery.append((r['id'], ap))
-        for ap, r in existing_pc.items():
+        for r in existing_pc.values():
+            ap = r['ap_number']
             if ap not in sheet_ap_numbers and not r.get('ap_orphaned'):
                 to_orphan_pc.append((r['id'], ap))
             elif ap in sheet_ap_numbers and r.get('ap_orphaned'):
@@ -1555,10 +1732,16 @@ def main(dry_run: bool = False):
             f"P&C      — would insert: {len(to_insert_pc)}, would update: {len(to_update_pc)}, "
             f"would close: {len(to_close_pc)}, would clear pending flag: {len(to_clear_pending_pc)}"
         )
+        scope_summary = (
+            f"Scope    — in-scope families/standalones: {len(in_scope_families)} "
+            f"({n_split} split across both modules); secondary parent projections: "
+            f"{sum(sec_planned.values())} ({sec_planned})"
+        )
         skip_summary = (
             f"Skipped  — no AP#/text: {skipped_no_ap}, unmapped lead: {skipped_unmapped}, "
             f"ambiguous lead: {skipped_ambiguous}, owner is viewer: {skipped_viewer}, "
-            f"pending Smartsheet update: {skipped_pending}, unchanged: {skipped_unchanged}"
+            f"pending Smartsheet update: {skipped_pending}, unchanged: {skipped_unchanged}, "
+            f"split-family unresolved leaf: {skipped_split_unresolved}"
         )
         orphan_summary = (
             f"Orphans  — would flag: {len(to_orphan_delivery)} delivery + {len(to_orphan_pc)} P&C, "
@@ -1580,6 +1763,7 @@ def main(dry_run: bool = False):
         print("-" * 72)
         print(delivery_summary)
         print(pc_summary)
+        print(scope_summary)
         print(skip_summary)
         print(orphan_summary)
         print(mirror_summary)
@@ -1602,13 +1786,13 @@ def main(dry_run: bool = False):
         # is written, so written/failed counters are their would-be values).
         accounting = build_sync_accounting(
             child_tasks_total=len(tasks),
-            inserted_delivery=len(to_insert_delivery),
-            updated_delivery=len(to_update_delivery),
-            inserted_pc=len(to_insert_pc),
-            updated_pc=len(to_update_pc),
+            inserted_delivery=planned_primary_insert['delivery'],
+            updated_delivery=planned_primary_update['delivery'],
+            inserted_pc=planned_primary_insert['pc'],
+            updated_pc=planned_primary_update['pc'],
             skipped_unchanged=skipped_unchanged,
-            cleared_pending=len(to_clear_pending),
-            cleared_pending_pc=len(to_clear_pending_pc),
+            cleared_pending=cleared_pending_planned,
+            cleared_pending_pc=cleared_pending_pc_planned,
             closed_delivery=len(to_close_delivery),
             closed_pc=len(to_close_pc),
             skipped_pending=skipped_pending,
@@ -1618,8 +1802,11 @@ def main(dry_run: bool = False):
             skipped_unmapped=skipped_unmapped,
             skipped_inactive_noop=skipped_inactive_noop,
             skipped_inactive_wrongtable=skipped_inactive_wrongtable,
+            skipped_split_unresolved=skipped_split_unresolved,
             failed_inserts_delivery=0,
             failed_inserts_pc=0,
+            split_projection={'planned': dict(sec_planned), 'inserted': 0, 'updated': 0,
+                              'cleared_pending': 0, 'failed': 0},
             parent_titles_total=len(parent_titles),
             titles_new_or_changed=len(titles_to_write),
             titles_written=len(titles_to_write) if not title_capture_failed else 0,
@@ -1690,32 +1877,64 @@ def main(dry_run: bool = False):
     # 24 batch-mates wholesale (batch INSERT is all-or-nothing at the API),
     # and the swallowed error left the run reporting green. The fallback
     # bounds the blast radius of a bad row to itself and names it in the log.
+    # Ops carry the `_secondary` tag (a pure parent landing in the second
+    # module of a split family) so counts attribute to the primary child
+    # identity vs the split_projection overlay stream.
     inserted_delivery = 0
     failed_inserts_delivery = 0
+    inserted_pc = 0
+    failed_inserts_pc = 0
+    sec_written = {'inserted': 0, 'updated': 0, 'cleared_pending': 0, 'failed': 0}
     inserted_delivery_items = []   # rows that actually landed — WIP check keys on these
+
+    def _count_insert(item, module):
+        nonlocal inserted_delivery, inserted_pc
+        if item.get('_secondary'):
+            sec_written['inserted'] += 1
+        elif module == 'delivery':
+            inserted_delivery += 1
+        else:
+            inserted_pc += 1
+
+    def _count_insert_failure(item, module):
+        nonlocal failed_inserts_delivery, failed_inserts_pc
+        if item.get('_secondary'):
+            sec_written['failed'] += 1
+        elif module == 'delivery':
+            failed_inserts_delivery += 1
+        else:
+            failed_inserts_pc += 1
+
+    def _strip(payload):
+        return {k: v for k, v in payload.items() if k != '_secondary'}
+
     for i in range(0, len(to_insert_delivery), 25):
         batch = to_insert_delivery[i:i + 25]
         try:
-            db.table('action_items').insert(batch).execute()
-            inserted_delivery += len(batch)
-            inserted_delivery_items.extend(batch)
+            db.table('action_items').insert([_strip(p) for p in batch]).execute()
+            for item in batch:
+                _count_insert(item, 'delivery')
+                inserted_delivery_items.append(item)
         except Exception as e:
             log.error(f"Delivery insert batch failed ({len(batch)} rows) — retrying per row: {e}")
             for item in batch:
                 try:
-                    db.table('action_items').insert(item).execute()
-                    inserted_delivery += 1
+                    db.table('action_items').insert(_strip(item)).execute()
+                    _count_insert(item, 'delivery')
                     inserted_delivery_items.append(item)
                 except Exception as row_e:
-                    failed_inserts_delivery += 1
+                    _count_insert_failure(item, 'delivery')
                     log.error(f"Delivery insert failed for {item['ap_number']}: {row_e}")
 
     # Apply Delivery updates
     updated_delivery = 0
-    for item_id, fields, ap_num in to_update_delivery:
+    for item_id, fields, ap_num, secondary in to_update_delivery:
         try:
             db.table('action_items').update(fields).eq('id', item_id).execute()
-            updated_delivery += 1
+            if secondary:
+                sec_written['updated'] += 1
+            else:
+                updated_delivery += 1
         except Exception as e:
             log.error(f"Delivery update failed for {ap_num}: {e}")
 
@@ -1723,13 +1942,16 @@ def main(dry_run: bool = False):
     # Deliberately does NOT touch last_updated (or anything else): the row's
     # content didn't change, only the flag lifecycle did.
     cleared_pending = 0
-    for item_id, ap_num in to_clear_pending:
+    for item_id, ap_num, secondary in to_clear_pending:
         try:
             db.table('action_items') \
                 .update({'ap_pending_update': False, 'ap_pending_since': None}) \
                 .eq('id', item_id) \
                 .execute()
-            cleared_pending += 1
+            if secondary:
+                sec_written['cleared_pending'] += 1
+            else:
+                cleared_pending += 1
         except Exception as e:
             log.error(f"Pending-flag clear failed for {ap_num}: {e}")
 
@@ -1747,44 +1969,49 @@ def main(dry_run: bool = False):
         except Exception as e:
             log.error(f"Delivery close failed for {ap_num}: {e}")
 
-    # Insert new P&C items in batches of 25 — same per-row fallback
-    # discipline as the Delivery inserts above.
-    inserted_pc = 0
-    failed_inserts_pc = 0
+    # Insert new P&C items in batches of 25 — same per-row fallback and
+    # secondary-attribution discipline as the Delivery inserts above.
     for i in range(0, len(to_insert_pc), 25):
         batch = to_insert_pc[i:i + 25]
         try:
-            db.table('pc_projects').insert(batch).execute()
-            inserted_pc += len(batch)
+            db.table('pc_projects').insert([_strip(p) for p in batch]).execute()
+            for item in batch:
+                _count_insert(item, 'pc')
         except Exception as e:
             log.error(f"P&C insert batch failed ({len(batch)} rows) — retrying per row: {e}")
             for item in batch:
                 try:
-                    db.table('pc_projects').insert(item).execute()
-                    inserted_pc += 1
+                    db.table('pc_projects').insert(_strip(item)).execute()
+                    _count_insert(item, 'pc')
                 except Exception as row_e:
-                    failed_inserts_pc += 1
+                    _count_insert_failure(item, 'pc')
                     log.error(f"P&C insert failed for {item['ap_number']}: {row_e}")
 
     # Apply P&C updates
     updated_pc = 0
-    for item_id, fields, ap_num in to_update_pc:
+    for item_id, fields, ap_num, secondary in to_update_pc:
         try:
             db.table('pc_projects').update(fields).eq('id', item_id).execute()
-            updated_pc += 1
+            if secondary:
+                sec_written['updated'] += 1
+            else:
+                updated_pc += 1
         except Exception as e:
             log.error(f"P&C update failed for {ap_num}: {e}")
 
     # Clear settled P&C pending flags — same discipline as Delivery: only
     # the flag lifecycle changes, nothing else on the row.
     cleared_pending_pc = 0
-    for item_id, ap_num in to_clear_pending_pc:
+    for item_id, ap_num, secondary in to_clear_pending_pc:
         try:
             db.table('pc_projects') \
                 .update({'ap_pending_update': False, 'ap_pending_since': None}) \
                 .eq('id', item_id) \
                 .execute()
-            cleared_pending_pc += 1
+            if secondary:
+                sec_written['cleared_pending'] += 1
+            else:
+                cleared_pending_pc += 1
         except Exception as e:
             log.error(f"P&C pending-flag clear failed for {ap_num}: {e}")
 
@@ -1886,7 +2113,8 @@ def main(dry_run: bool = False):
     # insert list — with a failed batch those two diverge, and on 2026-08-24
     # the slice flagged an owner whose rows were ALL in the failed batch.
     if inserted_delivery_items:
-        new_owner_ids = {item['owner_id'] for item in inserted_delivery_items}
+        # Null owners (unresolved-lead fallback rows) have no WIP to check.
+        new_owner_ids = {item['owner_id'] for item in inserted_delivery_items if item.get('owner_id')}
         wip_flagged = check_and_flag_wip_overages(db, new_owner_ids, log)
         if wip_flagged:
             log.warning(f"{wip_flagged} PLL(s) flagged for WIP review on next login")
@@ -1923,6 +2151,9 @@ def main(dry_run: bool = False):
         f"closed {closed_delivery}, pending cleared {cleared_pending} | "
         f"P&C: inserted {inserted_pc}, updated {updated_pc}, "
         f"closed {closed_pc}, pending cleared {cleared_pending_pc} | "
+        f"families in scope: {len(in_scope_families)} ({n_split} split; "
+        f"secondary parent ops: {sec_written['inserted']}i/{sec_written['updated']}u, "
+        f"{sec_written['failed']} failed) | "
         f"skipped: {skipped_total}, "
         f"pending Smartsheet updates: {len(pending)}, "
         f"escalated: {len(escalations)}, "
@@ -2058,8 +2289,10 @@ def main(dry_run: bool = False):
                 skipped_unmapped=skipped_unmapped,
                 skipped_inactive_noop=skipped_inactive_noop,
                 skipped_inactive_wrongtable=skipped_inactive_wrongtable,
+                skipped_split_unresolved=skipped_split_unresolved,
                 failed_inserts_delivery=failed_inserts_delivery,
                 failed_inserts_pc=failed_inserts_pc,
+                split_projection={'planned': dict(sec_planned), **sec_written},
                 parent_titles_total=len(parent_titles),
                 titles_new_or_changed=len(titles_to_write),
                 titles_written=titles_written,

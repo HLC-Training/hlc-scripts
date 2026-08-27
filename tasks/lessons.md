@@ -605,3 +605,35 @@ A must land before B, and a failed A must suppress B. A duplicate event on
 retry is absorbable; an advanced state with no recorded event is a lie.
 Also: any new `module` value logging to ap_change_log needs its CHECK
 widened first — it admitted only delivery/pc until today.
+
+## 2026-08-27 — Row-scoped rules scatter families; scope membership at the unit users see
+
+From the family-scope widening (37bc44dd / bug 3e1cdc00). The v1 brief said
+"widen the fetch to all row shapes, route each row by the existing Lead
+rule" — mechanically total, and wrong at the edges: per-row routing gave no
+answer for a parent whose own lead is out-of-scope over routed children, no
+placement for the "always show the complete family" requirement, and a
+"~126 backfill" number that was really 73 once lead-typing applied. The fix
+was not a cleverer per-row rule but moving MEMBERSHIP up one level: the
+family (the unit users actually see) is in-scope iff any member routes; the
+per-row rule keeps deciding ownership only. General shape: when a UI
+promises an aggregate ("the whole family always shows"), the sync's
+inclusion rule must be scoped at that same aggregate, or the projection and
+the promise will fight forever. Corollary that paid off immediately: run
+the Task-1-style discovery against LIVE data before coding — the 53
+foreign-lead standalones, the 3 flat parent/child twin numbers (which
+forced (ap_number, pure_parent) keying), and the 2 unresolved leaves in
+split families were all invisible in the brief and all load-bearing.
+
+## 2026-08-27 — Diff-driven state machines: new metadata fields must not count as divergence
+
+Same build. The pending-settle logic treats "any field diff" as "the PLL's
+change is still diverging — protect and eventually escalate." Adding
+ap_is_parent/ap_is_child/ap_lead_display to the projection diff would have
+made the FIRST widened run read every legacy pending row as diverging on
+metadata the PLL never touched (and page Jim about it). The projection
+planner therefore returns (content, meta) separately: pending logic judges
+content only; meta rides along on ordinary updates. Rule: when a sync
+gains new projected fields, ask which state machines key on "row changed"
+and whether the new fields belong to that meaning of "changed" — usually
+they don't.
