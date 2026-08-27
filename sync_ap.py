@@ -25,7 +25,9 @@ Flow:
     out-of-scope projects with owner_id NULL plus the raw Smartsheet lead
     display text (ap_lead_display). Pure parents (is_parent AND NOT
     is_child) project as family headers into EVERY module their family
-    occupies (split families get the header in both tables). Families with
+    occupies (split families get the header in both tables), and so do
+    null-owner LEAVES (2026-08-27 follow-up ruling — an unresolved-lead
+    leaf in a split family lands in both modules too). Families with
     zero routed members (Customer/Internal/Ops-led) stay out — that
     population's widening is deferred.
   - ALL statuses project, Complete/Cancelled included — ORiON is becoming
@@ -1022,7 +1024,8 @@ def plan_module_projection(task: dict, mod: dict, owner_id, shared: dict,
     """Plan one row's projection into one module. Returns the disposition:
     'insert' | 'update' | 'unchanged' | 'clear_pending' | 'skip_pending'.
 
-    Queue entries carry the `secondary` flag (a pure parent projecting into
+    Queue entries carry the `secondary` flag (a pure parent — or a
+    null-owner row, per the 2026-08-27 follow-up ruling — projecting into
     the second module of a split family) so the write phase can attribute
     each op to the primary row-disposition stream (the accounting identity
     counts ROWS once) or the split_projection overlay stream.
@@ -1095,7 +1098,6 @@ def build_sync_accounting(*, child_tasks_total, inserted_delivery, updated_deliv
                           cleared_pending_pc, closed_delivery, closed_pc, skipped_pending,
                           skipped_no_ap, skipped_ambiguous, skipped_viewer, skipped_unmapped,
                           skipped_inactive_noop, skipped_inactive_wrongtable,
-                          skipped_split_unresolved,
                           failed_inserts_delivery, failed_inserts_pc,
                           split_projection,
                           parent_titles_total, titles_new_or_changed, titles_written,
@@ -1117,9 +1119,10 @@ def build_sync_accounting(*, child_tasks_total, inserted_delivery, updated_deliv
     sites (dry-run prediction, live actuals) are forced to supply every
     field, so the emitted shape cannot drift between them.
     Overlays that must never appear as child terms: `escalations` (an
-    overlay on skipped_pending) and `split_projection` (a pure parent's
-    projection into the SECOND module of a split family — its own stream,
-    because the row already counted once under its primary module).
+    overlay on skipped_pending) and `split_projection` (a pure parent's or
+    null-owner row's projection into the SECOND module of a split family —
+    its own stream, because the row already counted once under its primary
+    module).
     """
     child = {
         'child_tasks_total':           child_tasks_total,
@@ -1139,7 +1142,6 @@ def build_sync_accounting(*, child_tasks_total, inserted_delivery, updated_deliv
         'skipped_unmapped':            skipped_unmapped,
         'skipped_inactive_noop':       skipped_inactive_noop,
         'skipped_inactive_wrongtable': skipped_inactive_wrongtable,
-        'skipped_split_unresolved':    skipped_split_unresolved,
         'failed_inserts_delivery':     failed_inserts_delivery,
         'failed_inserts_pc':           failed_inserts_pc,
     }
@@ -1158,9 +1160,10 @@ def build_sync_accounting(*, child_tasks_total, inserted_delivery, updated_deliv
             'date_events_written':   date_events_written,
             'title_capture_failed':  title_capture_failed,
         },
-        # Split-family stream (2026-08-27 widening): a pure parent's
-        # projection ops into the SECOND module its family occupies. Not
-        # part of the child identity — those rows already counted once.
+        # Split-family stream (2026-08-27 widening): a pure parent's or
+        # null-owner row's projection ops into the SECOND module its family
+        # occupies. Not part of the child identity — those rows already
+        # counted once.
         'split_projection': split_projection,
         # Third stream (Ops Phase 2): the ap_tracker mirror landing. Its own
         # identity — candidates = upserted + protected_pending (+ failed);
@@ -1441,13 +1444,10 @@ def main(dry_run: bool = False):
     # len(tasks) == sum(all dispositions) can close (action 9278f68e).
     skipped_inactive_noop       = 0  # out-of-scope inactive, non-pending, no close queued
     skipped_inactive_wrongtable = 0  # preserved counter; the in-scope path no longer produces it
-    # Family-scope widening (2026-08-27): an unresolved-lead LEAF inside a
-    # family whose members span BOTH modules has no ruled projection target
-    # — mirrored but not projected, loudly. Zero such rows exist today.
-    skipped_split_unresolved    = 0
     # Primary-row dispositions planned per module (the accounting identity
-    # counts each ROW exactly once; a pure parent's projection into the
-    # second module of a split family is tracked in the secondary stream).
+    # counts each ROW exactly once; a projection into the second module of
+    # a split family — pure parents and null-owner rows — is tracked in
+    # the secondary stream).
     planned_primary_insert = {'delivery': 0, 'pc': 0}
     planned_primary_update = {'delivery': 0, 'pc': 0}
     sec_planned = {'insert': 0, 'update': 0, 'unchanged': 0, 'clear_pending': 0, 'skip_pending': 0}
@@ -1531,17 +1531,15 @@ def main(dry_run: bool = False):
             else:
                 # Unresolved / viewer / ambiguous lead on an in-scope-family
                 # row: owner_id null + display-text fallback (ruling a).
+                # Follow-up ruling (2026-08-27 evening, 37bc44dd): a
+                # null-owner row — leaf or parent — projects into EVERY
+                # module its family occupies. In a split family the second
+                # module's op counts in the split_projection stream, same
+                # as parent headers. (First shipped one run behind the main
+                # widening: AP-0492-2/-3 were mirrored-but-unprojected
+                # until this branch existed.)
                 owner_id = None
-                fam_mods = sorted(fam_modules[task['family']])
-                if pure_parent or len(fam_mods) == 1:
-                    row_modules = fam_mods if pure_parent else fam_mods[:1]
-                else:
-                    skipped_split_unresolved += 1
-                    log.warning(
-                        f"{ap_num}: unresolved-lead leaf in split family {task['family']} "
-                        f"({fam_mods}) — no ruling covers this shape; mirrored, not projected"
-                    )
-                    continue
+                row_modules = sorted(fam_modules[task['family']])
                 primary_module = row_modules[0]
 
             shared = compute_shared_fields(task)
@@ -1740,8 +1738,7 @@ def main(dry_run: bool = False):
         skip_summary = (
             f"Skipped  — no AP#/text: {skipped_no_ap}, unmapped lead: {skipped_unmapped}, "
             f"ambiguous lead: {skipped_ambiguous}, owner is viewer: {skipped_viewer}, "
-            f"pending Smartsheet update: {skipped_pending}, unchanged: {skipped_unchanged}, "
-            f"split-family unresolved leaf: {skipped_split_unresolved}"
+            f"pending Smartsheet update: {skipped_pending}, unchanged: {skipped_unchanged}"
         )
         orphan_summary = (
             f"Orphans  — would flag: {len(to_orphan_delivery)} delivery + {len(to_orphan_pc)} P&C, "
@@ -1802,7 +1799,6 @@ def main(dry_run: bool = False):
             skipped_unmapped=skipped_unmapped,
             skipped_inactive_noop=skipped_inactive_noop,
             skipped_inactive_wrongtable=skipped_inactive_wrongtable,
-            skipped_split_unresolved=skipped_split_unresolved,
             failed_inserts_delivery=0,
             failed_inserts_pc=0,
             split_projection={'planned': dict(sec_planned), 'inserted': 0, 'updated': 0,
@@ -1877,8 +1873,9 @@ def main(dry_run: bool = False):
     # 24 batch-mates wholesale (batch INSERT is all-or-nothing at the API),
     # and the swallowed error left the run reporting green. The fallback
     # bounds the blast radius of a bad row to itself and names it in the log.
-    # Ops carry the `_secondary` tag (a pure parent landing in the second
-    # module of a split family) so counts attribute to the primary child
+    # Ops carry the `_secondary` tag (a pure parent or null-owner row
+    # landing in the second module of a split family) so counts attribute
+    # to the primary child
     # identity vs the split_projection overlay stream.
     inserted_delivery = 0
     failed_inserts_delivery = 0
@@ -2289,7 +2286,6 @@ def main(dry_run: bool = False):
                 skipped_unmapped=skipped_unmapped,
                 skipped_inactive_noop=skipped_inactive_noop,
                 skipped_inactive_wrongtable=skipped_inactive_wrongtable,
-                skipped_split_unresolved=skipped_split_unresolved,
                 failed_inserts_delivery=failed_inserts_delivery,
                 failed_inserts_pc=failed_inserts_pc,
                 split_projection={'planned': dict(sec_planned), **sec_written},
