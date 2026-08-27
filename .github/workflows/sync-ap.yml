@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '13,43 * * * *'    # Every 30 minutes, offset to avoid :00/:30 GitHub Actions load spikes
   workflow_dispatch:            # Manual trigger for testing
+    inputs:
+      dry_run:
+        description: 'Run with --dry-run (no Supabase writes)'
+        type: boolean
+        default: false
 
 jobs:
   sync:
@@ -25,7 +30,7 @@ jobs:
           SMARTSHEET_API_TOKEN: ${{ secrets.SMARTSHEET_API_TOKEN }}
           ORION_SUPABASE_SERVICE_KEY: ${{ secrets.ORION_SUPABASE_SERVICE_KEY }}
           SAMCOS_SERVICE_KEY: ${{ secrets.SAMCOS_SERVICE_KEY }}
-        run: python sync_ap.py
+        run: python sync_ap.py ${{ inputs.dry_run == true && '--dry-run' || '' }}
 
       # The script logs detail (per-row errors, page fetches) to sync_ap.log
       # and prints only the summary line to stdout. Without this step a
