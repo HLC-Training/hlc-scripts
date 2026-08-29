@@ -189,6 +189,28 @@ def fetch_incomplete(db, owner_ids: list[str]) -> list[dict]:
     return resp.data or []
 
 
+def fetch_open_questions_by_email(db) -> dict[str, int]:
+    """Open ask-a-question rows per recipient, keyed by LOWER(email).
+
+    item_questions (orion-pll 2026-08-29 ask-question build,
+    docs/migrations/2026-08-29_item_questions.sql): one row per question
+    asked about an item, status 'awaiting_response' until the recipient
+    replies in ORiON. asked_of is a portal_users id, so this joins through
+    portal_users email — the digest's users (legacy table) and portal_users
+    share emails, not ids. Counting in Python: row volumes are tiny and
+    PostgREST group-by isn't worth the ceremony."""
+    q = db.table('item_questions').select('asked_of') \
+        .eq('status', 'awaiting_response').execute()
+    if not q.data:
+        return {}
+    by_id: dict[str, int] = {}
+    for row in q.data:
+        by_id[row['asked_of']] = by_id.get(row['asked_of'], 0) + 1
+    portal = db.table('portal_users').select('id, email') \
+        .in_('id', list(by_id.keys())).execute()
+    return {p['email'].lower(): by_id[p['id']] for p in (portal.data or [])}
+
+
 def fetch_state(db) -> tuple[datetime | None, set]:
     """Return (watermark, ids reported in the previous run's section 1)."""
     resp = db.table('pll_digest_state').select('sent_at, summary') \
@@ -214,9 +236,9 @@ def parse_date(raw) -> date | None:
 
 # ─── DIGEST ASSEMBLY ────────────────────────────────────────────
 def build_digest(pll: dict, items: list[dict], approaching_items: list[dict],
-                 incomplete_items: list[dict],
+                 incomplete_items: list[dict], questions_count: int,
                  watermark_date: date, prev_section1_ids: set, today: date) -> dict | None:
-    """Five sections for one PLL; None if all empty (→ no email)."""
+    """Six sections for one PLL; None if all empty (→ no email)."""
     own = [i for i in items if i['owner_id'] == pll['id']]
     own_approaching = [i for i in approaching_items if i['owner_id'] == pll['id']]
     own_incomplete = [i for i in incomplete_items if i['owner_id'] == pll['id']]
@@ -247,11 +269,13 @@ def build_digest(pll: dict, items: list[dict], approaching_items: list[dict],
     )
     incomplete_all = sorted(own_incomplete, key=lambda i: i['title'])
 
-    if not new_items and not due_soon and not overdue_all and not approaching_all and not incomplete_all:
+    if (not new_items and not due_soon and not overdue_all and not approaching_all
+            and not incomplete_all and questions_count == 0):
         return None
 
     return {
         'pll':                  pll,
+        'questions_count':      questions_count,
         'new_items':            new_items,
         'due_soon':             due_soon,
         'overdue':              overdue_all[:OVERDUE_CAP],
@@ -422,6 +446,16 @@ def build_html_body(digest: dict, today: date) -> str:
             "Missing required information", rows, extra,
             intro="These items are missing information ORiON needs. Open one to "
                   "fill in what's missing."))
+    if digest.get('questions_count'):
+        n = digest['questions_count']
+        row = (
+            f'<tr><td style="padding:10px 14px;border-bottom:1px solid {BORDER};'
+            f'font-family:{FONT};font-size:14px;color:{NIGHT};line-height:1.4;">'
+            f'{n} question{"s" if n != 1 else ""} awaiting your response &mdash; '
+            f'they&rsquo;re listed on your Launch Pad, each with a link to its item.'
+            f'</td></tr>'
+        )
+        sections.append(section_html("Questions awaiting your response", [row]))
 
     return f"""<!DOCTYPE html>
 <html>
@@ -524,6 +558,13 @@ def build_text_body(digest: dict, today: date) -> str:
             lines.append(f"Plus {digest['incomplete_overflow']} more missing required "
                           f"information in ORiON.")
         lines.append("")
+    if digest.get('questions_count'):
+        n = digest['questions_count']
+        lines.append("Questions awaiting your response")
+        lines.append("-" * 31)
+        lines.append(f"{n} question{'s' if n != 1 else ''} awaiting your response -- "
+                     "they're listed on your Launch Pad, each with a link to its item.")
+        lines.append("")
     lines += [
         "Want the full picture? Open ORiON to see everything on your plate.",
         f"Open ORiON: {ORION_URL}",
@@ -571,7 +612,8 @@ def build_rollup(results: list[dict], today: date, live: bool,
                 f'<td style="padding:6px 10px;">{esc(r["result"])}</td></tr>')
             text_lines.append(
                 f"{r['pll']['name']}: new={n} due14={s} overdue={o} "
-                f"overflow={d['overdue_overflow']} approaching={a} -> {r['result']}")
+                f"overflow={d['overdue_overflow']} approaching={a} "
+                f"questions={d.get('questions_count', 0)} -> {r['result']}")
     html_body = (
         f'<html><body style="font-family:{FONT};color:{NIGHT};">'
         f'<p><strong>ORiON PLL digest roll-up</strong> — {today.strftime("%A, %B %d, %Y")}<br>'
@@ -665,6 +707,7 @@ def main():
         items = fetch_items(db, [p['id'] for p in plls])
         approaching = fetch_approaching(db, [p['id'] for p in plls])
         incomplete = fetch_incomplete(db, [p['id'] for p in plls])
+        open_questions = fetch_open_questions_by_email(db)
         watermark, prev_section1_ids = fetch_state(db)
     except Exception as e:
         log.error(f"Supabase fetch failed — aborting without sending: {e}")
@@ -678,7 +721,9 @@ def main():
 
     results = []
     for pll in plls:
-        digest = build_digest(pll, items, approaching, incomplete, watermark_date, prev_section1_ids, today)
+        questions_count = open_questions.get((pll.get('email') or '').lower(), 0)
+        digest = build_digest(pll, items, approaching, incomplete, questions_count,
+                              watermark_date, prev_section1_ids, today)
         results.append({'pll': pll, 'digest': digest, 'result': None})
 
     to_send = [r for r in results if r['digest'] is not None]

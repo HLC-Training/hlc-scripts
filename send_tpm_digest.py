@@ -219,6 +219,20 @@ def fetch_incomplete(db, owner_ids: list[str]) -> list[dict]:
     return resp.data or []
 
 
+def fetch_recipient_open_questions(db, email: str) -> int:
+    """Michele's open ask-a-question count (item_questions, orion-pll
+    2026-08-29 build). asked_of is a portal_users id; the lookup goes
+    through email (ilike — GE emails are mixed-case). Returns 0 when the
+    portal row is missing rather than failing the whole digest run."""
+    portal = db.table('portal_users').select('id').ilike('email', email).execute()
+    rows = portal.data or []
+    if not rows:
+        return 0
+    q = db.table('item_questions').select('id', count='exact') \
+        .eq('asked_of', rows[0]['id']).eq('status', 'awaiting_response').execute()
+    return q.count or 0
+
+
 def fetch_state(db) -> datetime | None:
     """Return the watermark timestamp (latest successful run's sent_at)."""
     resp = db.table('tpm_digest_state').select('sent_at') \
@@ -449,7 +463,7 @@ def section_blocks(results: list[dict], key: str, meta_fn) -> list[str]:
     return blocks
 
 
-def build_html_body(results: list[dict], today: date) -> str:
+def build_html_body(results: list[dict], today: date, questions_count: int = 0) -> str:
     greeting = (
         "Hi Michele, here's where your team's P&C projects stand this morning "
         "— a quick daily rundown across all TPMs so nothing slips. If a target "
@@ -495,6 +509,18 @@ def build_html_body(results: list[dict], today: date) -> str:
             intro="These projects are missing required information. Owners see the "
                   "same list when they sign in."),
     ]
+    # Ask-a-question nag (orion-pll 2026-08-29 build): Michele's own open
+    # questions, not her TPMs' — each TPM's nag surface is their Launch Pad.
+    if questions_count:
+        n = questions_count
+        row = (
+            f'<tr><td style="padding:10px 14px;border-bottom:1px solid {BORDER};'
+            f'font-family:{FONT};font-size:14px;color:{NIGHT};line-height:1.4;">'
+            f'{n} question{"s" if n != 1 else ""} awaiting your response &mdash; '
+            f'they&rsquo;re listed on your Launch Pad, each with a link to its item.'
+            f'</td></tr>'
+        )
+        sections.append(section_html("Questions awaiting your response", [row]))
 
     return f"""<!DOCTYPE html>
 <html>
@@ -590,7 +616,7 @@ def incomplete_text_section(results: list[dict]) -> list[str]:
     return lines
 
 
-def build_text_body(results: list[dict], today: date) -> str:
+def build_text_body(results: list[dict], today: date, questions_count: int = 0) -> str:
     lines = [
         "Hi Michele, here's where your team's P&C projects stand this morning "
         "-- a quick daily rundown across all TPMs so nothing slips. If a target "
@@ -622,6 +648,15 @@ def build_text_body(results: list[dict], today: date) -> str:
                                 "-- a note in ORiON resets the clock. See the Approaching Stale "
                                 "help article in ORiON for details.")
     lines += incomplete_text_section(results)
+    if questions_count:
+        n = questions_count
+        lines += [
+            "Questions awaiting your response",
+            "-" * 31,
+            f"{n} question{'s' if n != 1 else ''} awaiting your response -- "
+            "they're listed on your Launch Pad, each with a link to its item.",
+            "",
+        ]
     lines += [
         "Want the full picture? Open ORiON to see every P&C project.",
         f"Open ORiON: {ORION_URL}",
@@ -707,6 +742,7 @@ def main():
         projects = fetch_projects(db, [t['id'] for t in tpms])
         approaching = fetch_approaching(db, [t['id'] for t in tpms])
         incomplete = fetch_incomplete(db, [t['id'] for t in tpms])
+        questions_count = fetch_recipient_open_questions(db, MICHELE_EMAIL)
         watermark = fetch_state(db)
     except Exception as e:
         log.error(f"Supabase fetch failed — aborting without sending: {e}")
@@ -722,15 +758,15 @@ def main():
              f"{len(tpms) - len(to_report)} suppressed (no items).")
 
     if args.dry_run:
-        if not to_report:
+        if not to_report and questions_count == 0:
             print("\n[DRY RUN] Every TPM is empty across all sections — no email would be sent.")
             return
         print(f"\n===== Digest to Michele — subject: {build_subject(today)} =====")
-        print(build_text_body(results, today))
+        print(build_text_body(results, today, questions_count))
         print("\n[DRY RUN] Nothing sent, no state written.")
         return
 
-    if not to_report:
+    if not to_report and questions_count == 0:
         # Empty-suppression: nothing to report, so no email — but the run
         # still succeeded and still advances the watermark (there is
         # nothing to re-cover; a future run's "new since" window should
@@ -741,8 +777,8 @@ def main():
         return
 
     subject = build_subject(today)
-    html_body = build_html_body(results, today)
-    text_body = build_text_body(results, today)
+    html_body = build_html_body(results, today, questions_count)
+    text_body = build_text_body(results, today, questions_count)
     if live:
         send_email(MICHELE_EMAIL, subject, html_body, text_body)
         log.info(f"Sent to {MICHELE_EMAIL}.")
