@@ -1,9 +1,13 @@
 name: ORION AP Sync
 
 on:
-  schedule:
-    - cron: '13,43 * * * *'    # Every 30 minutes, offset to avoid :00/:30 GitHub Actions load spikes
-  workflow_dispatch:            # Manual trigger for testing
+  # Actions `schedule:` was contended (per-workflow GitHub Actions scheduler
+  # issue, not registration/rate-limit — see samcos
+  # knowledge/decisions/2026-08-29-ap-sync-trigger-to-vercel-cron.md). Trigger
+  # moved to Vercel Cron (samcos /api/cron/fire-ap-sync, */15 * * * *), which
+  # calls workflow_dispatch below. Do not re-add a schedule: trigger without
+  # re-reading that decision.
+  workflow_dispatch:            # Fired by Vercel Cron; also usable for manual testing
     inputs:
       dry_run:
         description: 'Run with --dry-run (no Supabase writes)'
