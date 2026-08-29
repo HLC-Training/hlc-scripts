@@ -637,3 +637,39 @@ content only; meta rides along on ordinary updates. Rule: when a sync
 gains new projected fields, ask which state machines key on "row changed"
 and whether the new fields belong to that meaning of "changed" — usually
 they don't.
+
+## 2026-08-29 — A write-age check and a run-health check look identical until the run crashes mid-write
+
+From the AP sync monitor fix (board item cf6bbfb7, decision
+2026-08-29-ap-sync-monitor-run-health.md). The monitor's staleness check
+compared `now` against the sync's own accounting write timestamp — which
+works as a de-facto run-health proxy AS LONG AS every run either completes
+fully or never starts. It has a real blind spot in between: `sync_ap.py`
+writes a "started" heartbeat before the Smartsheet fetch and the
+accounting payload near the very end of the same run. A run that starts
+and then crashes between those two writes (Smartsheet outage, a Supabase
+load failure, anything hitting one of the mid-function `sys.exit(1)`
+paths) refreshes the started heartbeat forever while the accounting
+timestamp never advances again — a chronic crash loop that a check keyed
+on EITHER timestamp alone would silently pass as healthy (last_run: always
+fresh; accounting-age: would eventually flag stale under the old design,
+but a "fix" that switched purely to last_run-recency to solve the write-age
+false-positive would have introduced exactly this new blind spot). The fix
+needed both signals compared to EACH OTHER — accounting older than the
+most recent last_run by more than the two writes' normal in-run gap means
+that run didn't finish — not just each checked against the current time
+independently.
+
+Also confirmed live during reproduction: the accounting write in
+`sync_ap.py` is unconditional on run completion (fires even when nothing
+changed, all counts zero), so a monitor's "write hasn't advanced" signal
+was never actually equivalent to "nothing happened this run" — it was
+already, accidentally, a run-recency proxy. The bug wasn't the timestamp
+being the wrong AGE signal; it was that no signal existed for a run that
+completed with real failures recorded in its own counters
+(failed_inserts_delivery, mirror_failed) — a fresh, on-time write can still
+describe a run that partly failed, and nothing was reading those counters
+at all. Verify what a "last successful write" timestamp is actually
+proving (that a write happened) versus what it's being used to prove (that
+the work behind the write succeeded) — those two claims silently diverge
+the moment a write can happen without the work being fully sound.

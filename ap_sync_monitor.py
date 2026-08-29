@@ -9,12 +9,20 @@ from sync-ap.yml.
 
 Read-only against sync state. This script:
   - Reads SAM COS context_store keys health:github:orion_ap_sync:accounting
-    (Phase 1's structured per-run accounting) and health:github:orion_ap_sync
-    (the main heartbeat, read only for diagnostic context when the
-    accounting key is absent).
+    (Phase 1's structured per-run accounting), health:github:orion_ap_sync:last_run
+    (the started-class heartbeat, written before the Smartsheet fetch — used
+    for run-recency), and health:github:orion_ap_sync (the completion
+    heartbeat, read only for diagnostic context when last_run is absent).
   - Audits three conditions every run: the child-row identity closes
     (child_identity_residual == 0), the parent-titles delta-integrity
-    holds, and the accounting is fresh (as_of within 4 hours).
+    holds, and the sync's RUN HEALTH is sound — not merely that a write
+    happened recently. A clean run that finds nothing to sync still writes
+    fresh last_run/accounting, so write-age alone can't distinguish "healthy
+    quiet window" from "actually broken." Run health escalates only when
+    the last run is overdue (last_run itself hasn't advanced) or the last
+    run failed (no accounting reached, accounting predates the run start —
+    a crash between the two writes — or the accounting's own failure
+    counters are nonzero). See decision 2026-08-29-ap-sync-monitor-run-health.md.
   - Pushes via SAM COS notification_queue (the house Pushover pattern —
     see sync_ap.py's escalation page) on a healthy→broken transition, a
     re-nag every >=12h a break stays open, and once on broken→healthy
@@ -43,10 +51,20 @@ SAMCOS_SUPABASE_URL = "https://hucrkbomqsxpmokgypxg.supabase.co"
 SAMCOS_SERVICE_KEY  = os.environ.get("SAMCOS_SERVICE_KEY", "")
 
 ACCOUNTING_KEY  = "health:github:orion_ap_sync:accounting"
+LAST_RUN_KEY    = "health:github:orion_ap_sync:last_run"
 HEARTBEAT_KEY   = "health:github:orion_ap_sync"
 ALERT_STATE_KEY = "system:ap_sync_monitor:alert_state"
 
-STALE_THRESHOLD = timedelta(hours=4)
+# Nominal cron is every 30 min (sync-ap.yml: '13,43 * * * *'), but observed
+# GH Actions contention (lessons.md 2026-07-29) produces routine multi-hour
+# gaps — this threshold is already tuned generously past that noise, not a
+# literal 30-min SLA.
+RUN_OVERDUE_THRESHOLD = timedelta(hours=4)
+# last_run is written before the Smartsheet fetch, accounting near the end
+# of the same run — a few seconds apart. If accounting is older than
+# last_run by more than this, the most recent run(s) started and crashed
+# before reaching the accounting write.
+ACCOUNTING_STARTUP_TOLERANCE = timedelta(minutes=2)
 DEDUP_WINDOW    = timedelta(hours=12)
 
 CHICAGO = ZoneInfo("America/Chicago")
@@ -84,21 +102,53 @@ def evaluate_titles(accounting: dict) -> str:
     return 'healthy' if pt['titles_new_or_changed'] == expected else 'mismatch'
 
 
-def evaluate_staleness(accounting: dict | None, now: datetime) -> str:
-    """'healthy' | 'stale' | 'absent'"""
-    if not accounting or not accounting.get('as_of'):
-        return 'absent'
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
     try:
-        as_of = datetime.fromisoformat(accounting['as_of'])
+        dt = datetime.fromisoformat(value.rstrip('Z'))
     except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def evaluate_run_health(last_run_value: str | None, accounting: dict | None, now: datetime) -> str:
+    """'healthy' | 'run_overdue' | 'run_failed' | 'absent'
+
+    Escalates on run problems, not on write age alone: a clean run that finds
+    nothing to sync still advances last_run and accounting, so it must read
+    healthy. What actually indicates trouble: the cron not firing at all
+    (run_overdue, judged off last_run — written before the Smartsheet fetch,
+    so it reflects "a run started" even when the run later crashes), or a
+    run starting and not finishing cleanly (run_failed — no accounting
+    reached yet, accounting predates the most recent run start, or the
+    run's own failure counters are nonzero).
+    """
+    last_run = _parse_iso(last_run_value)
+    if last_run is None:
         return 'absent'
-    if as_of.tzinfo is None:
-        as_of = as_of.replace(tzinfo=timezone.utc)
-    return 'healthy' if (now - as_of) <= STALE_THRESHOLD else 'stale'
+    if (now - last_run) > RUN_OVERDUE_THRESHOLD:
+        return 'run_overdue'
+
+    as_of = _parse_iso(accounting.get('as_of')) if accounting else None
+    if as_of is None or as_of < last_run - ACCOUNTING_STARTUP_TOLERANCE:
+        return 'run_failed'
+
+    child = accounting.get('child', {})
+    mirror = accounting.get('mirror', {})
+    if (child.get('failed_inserts_delivery', 0) > 0
+            or child.get('failed_inserts_pc', 0) > 0
+            or mirror.get('mirror_failed', 0) > 0):
+        return 'run_failed'
+
+    return 'healthy'
 
 
 def build_message(check: str, status: str, accounting: dict | None,
-                   now: datetime, heartbeat_value: str | None) -> str:
+                   now: datetime, heartbeat_value: str | None,
+                   last_run_value: str | None = None) -> str:
     as_of_dt = None
     if accounting and accounting.get('as_of'):
         try:
@@ -129,26 +179,40 @@ def build_message(check: str, status: str, accounting: dict | None,
                      f"{pt['titles_written']} written, {failed_txt} (as_of {as_of_ct}).")
         return f"AP sync monitor: recovered, titles delta-integrity closing again (as_of {as_of_ct})."
 
-    if check == 'stale':
-        if status == 'stale':
-            age = now - as_of_dt
+    if check == 'run_health':
+        last_run_dt = _parse_iso(last_run_value)
+        if status == 'run_overdue':
+            age = now - last_run_dt
             hours, rem = divmod(int(age.total_seconds()), 3600)
             minutes = rem // 60
-            return (f"AP sync stale: last accounting {hours}h{minutes}m ago "
-                     f"(as_of {as_of_ct}), expected within 4h.")
+            return (f"AP sync overdue: last run started {hours}h{minutes}m ago "
+                     f"(expected ~every 30min, tolerance "
+                     f"{int(RUN_OVERDUE_THRESHOLD.total_seconds() // 3600)}h). "
+                     f"GitHub Actions cron may not be firing — check sync-ap.yml run history.")
+        if status == 'run_failed':
+            if as_of_dt is None or as_of_dt < last_run_dt - ACCOUNTING_STARTUP_TOLERANCE:
+                last_run_ct = format_ct(last_run_dt) if last_run_dt else 'unknown'
+                return (f"AP sync run failed: last run started {last_run_ct} but no fresh "
+                         f"accounting followed (as_of {as_of_ct}) — likely crashed before "
+                         f"completing. Check the sync-ap.yml run log.")
+            c = accounting.get('child', {}) if accounting else {}
+            m = accounting.get('mirror', {}) if accounting else {}
+            return (f"AP sync run failed: {c.get('failed_inserts_delivery', 0)} delivery insert "
+                     f"failures, {c.get('failed_inserts_pc', 0)} pc insert failures, "
+                     f"{m.get('mirror_failed', 0)} mirror failures (as_of {as_of_ct}).")
         if status == 'absent':
             if heartbeat_value:
                 try:
                     hb_dt = datetime.fromisoformat(heartbeat_value.rstrip('Z'))
                     if hb_dt.tzinfo is None:
                         hb_dt = hb_dt.replace(tzinfo=timezone.utc)
-                    hb_txt = f", last heartbeat {format_ct(hb_dt)}"
+                    hb_txt = f", last completion heartbeat {format_ct(hb_dt)}"
                 except ValueError:
-                    hb_txt = ", heartbeat present but unparsable"
+                    hb_txt = ", completion heartbeat present but unparsable"
             else:
-                hb_txt = ", no heartbeat found either"
-            return f"AP sync stale: no accounting emitted yet{hb_txt}."
-        return f"AP sync monitor: recovered, accounting fresh again (as_of {as_of_ct})."
+                hb_txt = ", no completion heartbeat found either"
+            return f"AP sync: no last_run heartbeat found — sync has apparently never started{hb_txt}."
+        return f"AP sync monitor: recovered, run healthy again (as_of {as_of_ct})."
 
     raise ValueError(f"unknown check {check!r}")
 
@@ -184,27 +248,28 @@ def evaluate_and_dedup(check: str, status: str, state: dict, now: datetime):
 
 
 def run_monitor(accounting: dict | None, heartbeat_value: str | None,
-                 now: datetime, state: dict):
+                 now: datetime, state: dict, last_run_value: str | None = None):
     """
     Pure orchestration over the three checks. Returns
     (evaluations: dict[str, str|None], new_state: dict, pushes: list[(title, message)]).
     child/titles are evaluated only when accounting is present — with no
     accounting payload there is no child/parent_titles data to check, and
     forcing a verdict would just be a second way of saying "absent" (the
-    stale check already covers that).
+    run_health check already covers that).
     """
     new_state = {k: dict(v) for k, v in state.items()}
     evaluations = {}
     pushes = []
 
-    stale_status = evaluate_staleness(accounting, now)
-    evaluations['stale'] = stale_status
-    push, entry = evaluate_and_dedup('stale', stale_status, state, now)
-    new_state['stale'] = entry
+    run_health_status = evaluate_run_health(last_run_value, accounting, now)
+    evaluations['run_health'] = run_health_status
+    push, entry = evaluate_and_dedup('run_health', run_health_status, state, now)
+    new_state['run_health'] = entry
     if push:
-        title = ("AP sync monitor — recovered (staleness)" if stale_status == 'healthy'
-                  else "AP sync monitor — sync stale/absent")
-        pushes.append((title, build_message('stale', stale_status, accounting, now, heartbeat_value)))
+        title = ("AP sync monitor — recovered (run health)" if run_health_status == 'healthy'
+                  else "AP sync monitor — sync run unhealthy")
+        pushes.append((title, build_message('run_health', run_health_status, accounting, now,
+                                             heartbeat_value, last_run_value)))
 
     if accounting is not None:
         for check, evaluator in (('child', evaluate_child), ('titles', evaluate_titles)):
@@ -272,6 +337,12 @@ def parse_args():
         "--now",
         help="Override 'now' as an ISO 8601 UTC timestamp. Testing only.",
     )
+    parser.add_argument(
+        "--last-run",
+        help="Override the last_run heartbeat as an ISO 8601 UTC timestamp, for exercising "
+             "run_overdue/run_failed in a synthetic run. Testing only — ignored unless "
+             "--accounting-file/--state-file are also set. Omit to simulate 'absent'.",
+    )
     args = parser.parse_args()
     if bool(args.accounting_file) != bool(args.state_file):
         parser.error("--accounting-file and --state-file must be used together — "
@@ -290,26 +361,30 @@ def main():
 
     sc = None
     heartbeat_value = None
+    last_run_value = None
 
     if testing:
         accounting_raw = Path(args.accounting_file).read_text()
         accounting = json.loads(accounting_raw) if accounting_raw.strip() else None
         state_path = Path(args.state_file)
         state = json.loads(state_path.read_text()) if state_path.exists() else {}
+        last_run_value = args.last_run
     else:
         if not SAMCOS_SERVICE_KEY:
             raise SystemExit("ERROR: SAMCOS_SERVICE_KEY environment variable is not set.")
         sc = create_client(SAMCOS_SUPABASE_URL, SAMCOS_SERVICE_KEY)
         accounting_raw = fetch_context_value(sc, ACCOUNTING_KEY)
         heartbeat_value = fetch_context_value(sc, HEARTBEAT_KEY)
+        last_run_value = fetch_context_value(sc, LAST_RUN_KEY)
         accounting = json.loads(accounting_raw) if accounting_raw else None
         state_raw = fetch_context_value(sc, ALERT_STATE_KEY)
         state = json.loads(state_raw) if state_raw else {}
 
     log.info(f"Accounting: {json.dumps(accounting) if accounting else 'MISSING'}")
     log.info(f"Heartbeat: {heartbeat_value or 'MISSING'}")
+    log.info(f"Last run: {last_run_value or 'MISSING'}")
 
-    evaluations, new_state, pushes = run_monitor(accounting, heartbeat_value, now, state)
+    evaluations, new_state, pushes = run_monitor(accounting, heartbeat_value, now, state, last_run_value)
     log.info(f"Evaluations: {evaluations}")
 
     for title, message in pushes:
