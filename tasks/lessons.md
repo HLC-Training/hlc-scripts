@@ -673,3 +673,28 @@ at all. Verify what a "last successful write" timestamp is actually
 proving (that a write happened) versus what it's being used to prove (that
 the work behind the write succeeded) — those two claims silently diverge
 the moment a write can happen without the work being fully sound.
+
+## 2026-09-01 — A source picklist can grow a value the sync map doesn't know, and the failure is silent
+
+From the SQDCGP People-map fix (action item 1dcbfeaa, decision
+2026-09-01-sync-sqdcgp-people-map-and-backfill.md). The Smartsheet SQDCG
+column grew a sixth option (`P` = People) at some point after the 8/11
+category-tier build fixed `SQDCG_MAP` at five keys. `map_category()`'s own
+blank-handling contract — unmapped input returns `None`, same as a
+genuinely blank cell — meant a brand-new, populated, real category value
+produced exactly the same output as "nobody filled this in." No exception,
+no log line, no green-run anomaly: every `P`-categorized AP row synced
+with `category = NULL`, indistinguishable from the sparse-field gap the
+8/11 doc had already ruled acceptable. It took a TPM (Ankita) noticing her
+own projects were missing a category to surface it.
+
+When a category/enum source and the sync's own map of it can drift
+independently — anyone with edit rights on the source picklist, not just
+this repo, controls whether the map stays complete — the map needs a
+"value seen but unmapped" log line, distinct from "value genuinely blank."
+`map_category()` still can't tell those apart from its return value alone
+(`None` either way, by design — that's the correct behavior for the
+blank-cell ruling); the caller needs to check `if sqdcg_raw and mapped is
+None: log.warning(...)` at the point where blank and unmapped diverge,
+otherwise the next added picklist option is exactly this bug again, and
+next time nobody may be watching the field closely enough to report it.

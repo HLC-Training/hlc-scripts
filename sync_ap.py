@@ -123,7 +123,7 @@ COL_LEAD        = 8208898506051460   # Lead (email) → owner lookup
 COL_STATUS      = 890549111574404    # Overall Status
 COL_FINISH      = 3142348925259652   # Current Finish → due_date
 COL_START       = 6841156930670468   # Start Date (date only) → start_date
-COL_SQDCG       = 5718885853253508   # SQDCG → category
+COL_SQDCG       = 5718885853253508   # SQDCGP → category
 COL_BUCKET      = 982369741000580    # Bucket
 COL_SOURCE      = 3288805485006724   # Source (AP origin context)
 COL_IS_CHILD    = 4351693839093636   # Is Child (1 = task-level row)
@@ -215,13 +215,14 @@ def family_key(ap_number: str | None) -> str | None:
     m = FAMILY_RE.match((ap_number or "").strip())
     return m.group(1) if m else None
 
-# SQDCG → ORiON category (first letter wins; G = Growth = Strategy)
+# SQDCGP → ORiON category (first letter wins; G = Growth = Strategy)
 SQDCG_MAP = {
     "S": "Safety",
     "Q": "Quality",
     "D": "Delivery",
     "C": "Cost",
     "G": "Strategy",
+    "P": "People",
 }
 
 # ────────────────────────────────────────────────────────────────
