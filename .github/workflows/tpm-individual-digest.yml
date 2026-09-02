@@ -1,0 +1,80 @@
+name: ORION TPM Individual Weekly Digest
+
+# NO `schedule:` TRIGGER — ON PURPOSE.
+#
+# Vercel owns the scheduling for this job. The orion-pll Vercel cron
+# (vercel.json, '9 11 * * 1' = Mondays 11:09 UTC = 06:09 America/Chicago
+# during CDT, 05:09 during CST) calls the authenticated endpoint
+# /api/cron/tpm-individual-digest, which sends the repository_dispatch
+# below. GitHub Actions is only the RUNNER here.
+#
+# Do NOT add a `schedule:` trigger to "make it more reliable" — that is the
+# exact double-fire that hit the PLL digest (bug 645438e0, retired in
+# 4c0a9b2), and GitHub's own cron is the unreliable half: on this account a
+# 07:07 schedule has been observed firing at 12:04, 12:31, 15:01, 18:14 and
+# 19:23 (tasks/lessons.md). If Vercel is ever retired as the scheduler, add
+# the schedule back here in the same commit that removes the Vercel cron —
+# never both at once.
+#
+# workflow_dispatch is kept for manual test runs and as the fallback if the
+# bridge is ever down.
+on:
+  repository_dispatch:
+    types: [tpm-individual-digest]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (render only, do not send)'
+        required: false
+        type: boolean
+        default: false
+      force_date_gate:
+        description: 'Bypass the Monday-only gate (manual tests)'
+        required: false
+        type: boolean
+        default: false
+      only:
+        description: 'Restrict to TPMs whose name contains this text (test bundles)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install supabase requests tzdata
+
+      - name: Send digest
+        env:
+          ORION_SUPABASE_SERVICE_KEY: ${{ secrets.ORION_SUPABASE_SERVICE_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          # LIVE ROLLOUT SWITCH — deliberately absent until Jim reviews the
+          # TEST bundle and gives the explicit go (ORiON feedback 76944b43,
+          # SAM COS 8627d13f). To go live: set repo variable
+          # TPM_INDIVIDUAL_DIGEST_LIVE=true. Until then every run is TEST
+          # mode and all email goes to Jim only.
+          #
+          # This is its OWN variable. It is NOT PLL_DIGEST_LIVE and NOT
+          # TPM_DIGEST_LIVE — send_tpm_individual_digest.py reads no live
+          # flag but this one, so flipping either of the others can never
+          # turn this digest live. Do not alias or reuse them.
+          TPM_INDIVIDUAL_DIGEST_LIVE: ${{ vars.TPM_INDIVIDUAL_DIGEST_LIVE }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          FORCE_DATE_GATE: ${{ github.event.inputs.force_date_gate }}
+          ONLY: ${{ github.event.inputs.only }}
+        run: |
+          ARGS=()
+          if [ "$DRY_RUN" = "true" ]; then ARGS+=(--dry-run); fi
+          if [ "$FORCE_DATE_GATE" = "true" ]; then ARGS+=(--force-date-gate); fi
+          if [ -n "$ONLY" ]; then ARGS+=(--only "$ONLY"); fi
+          python send_tpm_individual_digest.py "${ARGS[@]}"
