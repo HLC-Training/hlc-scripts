@@ -709,3 +709,48 @@ blank-cell ruling); the caller needs to check `if sqdcg_raw and mapped is
 None: log.warning(...)` at the point where blank and unmapped diverge,
 otherwise the next added picklist option is exactly this bug again, and
 next time nobody may be watching the field closely enough to report it.
+
+## 2026-09-02 — A cron-triggered endpoint that reads its secret with `if (secret && ...)` fails OPEN
+
+From the Vercel-cron → GitHub-Actions bridge (decision
+2026-09-02-tpm-individual-digest.md, ORiON feedback 76944b43). The endpoint
+`/api/cron/tpm-individual-digest` fires a `repository_dispatch` that emails
+TPMs; `middleware.ts` exempts `/api/*` from session auth, so the URL is
+publicly reachable and the route is the only thing standing between a stranger
+and a TPM email blast.
+
+The shape that reads naturally — and that Vercel's own docs example is one
+character away from — is:
+
+```ts
+if (cronSecret && authHeader !== `Bearer ${cronSecret}`) return 401;   // WRONG
+```
+
+If `CRON_SECRET` is ever unset (a fresh environment, a preview deploy, a typo
+in the env var name, someone pruning "unused" vars), the guard's first clause
+is false, the whole condition is false, and **every unauthenticated request
+sails through**. The failure is invisible: no exception, no log line, and the
+endpoint returns a cheerful 200 while dispatching. The correct shape checks the
+secret's absence as its own rejection:
+
+```ts
+if (!cronSecret) return 401;                                  // fail CLOSED
+if (!secretMatches(request.headers.get("authorization"), cronSecret)) return 401;
+```
+
+Generalizing: for any guard whose secret comes from the environment, "the
+secret is missing" and "the secret does not match" must both reject. A missing
+credential is not a reason to skip the check — it is the most suspicious state
+the check can be in. Worth grepping for the `if (SECRET && ...)` pattern
+anywhere else a public endpoint gates on an env var.
+
+Second, smaller lesson from the same build: **verify which trigger is actually
+firing before disabling one.** Commit 4c0a9b2 retired the PLL digest's GitHub
+cron to fix a double-fire, reasoning "GitHub (07:07 UTC) and Vercel (~12:04
+UTC) are both firing." `gh run list --json event` says the opposite: the
+07:07:12-to-the-second runs are `workflow_dispatch` (an external dispatcher)
+and the erratic 12:04 / 12:31 / 15:01 / 18:14 / 19:23 runs are GitHub's own
+`schedule`. The commit disabled the right trigger for the wrong reason, and the
+reason is now written into a commit message the next reader will trust. The
+`event` field is one flag away in `gh run list` — check it before inferring a
+trigger from a timestamp.
