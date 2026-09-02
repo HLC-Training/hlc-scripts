@@ -48,6 +48,17 @@ queue is silently skipped by sync.
 
 Both failures are invisible on inspection. That is why they are here.
 
+## 2026-09-02 — Retiring a cron means disabling the OLD trigger, not just adding the new one
+
+The PLL digest moved to a Vercel cron for reliability but the GitHub Actions
+schedule was left live, so every recipient got the digest twice daily (02:07 CDT
+GitHub + ~07:04 CDT Vercel) until someone noticed. When migrating a scheduled
+job between platforms, disabling the source trigger is part of the SAME change,
+not a follow-up. Disable (comment out schedule:, keep workflow_dispatch) rather
+than delete, so the old path stays as a reversible fallback. The digest
+watermark (pll_digest_state, one row per successful run) made this safe to fix
+with zero window risk. Bug 645438e0.
+
 ## Postgres and Supabase gotchas
 
 Newlines in SQL content need PostgreSQL escape syntax: `E'line one\nline two'`.
