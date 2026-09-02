@@ -78,6 +78,17 @@ never shares with tpm_digest_state or pll_digest_state):
   digest (<date>)" and must NEVER hardcode "in the last 7 days" —
   window_phrase() is the single place that wording lives.
 
+  DATE-GATE SUPPRESSION IS VISIBLE, NOT SILENT (bug af3d6fb1, 2026-09-02):
+  a non-Monday invocation (a manual test dispatch, or a stray/duplicate
+  firing) writes a MARKER row — watermark_used=NULL,
+  summary.reason='date_gate' — via record_date_gate_suppression(), so
+  "green run, zero emails" is always explainable from the state table
+  alone. fetch_state() skips these marker rows when computing the next
+  watermark: they never fetched a single project, so their insert time
+  must never become the next window's start. Do not remove this
+  skip-filter without re-deriving it — that's exactly how a Wednesday
+  smoke test would silently steal days off the next real window.
+
 CADENCE — MONDAYS, HOLIDAY OR NOT:
   This job does NOT use ge_holidays.send_decision(). The daily digests
   gate on weekday AND holiday because skipping one of five weekly sends
@@ -255,12 +266,24 @@ def fetch_incomplete(db, owner_ids: list[str]) -> list[dict]:
 
 
 def fetch_state(db) -> datetime | None:
-    """Watermark = latest successful run's sent_at, from THIS digest's
-    own state table. Never reads tpm_digest_state or pll_digest_state."""
-    resp = db.table('tpm_individual_digest_state').select('sent_at') \
-        .order('sent_at', desc=True).limit(1).execute()
-    rows = resp.data or []
-    return parse_timestamp(rows[0]['sent_at']) if rows else None
+    """Watermark = latest REAL run's sent_at, from THIS digest's own state
+    table. Never reads tpm_digest_state or pll_digest_state.
+
+    Skips date-gate-suppression rows (summary.reason == 'date_gate',
+    written by _record_date_gate_suppression): those runs never fetched
+    projects, so their insert time must not become the next window's
+    start — that would silently drop real newly-assigned items created
+    between the last real watermark and the suppressed run (bug af3d6fb1
+    postmortem). A real send or a genuine all-empty-suppression run (which
+    DID evaluate every TPM's data) still counts, per the existing design.
+    """
+    resp = db.table('tpm_individual_digest_state').select('sent_at, summary') \
+        .order('sent_at', desc=True).limit(20).execute()
+    for row in (resp.data or []):
+        if (row.get('summary') or {}).get('reason') == 'date_gate':
+            continue
+        return parse_timestamp(row['sent_at'])
+    return None
 
 
 def parse_timestamp(raw: str) -> datetime:
@@ -610,24 +633,30 @@ def main():
     log.info(f"Mode: {'LIVE (each TPM)' if live else 'TEST (all email to Jim only)'}"
              + (" [dry-run]" if args.dry_run else ""))
 
+    if not ORION_SUPABASE_SERVICE_KEY:
+        raise SystemExit("ERROR: ORION_SUPABASE_SERVICE_KEY environment variable is not set.")
+    db = create_client(SUPABASE_URL, ORION_SUPABASE_SERVICE_KEY)
+
     now_chicago = datetime.now(CHICAGO)
     today = now_chicago.date()
     ok, reason = monday_decision(today)
     if not ok and not args.force_date_gate:
         log.info(reason)
         print(reason)
+        # A green run that sends nothing must never be a silent no-op
+        # (bug af3d6fb1): record WHY here so the state table alone
+        # explains "no email" without anyone having to open Actions logs.
+        # Never advances the watermark — fetch_state() skips these rows.
+        if not args.dry_run:
+            record_date_gate_suppression(db, reason)
         return
     if not ok and args.force_date_gate:
         log.info(f"Monday gate bypassed by --force-date-gate ({reason})")
-
-    if not ORION_SUPABASE_SERVICE_KEY:
-        raise SystemExit("ERROR: ORION_SUPABASE_SERVICE_KEY environment variable is not set.")
 
     # All reads: any failure exits non-zero. A digest job that silently
     # sends nothing and reports success is the failure mode this repo
     # exists to never repeat (tasks/lessons.md).
     try:
-        db = create_client(SUPABASE_URL, ORION_SUPABASE_SERVICE_KEY)
         tpms = fetch_tpms(db)
         if args.only:
             tpms = [t for t in tpms if args.only.lower() in (t.get('name') or '').lower()]
@@ -694,6 +723,29 @@ def main():
 
     _advance_watermark(db, watermark, live, results, sent=sent)
     print(f"Digest run complete ({'LIVE' if live else 'TEST'}) — {sent} email(s) sent.")
+
+
+def record_date_gate_suppression(db, reason: str) -> None:
+    """Make a Monday-gate no-send VISIBLE in the state table (bug af3d6fb1:
+    a green Actions run that silently sent nothing was indistinguishable
+    from a swallowed send failure until someone opened the job log).
+
+    Writes watermark_used=NULL and summary.reason='date_gate' — a marker,
+    not a real run record. fetch_state() skips rows shaped this way when
+    computing the next watermark, so this can NEVER advance the window:
+    this run never fetched a single project, so its insert time must not
+    become "since your last digest" for the next real send.
+    """
+    try:
+        db.table('tpm_individual_digest_state').insert({
+            'watermark_used': None,
+            'test_mode': True,
+            'summary': {'reason': 'date_gate', 'detail': reason, 'emails_sent': 0},
+        }).execute()
+    except Exception as e:
+        log.error(f"Failed to record date-gate suppression: {e}")
+        sys.exit(1)
+    log.info("Recorded date-gate suppression in tpm_individual_digest_state.")
 
 
 def _advance_watermark(db, watermark: datetime, live: bool, results: list[dict], sent: int) -> None:
