@@ -210,3 +210,28 @@ Code is done. `TPM_INDIVIDUAL_DIGEST_LIVE` was deliberately **not** flipped.
 Jim's sequence: review the 8 TEST emails → set the two Vercel env vars → set
 repo variable `TPM_INDIVIDUAL_DIGEST_LIVE=true` → confirm the first real Monday
 send. Same rollout posture as the PLL digest.
+
+## Addendum 2026-09-02 — the round-trip was tested on a Wednesday
+
+Jim ran the full authenticated round-trip same-day: curl → 200 `{"ok":true}` →
+Actions run [33651386674](https://github.com/HLC-Training/hlc-scripts/actions/runs/33651386674)
+(`repository_dispatch`) completed GREEN in 15s having sent **zero** emails and
+written **zero** state rows. That is **correct, not a break** — 2026-09-02 is
+a Wednesday, and this is a Monday-only job; `repository_dispatch` carries no
+inputs, so it can never bypass the gate the way a manual `workflow_dispatch
+--force-date-gate` run can. Logged and closed as bug `af3d6fb1` (not a bug).
+
+The send path itself was proven separately via the earlier forced
+`workflow_dispatch` run (`33645847441`, 15:01 UTC): 8 Resend sends + state row
+`2a53f6cf-...` matching exactly. Both trigger types run the identical Python
+step; the only difference is whether `FORCE_DATE_GATE` can be set, which only
+`workflow_dispatch` allows.
+
+One real gap this exposed: the no-send path exited before writing any state,
+so a correct self-suppression and a swallowed failure looked identical from
+`tpm_individual_digest_state` alone. `record_date_gate_suppression()`
+(hlc-scripts `b0fb22b`) now writes a marker row on that path, and
+`fetch_state()` skips marker rows so the watermark can't be corrupted by a
+Wednesday smoke test. See `tasks/lessons.md` 2026-09-02 for the full
+write-up. **The first real Monday send (2026-09-07 — Labor Day, which this
+job does not skip) is still the confirmation that actually matters.**

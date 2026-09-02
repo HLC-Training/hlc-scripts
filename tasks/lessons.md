@@ -754,3 +754,33 @@ and the erratic 12:04 / 12:31 / 15:01 / 18:14 / 19:23 runs are GitHub's own
 reason is now written into a commit message the next reader will trust. The
 `event` field is one flag away in `gh run list` — check it before inferring a
 trigger from a timestamp.
+
+## 2026-09-02 — A scheduled job that legitimately sends nothing must record WHY, or a green run and a silent failure are the same run
+
+From the TPM individual digest bridge round-trip test (bug `af3d6fb1`). Jim
+fired the full Vercel-cron → endpoint → `repository_dispatch` chain on a
+Wednesday: the endpoint returned 200, Actions ran GREEN in 15s — and sent zero
+emails, wrote zero state rows. That looked exactly like a broken bridge. It
+wasn't: `monday_decision()` correctly gated the send (this is a weekly,
+Monday-only job), but the code path that hit that gate returned before
+`main()` ever reached a state write. A correct no-send and a swallowed send
+failure produced the identical observable: exit 0, empty state table.
+
+The fix wasn't to the gate — the gate was right. It was to make the
+suppression itself leave a trace: `record_date_gate_suppression()` now writes
+a marker row (`summary.reason = 'date_gate'`) on that path, so "why did
+nothing send" is answerable from the state table alone, without opening an
+Actions log. The one hazard in adding that write: the digest's own watermark
+is derived from *the latest state row's insert time*, not a dedicated
+column — so a naive marker row would silently become the next run's window
+start, even though the suppressed run never fetched a single project. That
+would quietly steal days off the next real "newly assigned" window every time
+someone ran a manual smoke test on the wrong day. `fetch_state()` had to be
+taught to skip marker rows explicitly, or the visibility fix would have
+introduced exactly the class of silent data loss it existed to prevent.
+
+Generalizing: before adding a "record what happened" write to any job that
+already derives state from "the last row in this table," check what that
+table's read side actually keys off. A marker written for observability can
+corrupt an unrelated computed value if the read path doesn't distinguish
+marker rows from real ones.
