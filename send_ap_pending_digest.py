@@ -21,6 +21,23 @@ Flow:
     the new one). A row with zero matching entries — a pre-step-2 flag, or
     a flag set before reason-capture shipped — keeps the "not yet
     captured" placeholder.
+  - Reconciliation (2026-09-08, bug 424c1637, decision 2026-09-08-ap-
+    pending-clear-and-direction.md): before rendering, every logged field
+    is judged against the LIVE ap_tracker row with ap_pending.py — the
+    same module sync_ap.py clears the flag with. A field whose tracker
+    value already equals the ORiON value (matched), or whose tracker row
+    was edited AFTER the ORiON edit (tracker_newer — Jen's later edit
+    wins), is dropped from the reason lines; a row with nothing left
+    pending is dropped from the email entirely, so Jen is never asked to
+    re-apply something she already reconciled or to undo her own newer
+    edit. The digest never writes the flag — the sync clears it on its
+    next run with the same rule; this filter only keeps the two from
+    disagreeing in the window between.
+  - Fixtures never render: ap_pending.is_fixture() (AP-99xx range, "TEST
+    FIXTURE" titles) filters both sections.
+  - Removed-from-tracker section lists rows that are still OPEN in ORiON
+    (the section's own wording) — a closed row that later dropped out of
+    the sheet is not something Jen needs to review.
   - Sent via Resend (same endpoint/from-address as orion-pll/lib/resend.ts).
     A send failure raises and fails the job — a missed daily digest
     should page, not vanish silently.
@@ -38,6 +55,10 @@ import requests
 from datetime import datetime, timezone
 from pathlib import Path
 from supabase import create_client
+from ap_pending import (
+    TERMINAL_STATUSES, is_fixture, in_episode, latest_episode_entries,
+    classify_pending, row_is_reconciled, pick_tracker_row,
+)
 
 # ─── CONFIG ─────────────────────────────────────────────────────
 SUPABASE_URL         = "https://czdkctjbejnwuopigxta.supabase.co"
@@ -84,7 +105,7 @@ log = logging.getLogger(__name__)
 # ─── DATA ───────────────────────────────────────────────────────
 def fetch_pending_delivery_rows(db) -> list[dict]:
     resp = db.table('action_items') \
-        .select('id, ap_number, action_text, status, due_date, original_due_date, ap_pending_since, owner_id') \
+        .select('id, ap_number, action_text, status, due_date, original_due_date, ap_pending_since, owner_id, ap_is_parent, ap_is_child') \
         .eq('source', 'ap_import') \
         .eq('ap_pending_update', True) \
         .execute()
@@ -100,7 +121,7 @@ def fetch_pending_pc_rows(db) -> list[dict]:
     # original_target_date. Normalized into the same due_date/
     # original_due_date keys here so downstream rendering is module-agnostic.
     resp = db.table('pc_projects') \
-        .select('id, ap_number, title, status, target_end_date, original_target_date, ap_pending_since, owner_id') \
+        .select('id, ap_number, title, status, target_end_date, original_target_date, ap_pending_since, owner_id, ap_is_parent, ap_is_child') \
         .eq('ap_pending_update', True) \
         .execute()
     rows = resp.data or []
@@ -110,6 +131,61 @@ def fetch_pending_pc_rows(db) -> list[dict]:
         r['due_date']          = r.pop('target_end_date')
         r['original_due_date'] = r.pop('original_target_date')
     return rows
+
+
+def fetch_tracker_rows(db, ap_numbers: set) -> dict:
+    """ap_number -> list of live ap_tracker rows (a number can carry more
+    than one: parent/child twins, or a stale sibling a Smartsheet renumber
+    left behind — pick_tracker_row() chooses per module row)."""
+    aps = sorted(a for a in ap_numbers if a)
+    if not aps:
+        return {}
+    cols = ('id, ap_number, is_parent, is_child, smartsheet_row_id, smartsheet_modified_at, '
+            'last_synced_at, improvement, description, overall_status, sqdcgp, '
+            'start_date_only, current_finish')
+    by_ap: dict = {}
+    for i in range(0, len(aps), 100):
+        resp = db.table('ap_tracker').select(cols).in_('ap_number', aps[i:i + 100]).execute()
+        for t in (resp.data or []):
+            by_ap.setdefault(t['ap_number'], []).append(t)
+    return by_ap
+
+
+def reconcile_rows(rows: list[dict], reasons_by_item: dict, tracker_by_ap: dict) -> tuple[list[dict], list[dict]]:
+    """Apply the shared per-field rule. Returns (still_pending_rows,
+    dropped_rows). Each kept row gets its `reasons` trimmed to entries for
+    fields still pending and a `field_states` map for the log. Rows with no
+    logged mirrored edits are kept as-is (nothing to judge — the sync's
+    legacy whole-row rule owns them)."""
+    kept, dropped = [], []
+    for r in rows:
+        module = r['module']
+        entries = reasons_by_item.get(r['id'], [])
+        episode = latest_episode_entries(module, entries, r.get('ap_pending_since'))
+        if not episode:
+            r['field_states'] = {}
+            kept.append(r)
+            continue
+        pure_parent = bool(r.get('ap_is_parent')) and not bool(r.get('ap_is_child'))
+        candidates = tracker_by_ap.get(r['ap_number'], [])
+        if len(candidates) > 1:
+            log.warning(f"{r['ap_number']}: {len(candidates)} ap_tracker rows share this AP number — comparing against the freshest same-shape row")
+        tracker = pick_tracker_row(candidates, pure_parent)
+        if tracker is None:
+            log.warning(f"{r['ap_number']}: no ap_tracker row — cannot judge reconciliation, listing as pending")
+        states = classify_pending(module, tracker, episode, lambda _f, entry: entry.get('new_value'))
+        r['field_states'] = states
+        open_fields = {f for f, s in states.items() if s in ('pending', 'not_comparable')}
+        if row_is_reconciled(states) or not open_fields:
+            dropped.append(r)
+            log.info(f"{r['ap_number']} ({module}): reconciled — not listed ({', '.join(f'{f}: {s}' for f, s in sorted(states.items()))})")
+            continue
+        settled = {f: s for f, s in states.items() if f not in open_fields}
+        if settled:
+            log.info(f"{r['ap_number']} ({module}): {len(settled)} field(s) settled, not shown ({', '.join(f'{f}: {s}' for f, s in sorted(settled.items()))})")
+        r['reasons'] = [e for e in entries if e.get('field') in open_fields]
+        kept.append(r)
+    return kept, dropped
 
 
 def fetch_orphaned_delivery_rows(db) -> list[dict]:
@@ -163,15 +239,12 @@ def fetch_change_log_reasons(db, rows: list[dict]) -> dict:
         by_item.setdefault(entry['item_id'], []).append(entry)
 
     since_by_item = {r['id']: r.get('ap_pending_since') for r in rows}
-    out = {}
-    for item_id, entries in by_item.items():
-        since = since_by_item.get(item_id)
-        if not since:
-            out[item_id] = entries
-            continue
-        since_ts = parse_timestamp(since)
-        out[item_id] = [e for e in entries if parse_timestamp(e['changed_at']) >= since_ts]
-    return out
+    # Episode membership is the shared rule (ap_pending.in_episode) so the
+    # digest's reasons and the sync's settle judgement see the same entries.
+    return {
+        item_id: [e for e in entries if in_episode(e, since_by_item.get(item_id))]
+        for item_id, entries in by_item.items()
+    }
 
 
 def parse_timestamp(raw: str) -> datetime:
@@ -193,7 +266,9 @@ def enrich_rows(rows: list[dict], owner_names: dict, reasons_by_item: dict) -> l
             'pending_since': pending_since,
             'age_days':      age_days,
             'flagged':       age_days is not None and age_days > AGE_CALLOUT_DAYS,
-            'reasons':       reasons_by_item.get(r['id'], []),
+            # reconcile_rows() trims r['reasons'] to still-pending fields;
+            # rows it never judged (no logged edits) fall back to the raw list.
+            'reasons':       r.get('reasons', reasons_by_item.get(r['id'], [])),
         })
     # Oldest (most overdue) first — the rows most in need of attention lead.
     enriched.sort(key=lambda r: r['age_days'] if r['age_days'] is not None else -1, reverse=True)
@@ -446,19 +521,42 @@ def main():
     args = parse_args()
     db = create_client(SUPABASE_URL, ORION_SUPABASE_SERVICE_KEY)
 
-    delivery_rows = fetch_pending_delivery_rows(db)
-    pc_rows = fetch_pending_pc_rows(db)
-    rows = delivery_rows + pc_rows
-    orphan_rows = fetch_orphaned_delivery_rows(db) + fetch_orphaned_pc_rows(db)
+    def _not_fixture(r: dict) -> bool:
+        if is_fixture(r.get('ap_number'), r.get('action_text')):
+            log.warning(f"{r.get('ap_number')} ({r['module']}): test fixture excluded from the digest — {r.get('action_text')!r}")
+            return False
+        return True
+
+    pending_raw = [r for r in fetch_pending_delivery_rows(db) + fetch_pending_pc_rows(db) if _not_fixture(r)]
+    orphan_raw  = [r for r in fetch_orphaned_delivery_rows(db) + fetch_orphaned_pc_rows(db) if _not_fixture(r)]
+
+    # Reconcile against the live tracker (shared rule with sync_ap.py).
+    reasons_by_item = fetch_change_log_reasons(db, pending_raw)
+    tracker_by_ap = fetch_tracker_rows(db, {r['ap_number'] for r in pending_raw})
+    rows, reconciled = reconcile_rows(pending_raw, reasons_by_item, tracker_by_ap)
+    if reconciled:
+        log.info(f"{len(reconciled)} flagged row(s) already reconciled or superseded in the tracker — omitted: "
+                 + ", ".join(sorted(r['ap_number'] for r in reconciled)))
+
+    # Removed-from-tracker: only rows still open in ORiON (the section says
+    # so); a closed row that was later deleted from the sheet needs no review.
+    orphan_rows = []
+    for r in orphan_raw:
+        if r.get('status') in TERMINAL_STATUSES[r['module']]:
+            log.info(f"{r['ap_number']} ({r['module']}): orphaned but already {r['status']} in ORiON — not listed")
+            continue
+        orphan_rows.append(r)
+
     if not rows and not orphan_rows:
-        log.info("No AP rows flagged ap_pending_update or ap_orphaned (Delivery or P&C) — nothing to send.")
+        log.info("No open AP rows flagged ap_pending_update or ap_orphaned (Delivery or P&C) — nothing to send.")
         print("No flagged rows — digest skipped.")
         return
 
+    delivery_rows = [r for r in rows if r['module'] == 'delivery']
+    pc_rows = [r for r in rows if r['module'] == 'pc']
     delivery_owner_ids = {r['owner_id'] for r in delivery_rows + [o for o in orphan_rows if o['module'] == 'delivery'] if r.get('owner_id')}
     pc_owner_ids = {r['owner_id'] for r in pc_rows + [o for o in orphan_rows if o['module'] == 'pc'] if r.get('owner_id')}
     owner_names = fetch_owner_names(db, delivery_owner_ids, pc_owner_ids)
-    reasons_by_item = fetch_change_log_reasons(db, rows)
     enriched = enrich_rows(rows, owner_names, reasons_by_item)
     enriched_orphans = enrich_orphans(orphan_rows, owner_names)
 
@@ -470,7 +568,7 @@ def main():
     if args.dry_run:
         print(f"Subject: {subject}\n")
         print(text_body)
-        log.info(f"[DRY RUN] {len(enriched)} row(s), {flagged_count} over {AGE_CALLOUT_DAYS}d, {len(enriched_orphans)} orphan(s) — not sent.")
+        log.info(f"[DRY RUN] {len(enriched)} row(s), {flagged_count} over {AGE_CALLOUT_DAYS}d, {len(enriched_orphans)} orphan(s), {len(reconciled)} reconciled row(s) omitted — not sent.")
         return
 
     to_email = args.to or JENNIFER_EMAIL

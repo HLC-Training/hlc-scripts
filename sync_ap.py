@@ -87,6 +87,16 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from supabase import create_client
+# Reconciliation semantics shared with send_ap_pending_digest.py (decision
+# 2026-09-08-ap-pending-clear-and-direction.md). The status/category maps
+# moved there the same day so the digest projects tracker rows with the
+# sync's own vocab; the names stay importable from this module
+# (scripts/backfill_ap_category_people.py reads sync_ap.SQDCG_MAP).
+from ap_pending import (  # noqa: F401 — re-exported names
+    STATUS_MAP, PC_STATUS_MAP, SQDCG_MAP, map_status, map_category,
+    latest_episode_entries, classify_pending, row_is_reconciled,
+    project_tracker_field, NOT_COMPARABLE, parse_ts as _ap_parse_ts,
+)
 
 # ─── CONFIG ─────────────────────────────────────────────────────
 SUPABASE_URL         = "https://czdkctjbejnwuopigxta.supabase.co"
@@ -170,29 +180,11 @@ COL_MODIFIED_CELL  = 604393216184196   # Modified (DATETIME)
 COL_CREATED_BY     = 4844025737334660  # Created By (CONTACT_LIST)
 
 # ─── MAPPINGS ────────────────────────────────────────────────────
-# Smartsheet Overall Status → ORiON (Delivery / action_items) status
-STATUS_MAP = {
-    "Not Started": "Open",
-    "In Progress":  "In Progress",
-    "On Hold":      "Deferred",
-    "Complete":     "Done",
-    "Cancelled":    "Done",
-}
-
-# Smartsheet Overall Status → P&C (pc_projects) status.
-# Active statuses flow through the normal update path; inactive ones
-# (On Hold / Complete / Cancelled) reach an existing row only via the
-# status-only close pass in main() or the pending-settle diff — never as
-# inserts. Before the inactive mappings existed (bug e6b35596), a pending
-# P&C row that went Complete in Smartsheet diffed status against None and
-# could never settle its flag.
-PC_STATUS_MAP = {
-    "Not Started": "approved",
-    "In Progress": "active",
-    "On Hold":     "on_hold",
-    "Complete":    "complete",
-    "Cancelled":   "cancelled",
-}
+# STATUS_MAP (Overall Status → Delivery status) and PC_STATUS_MAP (→ P&C
+# status) live in ap_pending.py since 2026-09-08 and are imported above —
+# the digest needs the same vocab to judge reconciliation. Their history
+# (bug e6b35596: inactive P&C mappings so a pending row that went Complete
+# can settle) is documented there.
 
 # Active statuses — only import these (both Delivery and P&C)
 ACTIVE_STATUSES = {"Not Started", "In Progress"}
@@ -216,14 +208,8 @@ def family_key(ap_number: str | None) -> str | None:
     return m.group(1) if m else None
 
 # SQDCGP → ORiON category (first letter wins; G = Growth = Strategy)
-SQDCG_MAP = {
-    "S": "Safety",
-    "Q": "Quality",
-    "D": "Delivery",
-    "C": "Cost",
-    "G": "Strategy",
-    "P": "People",
-}
+# SQDCG_MAP (SQDCGP letter → category) is imported from ap_pending.py —
+# see the import block at the top. P = People added 2026-09-01.
 
 # ────────────────────────────────────────────────────────────────
 
@@ -625,14 +611,9 @@ def days_since(iso_ts: str | None) -> float | None:
     return (datetime.now(timezone.utc) - ts).total_seconds() / 86400
 
 
-def map_category(sqdcg_raw: str | None) -> str | None:
-    """Map first SQDCG letter to ORiON category."""
-    if not sqdcg_raw:
-        return None
-    for char in sqdcg_raw.upper():
-        if char in SQDCG_MAP:
-            return SQDCG_MAP[char]
-    return None
+# map_category(sqdcg_raw) is imported from ap_pending.py (same body it had
+# here; blank and unmapped both return None by design — the caller in
+# compute_shared_fields' consumers warns on seen-but-unmapped values).
 
 
 def map_no_report_out(raw) -> bool:
@@ -887,13 +868,9 @@ def map_module_status(status_map: dict, status_raw, default: str, ap_num: str, l
     project now, so an unmappable value must still land somewhere legal —
     default with a warning rather than dropping the row or writing an
     illegal CHECK value."""
-    if status_raw:
-        s = str(status_raw).strip()
-        if s in status_map:
-            return status_map[s]
-        for k, v in status_map.items():
-            if k.lower() == s.lower():
-                return v
+    mapped = map_status(status_map, status_raw)
+    if mapped is not None:
+        return mapped
     log.warning(f"{ap_num}: unmapped Overall Status {status_raw!r} — defaulting to {default!r} ({label})")
     return default
 
@@ -1031,10 +1008,24 @@ def plan_module_projection(task: dict, mod: dict, owner_id, shared: dict,
     each op to the primary row-disposition stream (the accounting identity
     counts ROWS once) or the split_projection overlay stream.
 
-    Pending-settle semantics are the pre-widening ones, verbatim: content
-    diff empty -> clear the flag and touch nothing else this run (metadata
-    lands on the next run's normal update); content diff non-empty -> skip,
-    protect, escalate past ESCALATION_DAYS."""
+    Pending-settle semantics (decision 2026-09-08-ap-pending-clear-and-
+    direction.md, bug 424c1637) are PER FIELD over the row's current flag
+    episode (its ap_change_log entries since ap_pending_since, latest per
+    field), judged by ap_pending.classify_pending against the live sheet
+    row's projection:
+      every episode field matched or tracker_newer -> clear the flag and
+        touch nothing else this run (the sheet's values, including any a
+        newer tracker edit superseded, land on the next run's normal
+        update). A superseded field is recorded to ap_change_log FIRST
+        (old = the losing ORiON value, new = the tracker value) so the
+        overwrite that follows has an audit row; the write phase withholds
+        the clear if that insert fails.
+      any episode field still pending -> skip, protect, escalate past
+        ESCALATION_DAYS on the pending fields only.
+    A flagged row with NO episode entries (legacy flag, unlogged writer)
+    keeps the pre-2026-09-08 whole-row rule: content diff empty -> clear,
+    non-empty -> protect. When the change-log load failed this run, every
+    flagged row is protected and nothing clears."""
     ap_num = task['ap_number']
     ex = mod['existing'].get(module_row_key(ap_num, is_pure_parent(task)))
     status = map_module_status(mod['status_map'], task['status_raw'], mod['default_status'], ap_num, mod['label'])
@@ -1050,19 +1041,70 @@ def plan_module_projection(task: dict, mod: dict, owner_id, shared: dict,
     content, meta = mod['build_diff'](task, ex, owner_id, shared, status)
 
     if ex.get('ap_pending_update'):
-        if not content:
-            mod['to_clear_pending'].append((ex['id'], ap_num, secondary))
-            log.info(f"{ap_num}: Smartsheet caught up ({mod['label']}) — clearing ap_pending_update")
+        module_key = 'delivery' if mod['esc_module'] == 'delivery' else 'pc'
+        episode = latest_episode_entries(module_key, mod['pending_log'].get(ex['id'], []), ex.get('ap_pending_since'))
+        # The live sheet row IS the tracker row (task['mirror'] carries the
+        # ap_tracker column shape), so the projection here is byte-identical
+        # to what the digest computes from the stored mirror.
+        states = classify_pending(module_key, task['mirror'], episode,
+                                  lambda field, _entry: ex.get(field))
+        # owner_id has no tracker-side projector (lead resolution lives in
+        # this script) — judge it by this run's own content diff instead,
+        # with the same newer-tracker rule.
+        sheet_mod = _ap_parse_ts(task['mirror'].get('smartsheet_modified_at'))
+        for _f, _s in list(states.items()):
+            if _s != 'not_comparable':
+                continue
+            if _f not in content:
+                states[_f] = 'matched'
+            else:
+                _edited = _ap_parse_ts(episode[_f].get('changed_at'))
+                states[_f] = 'tracker_newer' if (sheet_mod and _edited and sheet_mod > _edited) else 'pending'
+        if mod['pending_log_failed']:
+            settled = False
+            detail = "change-log unavailable this run — protected"
+        elif episode:
+            settled = row_is_reconciled(states)
+            detail = ", ".join(f"{f}: {s}" for f, s in sorted(states.items()))
+        else:
+            # Legacy / unlogged flag: pre-2026-09-08 whole-row rule.
+            settled = not content
+            detail = "no logged edits — whole-row rule: " + ("caught up" if settled else "still diverging")
+        if settled:
+            supersede_rows = []
+            for field, state in states.items():
+                if state != 'tracker_newer':
+                    continue
+                trk_val = project_tracker_field(module_key, field, task['mirror'])
+                if trk_val is NOT_COMPARABLE:
+                    trk_val = content.get(field)  # owner_id: the resolved lead
+                supersede_rows.append({
+                    'module':     module_key,
+                    'item_id':    ex['id'],
+                    'ap_number':  ap_num,
+                    'field':      field,
+                    'old_value':  None if ex.get(field) is None else str(ex.get(field)),
+                    'new_value':  None if trk_val is None or trk_val is NOT_COMPARABLE else str(trk_val),
+                    'reason':     'superseded: Smartsheet row edited after the ORiON change — tracker wins, flag cleared, sheet value lands next run (decision 2026-09-08)',
+                    'changed_by': None,
+                })
+            mod['to_clear_pending'].append((ex['id'], ap_num, secondary, supersede_rows))
+            log.info(f"{ap_num}: pending settled ({mod['label']}) — {detail}; clearing ap_pending_update"
+                     + (f"; {len(supersede_rows)} superseded field(s) logged" if supersede_rows else ""))
             if dry_run:
-                print(f"[DRY RUN] CLEAR    {ap_num:14} {mod['plabel']} — Smartsheet caught up, pending flag cleared")
+                print(f"[DRY RUN] CLEAR    {ap_num:14} {mod['plabel']} — {detail}"
+                      + (f" — would log {len(supersede_rows)} superseded field(s)" if supersede_rows else ""))
             return 'clear_pending'
-        log.info(f"Skipping {ap_num} — {mod['label']} pending update awaiting Smartsheet change")
+        log.info(f"Skipping {ap_num} — {mod['label']} pending update awaiting Smartsheet change ({detail})")
         if dry_run:
-            print(f"[DRY RUN] SKIP     {ap_num:14} {mod['plabel']} — pending update awaiting Smartsheet change")
+            print(f"[DRY RUN] SKIP     {ap_num:14} {mod['plabel']} — pending update awaiting Smartsheet change ({detail})")
         pending_days = days_since(ex.get('ap_pending_since'))
         if pending_days is not None and pending_days > ESCALATION_DAYS:
+            still_open = {f for f, s in states.items() if s in ('pending', 'not_comparable')} if episode else set(content)
             divergence = ", ".join(
-                f"{k}: {ex.get(k)!r} -> {v!r}" for k, v in content.items()
+                f"{k}: {ex.get(k)!r} -> {v!r}" for k, v in content.items() if k in still_open
+            ) or ", ".join(
+                f"{f}: {ex.get(f)!r} -> {episode[f].get('new_value')!r} (not yet in tracker)" for f in sorted(still_open)
             )
             escalations.append({
                 'module':       mod['esc_module'],
@@ -1340,6 +1382,33 @@ def main(dry_run: bool = False):
         log.error(f"Failed to load existing P&C AP items: {e}")
         sys.exit(1)
 
+    # Load the ap_change_log entries behind every currently-flagged row —
+    # the per-field pending-settle rule (decision 2026-09-08, bug 424c1637)
+    # judges reconciliation on the fields the ORiON edit actually touched,
+    # not on the whole row. A failed load must not silently revert to the
+    # whole-row rule (that IS the bug): flagged rows are protected for this
+    # run and the process exits non-zero at the very end, same discipline
+    # as the mirror load.
+    pending_log_by_item: dict = {}
+    pending_log_load_failed = False
+    flagged_ids = [r['id'] for r in list(existing_delivery.values()) + list(existing_pc.values())
+                   if r.get('ap_pending_update')]
+    if flagged_ids:
+        try:
+            for i in range(0, len(flagged_ids), 100):
+                chunk = flagged_ids[i:i + 100]
+                log_resp = db.table('ap_change_log') \
+                    .select('item_id, field, old_value, new_value, changed_at') \
+                    .in_('item_id', chunk) \
+                    .order('changed_at') \
+                    .execute()
+                for e in (log_resp.data or []):
+                    pending_log_by_item.setdefault(e['item_id'], []).append(e)
+            log.info(f"Pending-settle: {len(flagged_ids)} flagged row(s), change-log entries loaded for {len(pending_log_by_item)}")
+        except Exception as e:
+            pending_log_load_failed = True
+            log.error(f"Failed to load ap_change_log for flagged rows — pending flags protected this run, no clears: {e}")
+
     # Load existing ap_tracker mirror rows (Ops Phase 2, decision 69ba45bd)
     # keyed by smartsheet_row_id — the loop-prevention planner needs each
     # row's dirty state. A failed load must NOT block the child sync (same
@@ -1424,11 +1493,11 @@ def main(dry_run: bool = False):
 
     to_insert_delivery = []
     to_update_delivery = []  # list of (id, fields_to_update, ap_number, secondary)
-    to_clear_pending   = []  # list of (id, ap_number, secondary) — Smartsheet caught up, clear flag only
+    to_clear_pending   = []  # list of (id, ap_number, secondary, supersede_rows) — settled, clear flag only (supersede rows logged first)
     to_close_delivery  = []  # list of (id, new_status, ap_number) — out-of-scope row went inactive in Smartsheet
     to_insert_pc       = []
     to_update_pc       = []  # list of (id, fields_to_update, ap_number, secondary)
-    to_clear_pending_pc = []  # list of (id, ap_number, secondary) — Smartsheet caught up, clear flag only
+    to_clear_pending_pc = []  # list of (id, ap_number, secondary, supersede_rows) — settled, clear flag only (supersede rows logged first)
     to_close_pc        = []  # list of (id, new_status, ap_number) — out-of-scope row went inactive in Smartsheet
     escalations        = []  # pending > ESCALATION_DAYS and still diverging
 
@@ -1491,6 +1560,7 @@ def main(dry_run: bool = False):
             'ts_field': 'last_updated',
             'to_insert': to_insert_delivery, 'to_update': to_update_delivery,
             'to_clear_pending': to_clear_pending,
+            'pending_log': pending_log_by_item, 'pending_log_failed': pending_log_load_failed,
         },
         'pc': {
             'label': 'P&C', 'plabel': 'P&C     ', 'esc_module': 'pc',
@@ -1499,6 +1569,7 @@ def main(dry_run: bool = False):
             'ts_field': 'updated_at',
             'to_insert': to_insert_pc, 'to_update': to_update_pc,
             'to_clear_pending': to_clear_pending_pc,
+            'pending_log': pending_log_by_item, 'pending_log_failed': pending_log_load_failed,
         },
     }
 
@@ -1730,6 +1801,7 @@ def main(dry_run: bool = False):
         pc_summary = (
             f"P&C      — would insert: {len(to_insert_pc)}, would update: {len(to_update_pc)}, "
             f"would close: {len(to_close_pc)}, would clear pending flag: {len(to_clear_pending_pc)}"
+            + (" [CHANGE-LOG LOAD FAILED — all pending rows protected]" if pending_log_load_failed else "")
         )
         scope_summary = (
             f"Scope    — in-scope families/standalones: {len(in_scope_families)} "
@@ -1936,11 +2008,32 @@ def main(dry_run: bool = False):
         except Exception as e:
             log.error(f"Delivery update failed for {ap_num}: {e}")
 
-    # Clear settled pending flags — Smartsheet caught up on these rows.
-    # Deliberately does NOT touch last_updated (or anything else): the row's
-    # content didn't change, only the flag lifecycle did.
+    # Clear settled pending flags — Smartsheet caught up on these rows (or
+    # a newer tracker edit superseded them). Deliberately does NOT touch
+    # last_updated (or anything else): the row's content didn't change,
+    # only the flag lifecycle did. A superseded field's audit row is
+    # inserted BEFORE the clear and a failed insert withholds the clear —
+    # the clear is what lets the next run overwrite the losing ORiON value,
+    # so the evidence must land first (2026-08-26 lesson).
     cleared_pending = 0
-    for item_id, ap_num, secondary in to_clear_pending:
+    supersede_log_failures = 0
+
+    def _log_supersede(rows: list, ap_num: str) -> bool:
+        nonlocal supersede_log_failures
+        if not rows:
+            return True
+        try:
+            db.table('ap_change_log').insert(rows).execute()
+            log.info(f"{ap_num}: {len(rows)} superseded field(s) recorded to ap_change_log")
+            return True
+        except Exception as e:
+            supersede_log_failures += 1
+            log.error(f"{ap_num}: supersede audit insert failed ({len(rows)} row(s)) — withholding the pending-flag clear so the losing edit stays protected: {e}")
+            return False
+
+    for item_id, ap_num, secondary, supersede_rows in to_clear_pending:
+        if not _log_supersede(supersede_rows, ap_num):
+            continue
         try:
             db.table('action_items') \
                 .update({'ap_pending_update': False, 'ap_pending_since': None}) \
@@ -2000,7 +2093,9 @@ def main(dry_run: bool = False):
     # Clear settled P&C pending flags — same discipline as Delivery: only
     # the flag lifecycle changes, nothing else on the row.
     cleared_pending_pc = 0
-    for item_id, ap_num, secondary in to_clear_pending_pc:
+    for item_id, ap_num, secondary, supersede_rows in to_clear_pending_pc:
+        if not _log_supersede(supersede_rows, ap_num):
+            continue
         try:
             db.table('pc_projects') \
                 .update({'ap_pending_update': False, 'ap_pending_since': None}) \
@@ -2362,6 +2457,23 @@ def main(dry_run: bool = False):
             f"ap_tracker mirror FAILED "
             f"({'load failed' if mirror_load_failed else f'{mirror_failed_writes} write failure(s)'}) — "
             f"exiting non-zero (module sync completed; see log)"
+        )
+        log.error(msg)
+        print(msg)
+        sys.exit(1)
+
+    # ── Pending-settle failures → non-zero exit, same discipline ────
+    # A run that could not read ap_change_log settled nothing (every
+    # flagged row was protected), and a run that could not record a
+    # superseded field withheld that row's clear. Both leave flags that
+    # should have cleared still set — Jen's next digest would re-list them
+    # — so the run must not report green.
+    if pending_log_load_failed or supersede_log_failures:
+        msg = (
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
+            f"pending-settle FAILED "
+            f"({'ap_change_log load failed — no flags cleared' if pending_log_load_failed else f'{supersede_log_failures} supersede audit insert(s) failed — clears withheld'}) — "
+            f"exiting non-zero (rest of sync completed; see log)"
         )
         log.error(msg)
         print(msg)
