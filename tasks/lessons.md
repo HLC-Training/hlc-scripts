@@ -838,3 +838,31 @@ pruning on that would delete live work. The behavioral proof that matters
 most isn't "prune deletes a stale row" — it's "prune does NOT delete
 anything when the fetch was incomplete, even though the row still looks
 vanished." Test both directions, not just the happy path.
+
+## An AP task can live in `action_items` OR `pc_projects` — "absent from one" is never "does not exist"
+
+**2026-09-08.** An AP-0785 orphan cleanup went sideways for most of a session
+because a chat diagnosis queried `action_items` for two task IDs
+(AP-0785-3-5, AP-0785-3-6), got zero rows, and concluded the IDs were
+fabricated — including declaring, to Jim, that a correct email he had already
+sent to the tracker owner was wrong. The IDs were real the whole time. They
+were `pc_projects` rows, not `action_items` rows. P&C-owned AP tasks mirror
+into `pc_projects`; Delivery-owned ones mirror into `action_items`. The same
+AP family can have children in both tables. Querying one and treating the
+empty result as proof of non-existence is the same "empty from the wrong
+place looks identical to empty from the right place" trap that this codebase
+has already been bitten by against Box, against a mis-pathed grep, and against
+a wrong Supabase project — and it was walked into here *in the same
+conversation where that exact trap had just been flagged twice*.
+
+Two durable rules from it. First, for any AP-number lookup, query BOTH
+`action_items` and `pc_projects` (and `ap_tracker` if the mirror itself is in
+question) before concluding a row is absent — the orphan-diagnosis bug
+`424c1637` postmortem made the same mistake at the code level (it queried only
+`action_items` and missed three genuine `pc_projects` orphans), so this is a
+proven, repeated failure mode, not a one-off. Second, an empty query result is
+evidence of nothing until the target has been confirmed correct: confirm the
+table, the project id, the path, the column name — the empty set does not tell
+you which of those you got wrong. When a live record (here, the SAM COS action
+item `f86bd75e` notes) already states the answer, read it before contradicting
+a human's own correct account.
