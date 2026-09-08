@@ -784,3 +784,32 @@ already derives state from "the last row in this table," check what that
 table's read side actually keys off. A marker written for observability can
 corrupt an unrelated computed value if the read path doesn't distinguish
 marker rows from real ones.
+
+## 2026-09-08 — "Caught up" must be judged on the fields the edit touched, and a supersede needs an audit row
+
+From the AP-pending digest fix (bug 424c1637, decision
+2026-09-08-ap-pending-clear-and-direction.md). The pending-settle check
+compared the whole projected row, so a TPM's one-field edit that Jen had
+already applied stayed flagged as long as any OTHER field on the row
+differed — which, after she rearranges a family, is every row. The flag
+protects a specific edit; the reconciliation test must be scoped to that
+edit's fields (the ap_change_log episode), not to the row. Corollary: when
+a newer tracker edit supersedes the ORiON value, the sync's next normal
+update silently overwrites it — write the losing value to ap_change_log
+BEFORE clearing the flag, and withhold the clear if that insert fails.
+
+Three smaller ones from the same build:
+
+- **Two scripts that must agree share one module.** The digest and the
+  sync now import ap_pending.py; a second implementation of "reconciled"
+  in either script is the drift that produced this bug's cousin.
+- **"Duplicate rows" were two different kinds.** Six were stale mirror
+  siblings (sheet row deleted/renumbered, mirror never pruned — each
+  smartsheet_row_id 404s); two (AP-036, AP-174) were live parent/child
+  twins the sync keys on deliberately. A verbatim `unique (ap_number)`
+  would have failed to create and broken the next sync. Confirm what a
+  "duplicate" IS against the source before deduping to a rule.
+- **A `>=` on an id band matched every real row.** Fixture Smartsheet
+  ids are 12 digits (9999999xxxxx); real ones are 16. The unit test
+  caught it on the first run — a fixture filter with no negative test is
+  a filter you have not tested.

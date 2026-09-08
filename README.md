@@ -44,13 +44,17 @@ per-run log reports the joined/unjoined counts.
 ### send_ap_pending_digest.py
 **Workflow:** ap-pending-digest.yml
 **Schedule:** Weekdays 12:00 UTC (7:00 AM Houston, CDT; Mon-Fri)
-**What it does:** Reads action_items rows flagged `ap_pending_update`
-(PLL edits in ORiON not yet mirrored back to Smartsheet) and emails Jen
-Wright a digest via Resend, with a callout on rows pending more than 14
-days. Sends nothing when zero rows are flagged. Delivery-only in v1 —
-see `orion/knowledge/decisions/2026-07-31-ap-lifecycle-step2-design.md`
-for the reason-capture/P&C-parity follow-up. Run with `--dry-run` to
-render without sending, or `--to <email>` to override the recipient.
+**What it does:** Reads action_items and pc_projects rows flagged
+`ap_pending_update` (PLL/TPM edits in ORiON not yet applied in Smartsheet),
+reconciles each logged field against the live `ap_tracker` row with the
+shared `ap_pending.py` rule (matched or superseded-by-a-newer-tracker-edit
+rows are omitted), and emails Jen Wright a digest via Resend, with a
+callout on rows pending more than 14 days and a removed-from-tracker
+section for rows still open in ORiON whose AP number left the sheet. Test
+fixtures (AP-99xx, "TEST FIXTURE" titles) never render. Sends nothing when
+nothing is left. Run with `--dry-run` to render without sending (set
+`PYTHONIOENCODING=utf-8` on Windows), or `--to <email>` to override the
+recipient. Decision: `knowledge/decisions/2026-09-08-ap-pending-clear-and-direction.md`.
 
 **Secrets required:**
 - `ORION_SUPABASE_SERVICE_KEY`

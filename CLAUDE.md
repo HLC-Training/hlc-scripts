@@ -1,9 +1,9 @@
 # hlc-scripts
 
-Last updated: 2026-09-02 — added the three-digest inventory and the
-Vercel-owns-scheduling rule (weekly per-TPM digest build). Prior note:
-2026-08-26 (second update — ORiON→Smartsheet live push landed in
-orion-pll, not here; sync_ap.py placeholder note corrected)
+Last updated: 2026-09-08 — AP-pending reconciliation rule moved into the
+shared `ap_pending.py` (per-field settle, tracker wins when newer, fixture
+exclusion); the status/category maps live there now. Prior note:
+2026-09-02 (three-digest inventory + Vercel-owns-scheduling rule).
 
 Scheduled sync and automation scripts for the SAM COS and ORiON systems.
 
@@ -22,6 +22,23 @@ Scheduled sync and automation scripts for the SAM COS and ORiON systems.
   Smartsheet→ORiON; its loop-prevention echo handling is what absorbs the
   app's pushes (AP Manager flag checked in code on both sides because
   service_role bypasses RLS). Runs on GitHub Actions.
+- `ap_pending.py` — the ONE implementation of "has this ORiON edit been
+  reconciled in the tracker" (decision `2026-09-08-ap-pending-clear-and-
+  direction.md`): per-field over the row's `ap_change_log` episode, judged
+  against the live sheet row; tracker wins when its `smartsheet_modified_at`
+  post-dates the edit; blank tracker cells stay "caught up" except
+  `pc.description` (ac29261e preserved); `is_fixture()` keeps AP-99xx /
+  "TEST FIXTURE" rows out of every email. `STATUS_MAP` / `PC_STATUS_MAP` /
+  `SQDCG_MAP` are defined here and re-exported by `sync_ap.py`. Both
+  `sync_ap.py` (clears the flag, logs superseded values first) and
+  `send_ap_pending_digest.py` (renders only what is still pending) import
+  it — never re-derive the rule in either script. Tests:
+  `python tests/test_ap_pending.py`.
+- `send_ap_pending_digest.py` — daily digest to Jen Wright of AP rows
+  still flagged `ap_pending_update` (both modules) plus rows orphaned from
+  the tracker while still open. Read-only; `--dry-run` renders locally (set
+  `PYTHONIOENCODING=utf-8` on Windows, bug 49e0cbe9). Still on the GitHub
+  `schedule:` (weekdays 12:00 UTC) — not yet moved to Vercel.
 - `sync_repo_docs.py` — repo reasoning docs to SAM COS Supabase. Vendored
   identically into four repos; samcos is canonical.
 - **Three digests, three separate everything.** `send_pll_digest.py` (daily,
@@ -58,6 +75,18 @@ digest's `7 7 * * 1-5` has been observed firing at 12:04, 12:31, 15:01,
 already has a Vercel cron** — that is the double-fire of bug `645438e0`. If
 Vercel is ever retired as scheduler, the schedule goes back in the same
 commit that removes the Vercel cron, never both at once.
+
+## ap_tracker is keyed on smartsheet_row_id, and ap_number is NOT unique
+
+The mirror upserts on `smartsheet_row_id` and never prunes: a sheet row
+that is deleted or renumbered leaves a stale sibling behind under the old
+AP number (six were removed by hand 2026-09-08). Separately, AP-036 and
+AP-174 are legitimate parent+child twins sharing one flat AP number
+(`module_row_key` exists because of them). Do NOT add
+`unique (ap_number)` — it cannot be created and would break the sync.
+Anything reading `ap_tracker` by AP number must pick the row by shape and
+freshness (`ap_pending.pick_tracker_row`). Pruning + a composite guard is
+an open design item with Jim.
 
 ## Databases
 
