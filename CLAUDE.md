@@ -1,8 +1,10 @@
 # hlc-scripts
 
-Last updated: 2026-09-08 — AP-pending reconciliation rule moved into the
+Last updated: 2026-09-08 — ap_tracker prunes stale mirror rows (gated on
+fetch completeness) and carries a `(ap_number, is_parent)` unique guard.
+Prior note: 2026-09-08 (AP-pending reconciliation rule moved into the
 shared `ap_pending.py` (per-field settle, tracker wins when newer, fixture
-exclusion); the status/category maps live there now. Prior note:
+exclusion); the status/category maps live there now). Earlier:
 2026-09-02 (three-digest inventory + Vercel-owns-scheduling rule).
 
 Scheduled sync and automation scripts for the SAM COS and ORiON systems.
@@ -76,17 +78,25 @@ already has a Vercel cron** — that is the double-fire of bug `645438e0`. If
 Vercel is ever retired as scheduler, the schedule goes back in the same
 commit that removes the Vercel cron, never both at once.
 
-## ap_tracker is keyed on smartsheet_row_id, and ap_number is NOT unique
+## ap_tracker is keyed on smartsheet_row_id; uniqueness is (ap_number, is_parent)
 
-The mirror upserts on `smartsheet_row_id` and never prunes: a sheet row
-that is deleted or renumbered leaves a stale sibling behind under the old
-AP number (six were removed by hand 2026-09-08). Separately, AP-036 and
-AP-174 are legitimate parent+child twins sharing one flat AP number
-(`module_row_key` exists because of them). Do NOT add
-`unique (ap_number)` — it cannot be created and would break the sync.
-Anything reading `ap_tracker` by AP number must pick the row by shape and
-freshness (`ap_pending.pick_tracker_row`). Pruning + a composite guard is
-an open design item with Jim.
+The mirror upserts on `smartsheet_row_id`. Since 2026-09-08 (decision
+`2026-09-08-ap-tracker-prune-and-composite-guard.md`, action item
+`3ca6c010`) `sync_ap.py` also PRUNES: `prune_stale_mirror_rows()`, called
+from `main()` right after the mirror upsert, deletes any `ap_tracker` row
+whose `smartsheet_row_id` is absent from the current fetch — but only when
+`fetch_ap_rows()`'s `fetch_complete` flag (the `totalRowCount` cross-check)
+is True and the pre-upsert mirror load succeeded; a short/partial/failed
+fetch skips the prune and logs why, never deletes on incomplete data. A
+unique index `ap_tracker_ap_number_is_parent_key (ap_number, is_parent)` is
+live — NOT bare `ap_number`, which can never be unique: AP-036 and AP-174
+are legitimate parent+child twins sharing one flat AP number
+(`module_row_key` exists because of them), and the composite key is what
+permits them (opposite `is_parent`) while blocking a stale-mirror duplicate
+(same `is_parent`, same `ap_number` — the shape every stale sibling took).
+Anything reading `ap_tracker` by AP number must still pick the row by shape
+and freshness (`ap_pending.pick_tracker_row`) rather than assuming one row
+per number.
 
 ## Databases
 

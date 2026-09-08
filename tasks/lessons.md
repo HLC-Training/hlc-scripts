@@ -813,3 +813,28 @@ Three smaller ones from the same build:
   ids are 12 digits (9999999xxxxx); real ones are 16. The unit test
   caught it on the first run — a fixture filter with no negative test is
   a filter you have not tested.
+
+## 2026-09-08 — ap_tracker uniqueness is (ap_number, is_parent), and a mirror-sync prune must gate on fetch completeness
+
+From the ap_tracker prune + composite guard build (action item 3ca6c010).
+`ap_number` alone can never be the unique key: AP-036 and AP-174 are
+legitimate live parent+child twins sharing one flat AP number (one
+`is_parent=true` row, one `is_child=true` row, distinct `smartsheet_row_id`s)
+— a bare `unique(ap_number)` cannot be created against real data. The
+durable key is `(ap_number, is_parent)`, which permits the twins (they
+differ on `is_parent`) while blocking a stale mirror duplicate (every stale
+sibling found so far was same-shape: two `is_parent=false` children or two
+parents under one number).
+
+Second, sharper point: a sync's prune step is a DELETE against a live
+system-of-record table, so its only safety is knowing when the fetch it's
+diffing against was actually whole. `sync_ap.py` already had a
+`totalRowCount` cross-check (added for the 8/24 pagination bug) but it only
+logged a warning — nothing gated on it. Widening it into a returned
+`fetch_complete` flag, and refusing to prune unless that flag is True AND
+the pre-upsert mirror read itself succeeded, is what makes the delete safe:
+a short/partial/failed fetch reads every un-fetched row as "vanished," and
+pruning on that would delete live work. The behavioral proof that matters
+most isn't "prune deletes a stale row" — it's "prune does NOT delete
+anything when the fetch was incomplete, even though the row still looks
+vanished." Test both directions, not just the happy path.

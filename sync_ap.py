@@ -237,10 +237,10 @@ def ss_get(path: str, params: dict = None) -> dict:
     return resp.json()
 
 
-def fetch_ap_rows() -> tuple[list[dict], list[dict]]:
+def fetch_ap_rows() -> tuple[list[dict], list[dict], bool, set]:
     """
     Fetch all rows from the AP sheet and return
-    (tasks, parent_titles):
+    (tasks, parent_titles, fetch_complete, all_row_ids):
 
     tasks — EVERY row that carries an AP number (children, mid-nodes,
     umbrella parents, standalones), active AND inactive — regardless of
@@ -275,6 +275,18 @@ def fetch_ap_rows() -> tuple[list[dict], list[dict]]:
     touch the skip counters.
 
     Smartsheet rows are retrieved via GET /sheets/{id} with pagination.
+
+    fetch_complete — True iff Smartsheet's totalRowCount cross-check (below)
+    confirmed the fetch is whole; False on any mismatch, including a
+    response that never returned totalRowCount at all (can't confirm
+    completeness, so it isn't assumed). This gates the ap_tracker mirror
+    prune in main() (action item 3ca6c010) — deleting mirror rows on a
+    short/partial fetch would read every un-fetched sheet row as vanished
+    and destroy live data, so the prune must never run without this flag.
+
+    all_row_ids — the smartsheet_row_id of every row returned by this
+    fetch (all shapes, not just tasks) — the "still alive in the sheet"
+    reference set the prune diffs the mirror against.
     """
     page_size = 500
     page      = 1
@@ -311,16 +323,20 @@ def fetch_ap_rows() -> tuple[list[dict], list[dict]]:
             break
         page += 1
 
-    if total_row_count is not None and len(all_rows) != total_row_count:
+    fetch_complete = total_row_count is not None and len(all_rows) == total_row_count
+    if not fetch_complete:
         # Loud, not fatal: rows added/deleted between page fetches can
         # legitimately move the count; orphan detection downstream is the
-        # reason a silent shortfall here would be dangerous.
+        # reason a silent shortfall here would be dangerous. Also gates the
+        # ap_tracker mirror prune (action item 3ca6c010) — see fetch_complete
+        # in the docstring above.
         log.warning(
             f"Smartsheet: fetched {len(all_rows)} rows but the response "
             f"reported totalRowCount={total_row_count} — sheet may have "
-            f"changed mid-fetch"
+            f"changed mid-fetch, or totalRowCount was never returned"
         )
     log.info(f"Smartsheet: fetched {len(all_rows)} total rows across {page} page(s)")
+    all_row_ids = {row.get('id') for row in all_rows if row.get('id') is not None}
 
     tasks         = []
     parent_titles = []
@@ -410,7 +426,7 @@ def fetch_ap_rows() -> tuple[list[dict], list[dict]]:
         f"{skipped_structural} structural blank-AP rows skipped)"
     )
     log.info(f"Smartsheet: {len(parent_titles)} top-level AP titles found on parent rows")
-    return tasks, parent_titles
+    return tasks, parent_titles, fetch_complete, all_row_ids
 
 
 def resolve_lead_email(lead_value: str, lead_display: str, alias_map: dict, name_to_email: dict) -> str | None:
@@ -786,6 +802,59 @@ def plan_mirror_writes(existing_mirror: dict, mirror_candidates: dict, dry_run: 
         to_upsert.append(payload)
 
     return to_upsert, conflict_rows, conflicted_row_ids, echo_cleared, conflicts_ingested, protected_pending
+
+
+def prune_stale_mirror_rows(db, existing_mirror: dict, all_sheet_row_ids: set,
+                            fetch_complete: bool, mirror_load_failed: bool) -> tuple[int, bool]:
+    """Delete ap_tracker rows whose smartsheet_row_id no longer appears in
+    the sheet (action item 3ca6c010). A sheet row Jen deletes — or
+    replaces via a renumber that assigns a brand-new smartsheet_row_id —
+    leaves its old ap_tracker row behind forever, because the upsert in
+    main() only ever adds/updates rows, never removes one. Six such stale
+    siblings were deleted by hand 2026-09-08; without this step they
+    recur on every future renumber.
+
+    HARD RULE, this is the whole safety of the function: prune runs ONLY
+    when fetch_ap_rows()'s totalRowCount cross-check confirmed the fetch
+    was whole (fetch_complete) AND the pre-upsert ap_tracker mirror load
+    in main() succeeded (mirror_load_failed False, so existing_mirror is
+    trustworthy). A short/partial/failed fetch would read every
+    un-fetched sheet row as "vanished" and delete live data — on either
+    condition failing, the prune is skipped, and the skip is always
+    logged, never silent.
+
+    Deletes by smartsheet_row_id ONLY — existing_mirror.keys() (loaded
+    before this run's upsert) diffed against all_sheet_row_ids (every row
+    id in this fetch, all shapes, from fetch_ap_rows) — never by
+    ap_number, which would take out the AP-036/AP-174 parent+child twins
+    that legitimately share one flat AP number: each twin's two rows
+    carry two distinct smartsheet_row_ids, both present in
+    all_sheet_row_ids as long as both sheet rows still exist, so neither
+    is ever a candidate here regardless of how many rows share their
+    ap_number.
+
+    Returns (pruned_count, skipped) for the caller/tests to assert on.
+    """
+    if not fetch_complete or mirror_load_failed:
+        reason = "fetch did not pass the totalRowCount cross-check" if not fetch_complete else "ap_tracker mirror load failed this run"
+        log.warning(f"Mirror prune skipped: {reason} — pruning on incomplete data risks deleting live rows")
+        return 0, True
+
+    stale_row_ids = set(existing_mirror.keys()) - all_sheet_row_ids
+    if not stale_row_ids:
+        log.info("Mirror prune: 0 stale ap_tracker rows (fetch complete)")
+        return 0, False
+
+    try:
+        db.table('ap_tracker').delete().in_('smartsheet_row_id', list(stale_row_ids)).execute()
+        log.warning(
+            f"Mirror prune: removed {len(stale_row_ids)} stale ap_tracker "
+            f"row(s) absent from the sheet: {sorted(stale_row_ids)}"
+        )
+        return len(stale_row_ids), False
+    except Exception as e:
+        log.error(f"Mirror prune failed ({len(stale_row_ids)} candidate row(s)): {e}")
+        return 0, False
 
 
 def user_is_ap_manager(db, user_id: str) -> bool:
@@ -1329,7 +1398,7 @@ def main(dry_run: bool = False):
 
     # Fetch all AP rows from Smartsheet
     try:
-        tasks, parent_titles = fetch_ap_rows()
+        tasks, parent_titles, fetch_complete, all_sheet_row_ids = fetch_ap_rows()
     except Exception as e:
         # Exit non-zero (closes bug 306cea89 / lessons.md "exit 0 on a failed
         # fetch is a lie the whole system believes") — a plain `return` here
@@ -1940,6 +2009,8 @@ def main(dry_run: bool = False):
             f"{mirror_echo_cleared} echo-cleared, {mirror_conflicts_ingested} conflict(s) ingested, "
             f"{mirror_protected} protected pending, {mirror_conflict_rows_logged} conflict row(s) logged"
         )
+
+    prune_stale_mirror_rows(db, existing_mirror, all_sheet_row_ids, fetch_complete, mirror_load_failed)
 
     # Insert new Delivery items in batches of 25. A failed batch falls back
     # to per-row inserts: on 2026-08-24 one row with a junk date killed its
