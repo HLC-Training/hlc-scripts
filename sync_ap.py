@@ -471,43 +471,58 @@ def resolve_lead_email(lead_value: str, lead_display: str, alias_map: dict, name
 
 
 def resolve_owner(email: str, email_to_id: dict, portal_email_to_id: dict, viewer_emails: set,
-                  all_portal_users: list = None) -> tuple[str, str | None]:
+                  director_email_to_id: dict | None = None) -> tuple[str, str | None, bool]:
     """
     Resolve an already-identified email to a routing decision.
-    Returns (destination, owner_id) where destination is one of:
+    Returns (destination, owner_id, via_director) where destination is one of:
       'delivery'  — resolves in users, role != viewer (a PLL/admin)  → action_items
-      'pc'        — resolves in portal_users, role tpm                → pc_projects
-      'director'  — resolves in portal_users, role director (no executing owner available) → pc_projects (owner assignment only)
-      'ambiguous' — resolves in BOTH; needs a human, not a guess
+      'pc'        — resolves in portal_users, role tpm OR director    → pc_projects.
+                    A director is a valid owner exactly like a tpm — every AP
+                    row's own lead owns that row, hierarchy-independent
+                    (Phase 2c ruling, 2026-09-11, bug ca9beaeb — supersedes
+                    Phase 2b's per-family fallback, which both never actually
+                    wrote anything live AND used the wrong model: it skipped
+                    a director whenever ANY other family member had an
+                    executing owner, when the real rule is per-ROW, not
+                    per-family).
+      'ambiguous' — resolves in BOTH users and the tpm map; needs a human,
+                    not a guess.
       'viewer'    — resolves in users, but role is viewer — a real person,
                     excluded on purpose (mirrors item-actions.ts, which
                     rejects viewers on owner assignment). Distinct from
                     'none' so this doesn't get buried in the unmapped bucket.
       'none'      — resolves in neither (or no email was ever identified)
 
-    When all_portal_users is provided, directors are detected and returned as
-    'director' destination; the owner_id will be set by the caller if this is a
-    fallback case (director is the only lead for the AP).
+    via_director is True only when the 'pc' destination came from
+    director_email_to_id (not the tpm map). The caller uses this to keep
+    FAMILY MEMBERSHIP (which families sync into ORiON at all) based on
+    tpm/pll/admin leads only, unchanged from pre-Phase-2c behavior: a family
+    led SOLELY by a director — e.g. AP-0570/AP-0791, the Ops APs Jim ruled
+    to leave alone — must not newly enter ORiON just because directors are
+    now valid owners. OWNERSHIP within an already-in-scope family (one that
+    has a tpm/pll lead somewhere in it, e.g. AP-0917/1073/1078 via Gloria
+    Norris) does honor a director's own lead on their own row. A caller that
+    ignores via_director and always counts 'pc' toward membership would
+    silently pull every director-only-led family into scope on the next
+    live run — not what this phase authorizes.
     """
     delivery_id = email_to_id.get(email)
     pc_id       = portal_email_to_id.get(email)
 
     if delivery_id and pc_id:
-        return "ambiguous", None
+        return "ambiguous", None, False
     if delivery_id:
-        return "delivery", delivery_id
+        return "delivery", delivery_id, False
     if pc_id:
-        return "pc", pc_id
+        return "pc", pc_id, False
 
-    # Check if this email resolves to a director (in portal_users but not in the tpm-filtered map)
-    if all_portal_users and email:
-        for p in all_portal_users:
-            if p.get('email', '').strip().lower() == email.lower() and p.get('role') == 'director':
-                return "director", p['id']
+    director_id = (director_email_to_id or {}).get(email)
+    if director_id:
+        return "pc", director_id, True
 
     if email in viewer_emails:
-        return "viewer", None
-    return "none", None
+        return "viewer", None, False
+    return "none", None, False
 
 
 def parse_due_date(finish_raw: str | None) -> str | None:
@@ -1372,16 +1387,30 @@ def main(dry_run: bool = False):
         sys.exit(1)
 
     # portal_users is fetched WITHOUT a role filter: portal_email_to_id (the
-    # actual P&C routing map) stays narrowed to role=tpm, but name_to_email
-    # (built below) needs every portal_users row so a name match can find e.g.
-    # a director too — resolve_owner() enforces the role filter afterward.
+    # tpm routing map) stays narrowed to role=tpm, director_email_to_id is a
+    # SEPARATE map narrowed to role=director (Phase 2c, 2026-09-11 — a
+    # director is a valid pc_projects owner exactly like a tpm, see
+    # resolve_owner's via_director docs for why the two maps stay separate
+    # rather than merging into one role IN ('tpm','director') filter: Jim
+    # Rosen is a director in portal_users AND a non-viewer admin in users —
+    # merging would make his email resolve in both tables and flip him to
+    # 'ambiguous', nulling the 27 Delivery rows he already owns. Keeping
+    # delivery checked first in resolve_owner and director as a distinct,
+    # lower-priority map avoids that regression. name_to_email (built below)
+    # still needs every portal_users row so a free-text name match can find
+    # a director too.
     try:
         portal_resp = db.table('portal_users').select('id, name, email, role').execute()
         portal_email_to_id = {
             p['email'].strip().lower(): p['id']
             for p in portal_resp.data if p.get('email') and p.get('role') == 'tpm'
         }
-        log.info(f"Portal users loaded: {len(portal_email_to_id)} eligible (tpm) of {len(portal_resp.data)} total")
+        director_email_to_id = {
+            p['email'].strip().lower(): p['id']
+            for p in portal_resp.data if p.get('email') and p.get('role') == 'director'
+        }
+        log.info(f"Portal users loaded: {len(portal_email_to_id)} eligible (tpm), "
+                f"{len(director_email_to_id)} eligible (director) of {len(portal_resp.data)} total")
     except Exception as e:
         log.error(f"Failed to load portal_users: {e}")
         sys.exit(1)
@@ -1648,38 +1677,37 @@ def main(dry_run: bool = False):
     # holds the set of modules each in-scope family occupies — a pure parent
     # projects into every one of them (split families get the header in
     # both tables, ruling b).
+    #
+    # Phase 2c (2026-09-11, bug ca9beaeb) replaced Phase 2b's per-family
+    # "director fallback" entirely — that pre-pass (a) used the wrong model
+    # (director owns only if the FAMILY has no executing owner, when the
+    # real rule is per-ROW: every row's own lead owns that row, hierarchy-
+    # independent) and (b) was structurally inert in production: fam_modules
+    # was built from PRE-fallback destinations, so a family whose fallback
+    # applied (no tpm/pll anywhere in it) never entered in_scope_families in
+    # the first place, and the out-of-scope branch below never reads
+    # task['destination']/task['owner_id']. It logged "assigned as owner"
+    # on every run and wrote nothing, live, ever — see the 2c decision doc.
+    #
+    # The correct rule: resolve_owner() now treats a director exactly like a
+    # tpm (destination 'pc') for OWNERSHIP. But MEMBERSHIP (which families
+    # enter ORiON at all) must stay exactly as it was pre-2c — director-only
+    # leads must not count toward it, or a previously-untouched director-led
+    # family (AP-0570/AP-0791, the out-of-scope Ops APs Jim ruled to leave
+    # alone) would newly insert on the next live run purely because
+    # directors became valid owners. via_director (returned by
+    # resolve_owner) is exactly that signal: True only when the 'pc'
+    # destination came from director_email_to_id, not the tpm map.
     fam_modules = defaultdict(set)
-    # Track director leads per-family (Phase 2b director-fallback): a family
-    # whose lead resolves to a director but has no executing owner will get
-    # the director assigned as owner.
-    fam_directors = defaultdict(lambda: {'director_id': None, 'director_email': None, 'has_executing_owner': False})
     for task in tasks:
         task['lead_email'] = resolve_lead_email(task['lead_value'], task['lead_display'], alias_map, name_to_email)
-        destination, owner_id = resolve_owner(task['lead_email'] or "", email_to_id, portal_email_to_id, viewer_emails,
-                                              all_portal_users=portal_resp.data)
+        destination, owner_id, via_director = resolve_owner(
+            task['lead_email'] or "", email_to_id, portal_email_to_id, viewer_emails,
+            director_email_to_id=director_email_to_id)
         task['destination'] = destination
         task['owner_id'] = owner_id
-        if task['family'] and destination in ('delivery', 'pc'):
+        if task['family'] and destination in ('delivery', 'pc') and not via_director:
             fam_modules[task['family']].add(destination)
-            # An executing owner exists for this family (Phase 2b)
-            fam_directors[task['family']]['has_executing_owner'] = True
-        elif task['family'] and destination == 'director':
-            # Director detected for this family; store their info for fallback
-            if not fam_directors[task['family']]['director_id']:
-                fam_directors[task['family']]['director_id'] = owner_id
-                fam_directors[task['family']]['director_email'] = task['lead_email']
-
-    # Apply director-fallback (Phase 2b): families with only a director lead
-    # and no executing owner get the director assigned as owner.
-    for task in tasks:
-        if task['family'] and task['destination'] == 'director':
-            family_info = fam_directors[task['family']]
-            if not family_info['has_executing_owner']:
-                # Director fallback: assign director as owner for pc module
-                task['destination'] = 'pc'
-                task['owner_id'] = family_info['director_id']
-                log.info(f"{task['ap_number']}: director fallback — lead {family_info['director_email']} "
-                        f"is the only lead for family {task['family']}, assigned as owner")
 
     in_scope_families = set(fam_modules)
     n_split = sum(1 for mods in fam_modules.values() if len(mods) > 1)

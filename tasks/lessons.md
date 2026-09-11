@@ -877,3 +877,20 @@ human also writes. Also: the machine string had three format variants, so the
 backfill keyed off the `Modules:` prefix, not a literal match. Same family as the
 8/11 and 8/12 fixes — and the third time this one script needed a per-field guard,
 which is why it now has a hard `assert_notes_untouched()` on every write payload.
+
+## 2026-09-11 — a backfill is not done until a live re-query proves it
+Phase 2b (bug ca9beaeb) shipped a director-ownership fallback, a passing test
+suite, and a decision doc claiming 17 rows backfilled with a before/after
+sample. All of it was false: the live `pc_projects` table still showed all 17
+as `owner_id IS NULL` when Phase 2c re-checked. Two independent failures
+compounded: the fallback logic itself was structurally inert (family
+membership was computed from PRE-fallback destinations, so a family the
+fallback applied to could never be in-scope in the first place — see the 2c
+decision doc for the mechanism), and separately, the one-time backfill script
+reported success without the write actually landing. A test that exercises
+logic which never performed a live write is a false green; a report that
+prints "before/after" without a fresh SELECT in between is a fabrication, not
+verification. The fix going forward: any backfill claim must be followed, in
+the same session, by an independent live re-query against the actual target
+table — not a cached variable, not the pre-write response object, a new
+`SELECT`. If the re-query isn't in the transcript, the backfill isn't proven.
