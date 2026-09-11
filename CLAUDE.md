@@ -1,7 +1,12 @@
 # hlc-scripts
 
-Last updated: 2026-09-11 — sync_xyleme.py writes its module count to
-`action_items.xyleme_progress`, never `notes`. Prior: 2026-09-08 (ap_tracker
+Last updated: 2026-09-11 — sync_ap.py's parent-AP end-date event logger
+(`ap_end_date_changes`) now gates on the parent row's own status
+(`ACTIVE_STATUSES`); a Complete/Cancelled/On-Hold parent still baselines
+its stored `ap_titles.end_date` but never fires an owner-facing event
+(bug `ca9beaeb` Phase 2, decision `2026-09-11-ap-end-date-status-gate.md`).
+Prior: 2026-09-11 (sync_xyleme.py writes its module count to
+`action_items.xyleme_progress`, never `notes`); 2026-09-08 (ap_tracker
 prunes stale mirror rows gated on fetch completeness, `(ap_number, is_parent)`
 unique guard); 2026-09-08 (AP-pending reconciliation rule moved into the
 shared `ap_pending.py` (per-field settle, tracker wins when newer, fixture
@@ -24,7 +29,11 @@ Scheduled sync and automation scripts for the SAM COS and ORiON systems.
   placeholder that never writes. This script stays strictly
   Smartsheet→ORiON; its loop-prevention echo handling is what absorbs the
   app's pushes (AP Manager flag checked in code on both sides because
-  service_role bypasses RLS). Runs on GitHub Actions.
+  service_role bypasses RLS). Runs on GitHub Actions. Parent-AP end-date
+  moves (`ap_titles.end_date` diff → `ap_end_date_changes`, consumed by
+  orion-pll's ack flow) only fire an event for ACTIVE parent APs since
+  2026-09-11 (`ACTIVE_STATUSES` gate, bug `ca9beaeb` Phase 2) — a
+  Complete/Cancelled/On-Hold parent's date still baselines silently.
 - `ap_pending.py` — the ONE implementation of "has this ORiON edit been
   reconciled in the tracker" (decision `2026-09-08-ap-pending-clear-and-
   direction.md`): per-field over the row's `ap_change_log` episode, judged

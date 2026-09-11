@@ -258,11 +258,18 @@ def fetch_ap_rows() -> tuple[list[dict], list[dict], bool, set]:
     set, AP# like "AP-0621" with no sub-segments): the AP number, the
     primary "Improvement" text (the AP's real title), the parent-level
     "Current Finish" end date (None when blank/unparseable — the diff in
-    main() keeps the stored value in that case), and the Smartsheet row id
-    for traceability. Mid-level summary rows (Is Parent on e.g.
-    AP-0621-1) are expected and silently skipped — ap_titles keys on
-    top-level numbers only. A top-level parent with a blank title is
-    logged and skipped, never captured as an empty string.
+    main() keeps the stored value in that case), the parent row's own
+    "Overall Status" (raw Smartsheet value — same COL_STATUS cell already
+    read for every row, no extra fetch), and the Smartsheet row id for
+    traceability. status_raw is what main()'s end-date diff gates the
+    ap_end_date_changes event on (2026-09-11, bug ca9beaeb Phase 2): a
+    parent whose status isn't in ACTIVE_STATUSES still baselines/updates
+    its stored end_date normally, it just never fires an owner-facing
+    event — a date correction on a Complete/Cancelled/On-Hold AP is noise,
+    not something anyone should be asked to acknowledge. Mid-level summary
+    rows (Is Parent on e.g. AP-0621-1) are expected and silently skipped —
+    ap_titles keys on top-level numbers only. A top-level parent with a
+    blank title is logged and skipped, never captured as an empty string.
 
     Inactive rows (Complete / Cancelled / On Hold) are all captured. For
     IN-SCOPE families they now project fully — all statuses, terminal
@@ -367,6 +374,7 @@ def fetch_ap_rows() -> tuple[list[dict], list[dict], bool, set]:
                         "ap_number":     p_ap,
                         "title":         p_title,
                         "end_date":      parse_due_date(cells.get(COL_FINISH)),
+                        "status_raw":    str(cells.get(COL_STATUS) or "").strip(),
                         "source_row_id": row.get("id"),
                     })
             # Non-top-level parents (AP-0621-1 etc.) and blank AP# summary
@@ -1214,6 +1222,7 @@ def build_sync_accounting(*, child_tasks_total, inserted_delivery, updated_deliv
                           split_projection,
                           parent_titles_total, titles_new_or_changed, titles_written,
                           date_baselines, date_events_detected, date_events_written,
+                          date_events_skipped_inactive,
                           title_capture_failed,
                           mirror_candidates_total, mirror_upserted, mirror_echo_cleared,
                           mirror_conflicts_ingested, mirror_protected_pending,
@@ -1270,6 +1279,7 @@ def build_sync_accounting(*, child_tasks_total, inserted_delivery, updated_deliv
             'date_baselines':        date_baselines,
             'date_events_detected':  date_events_detected,
             'date_events_written':   date_events_written,
+            'date_events_skipped_inactive': date_events_skipped_inactive,
             'title_capture_failed':  title_capture_failed,
         },
         # Split-family stream (2026-08-27 widening): a pure parent's or
@@ -1509,10 +1519,11 @@ def main(dry_run: bool = False):
     # ap_titles read/write marks the run failed and exits non-zero at the
     # very end, but the child sync always completes first. Malformed
     # parent rows were already logged and skipped at fetch time.
-    titles_to_write      = []
-    date_events          = []  # parent-level end-date moves → ap_end_date_changes
-    date_baselines       = 0   # stored end_date NULL → silent first capture, no event
-    title_capture_failed = False
+    titles_to_write               = []
+    date_events                   = []  # parent-level end-date moves → ap_end_date_changes
+    date_baselines                = 0   # stored end_date NULL → silent first capture, no event
+    date_events_skipped_inactive  = 0   # genuine move, but parent AP isn't active — no event (ca9beaeb Phase 2)
+    title_capture_failed          = False
     try:
         titles_resp = db.table('ap_titles').select('ap_number, title, source_row_id, end_date').execute()
         existing_titles = {r['ap_number']: r for r in (titles_resp.data or []) if r.get('ap_number')}
@@ -1536,12 +1547,30 @@ def main(dry_run: bool = False):
                     date_baselines += 1
                 elif stored_end != new_end:
                     # Genuine parent-level move (either direction — a pull-in
-                    # matters to a child owner as much as a slip).
-                    date_events.append({
-                        'ap_number':    p['ap_number'],
-                        'old_end_date': stored_end,
-                        'new_end_date': new_end,
-                    })
+                    # matters to a child owner as much as a slip). Gated on
+                    # the parent's own status (ca9beaeb Phase 2, 2026-09-11):
+                    # only ACTIVE_STATUSES fires an owner-facing event. The
+                    # 2026-09-01 bulk cleanup of stale historical dates on
+                    # COMPLETED APs fired 11 phantom events across 10
+                    # completed APs — nobody should be asked to acknowledge
+                    # a date correction on a finished AP. The stored value
+                    # still updates (write_end = new_end, above) so a later
+                    # reactivation's diff has the right baseline to move
+                    # from — this AP is never permanently blind, it just
+                    # stops nagging while inactive.
+                    if p['status_raw'] in ACTIVE_STATUSES:
+                        date_events.append({
+                            'ap_number':    p['ap_number'],
+                            'old_end_date': stored_end,
+                            'new_end_date': new_end,
+                        })
+                    else:
+                        date_events_skipped_inactive += 1
+                        log.info(
+                            f"End-date move skipped (status gate): {p['ap_number']} "
+                            f"status={p['status_raw']!r} {stored_end} -> {new_end} — "
+                            f"date baselined, no event"
+                        )
 
             if (ex is None or ex.get('title') != p['title']
                     or ex.get('source_row_id') != p['source_row_id']
@@ -1554,7 +1583,8 @@ def main(dry_run: bool = False):
                 })
         log.info(
             f"AP titles: {len(existing_titles)} existing, {len(titles_to_write)} new/changed, "
-            f"{date_baselines} end-date baseline(s), {len(date_events)} end-date change event(s)"
+            f"{date_baselines} end-date baseline(s), {len(date_events)} end-date change event(s), "
+            f"{date_events_skipped_inactive} skipped (inactive parent status)"
         )
     except Exception as e:
         title_capture_failed = True
@@ -1896,7 +1926,8 @@ def main(dry_run: bool = False):
             f"AP titles — captured from Smartsheet: {len(parent_titles)}, "
             f"would write (new/changed): {len(titles_to_write)}, "
             f"end-date baselines: {date_baselines}, "
-            f"end-date change events: {len(date_events)}"
+            f"end-date change events: {len(date_events)}, "
+            f"skipped (inactive parent): {date_events_skipped_inactive}"
             + (" [CAPTURE FAILED — existing ap_titles unreadable]" if title_capture_failed else "")
         )
         print("-" * 72)
@@ -1951,6 +1982,7 @@ def main(dry_run: bool = False):
             date_baselines=date_baselines,
             date_events_detected=len(date_events),
             date_events_written=len(date_events) if not title_capture_failed else 0,
+            date_events_skipped_inactive=date_events_skipped_inactive,
             title_capture_failed=title_capture_failed,
             mirror_candidates_total=len(mirror_candidates),
             mirror_upserted=len(to_upsert_mirror),
@@ -2324,7 +2356,8 @@ def main(dry_run: bool = False):
         f"orphans flagged: {orphaned_delivery + orphaned_pc}, orphans cleared: {unorphaned}, "
         f"WIP flags set: {wip_flagged} | "
         f"AP titles: captured {len(parent_titles)}, written {titles_written}, "
-        f"end-date events: {len(date_events)} detected, {date_events_written} written | "
+        f"end-date events: {len(date_events)} detected, {date_events_written} written, "
+        f"{date_events_skipped_inactive} skipped (inactive) | "
         f"mirror: {mirror_upserted}/{len(mirror_candidates)} upserted, "
         f"{mirror_echo_cleared} echo, {mirror_conflicts_ingested} conflict, "
         f"{mirror_protected} protected"
@@ -2415,6 +2448,7 @@ def main(dry_run: bool = False):
                     f'orphans_flagged={orphaned_delivery + orphaned_pc} orphans_cleared={unorphaned} '
                     f'titles_captured={len(parent_titles)} titles_written={titles_written} '
                     f'date_events_detected={len(date_events)} date_events_written={date_events_written} '
+                    f'date_events_skipped_inactive={date_events_skipped_inactive} '
                     f'date_baselines={date_baselines} '
                     f'insert_failures={failed_inserts_delivery + failed_inserts_pc} '
                     f'title_capture_failed={title_capture_failed} '
@@ -2462,6 +2496,7 @@ def main(dry_run: bool = False):
                 date_baselines=date_baselines,
                 date_events_detected=len(date_events),
                 date_events_written=date_events_written,
+                date_events_skipped_inactive=date_events_skipped_inactive,
                 title_capture_failed=title_capture_failed,
                 mirror_candidates_total=len(mirror_candidates),
                 mirror_upserted=mirror_upserted,
