@@ -470,18 +470,24 @@ def resolve_lead_email(lead_value: str, lead_display: str, alias_map: dict, name
     return None
 
 
-def resolve_owner(email: str, email_to_id: dict, portal_email_to_id: dict, viewer_emails: set) -> tuple[str, str | None]:
+def resolve_owner(email: str, email_to_id: dict, portal_email_to_id: dict, viewer_emails: set,
+                  all_portal_users: list = None) -> tuple[str, str | None]:
     """
     Resolve an already-identified email to a routing decision.
     Returns (destination, owner_id) where destination is one of:
       'delivery'  — resolves in users, role != viewer (a PLL/admin)  → action_items
       'pc'        — resolves in portal_users, role tpm                → pc_projects
+      'director'  — resolves in portal_users, role director (no executing owner available) → pc_projects (owner assignment only)
       'ambiguous' — resolves in BOTH; needs a human, not a guess
       'viewer'    — resolves in users, but role is viewer — a real person,
                     excluded on purpose (mirrors item-actions.ts, which
                     rejects viewers on owner assignment). Distinct from
                     'none' so this doesn't get buried in the unmapped bucket.
       'none'      — resolves in neither (or no email was ever identified)
+
+    When all_portal_users is provided, directors are detected and returned as
+    'director' destination; the owner_id will be set by the caller if this is a
+    fallback case (director is the only lead for the AP).
     """
     delivery_id = email_to_id.get(email)
     pc_id       = portal_email_to_id.get(email)
@@ -492,6 +498,13 @@ def resolve_owner(email: str, email_to_id: dict, portal_email_to_id: dict, viewe
         return "delivery", delivery_id
     if pc_id:
         return "pc", pc_id
+
+    # Check if this email resolves to a director (in portal_users but not in the tpm-filtered map)
+    if all_portal_users and email:
+        for p in all_portal_users:
+            if p.get('email', '').strip().lower() == email.lower() and p.get('role') == 'director':
+                return "director", p['id']
+
     if email in viewer_emails:
         return "viewer", None
     return "none", None
@@ -1636,13 +1649,38 @@ def main(dry_run: bool = False):
     # projects into every one of them (split families get the header in
     # both tables, ruling b).
     fam_modules = defaultdict(set)
+    # Track director leads per-family (Phase 2b director-fallback): a family
+    # whose lead resolves to a director but has no executing owner will get
+    # the director assigned as owner.
+    fam_directors = defaultdict(lambda: {'director_id': None, 'director_email': None, 'has_executing_owner': False})
     for task in tasks:
         task['lead_email'] = resolve_lead_email(task['lead_value'], task['lead_display'], alias_map, name_to_email)
-        destination, owner_id = resolve_owner(task['lead_email'] or "", email_to_id, portal_email_to_id, viewer_emails)
+        destination, owner_id = resolve_owner(task['lead_email'] or "", email_to_id, portal_email_to_id, viewer_emails,
+                                              all_portal_users=portal_resp.data)
         task['destination'] = destination
         task['owner_id'] = owner_id
         if task['family'] and destination in ('delivery', 'pc'):
             fam_modules[task['family']].add(destination)
+            # An executing owner exists for this family (Phase 2b)
+            fam_directors[task['family']]['has_executing_owner'] = True
+        elif task['family'] and destination == 'director':
+            # Director detected for this family; store their info for fallback
+            if not fam_directors[task['family']]['director_id']:
+                fam_directors[task['family']]['director_id'] = owner_id
+                fam_directors[task['family']]['director_email'] = task['lead_email']
+
+    # Apply director-fallback (Phase 2b): families with only a director lead
+    # and no executing owner get the director assigned as owner.
+    for task in tasks:
+        if task['family'] and task['destination'] == 'director':
+            family_info = fam_directors[task['family']]
+            if not family_info['has_executing_owner']:
+                # Director fallback: assign director as owner for pc module
+                task['destination'] = 'pc'
+                task['owner_id'] = family_info['director_id']
+                log.info(f"{task['ap_number']}: director fallback — lead {family_info['director_email']} "
+                        f"is the only lead for family {task['family']}, assigned as owner")
+
     in_scope_families = set(fam_modules)
     n_split = sum(1 for mods in fam_modules.values() if len(mods) > 1)
     log.info(
