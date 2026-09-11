@@ -1,8 +1,9 @@
 # hlc-scripts
 
-Last updated: 2026-09-08 — ap_tracker prunes stale mirror rows (gated on
-fetch completeness) and carries a `(ap_number, is_parent)` unique guard.
-Prior note: 2026-09-08 (AP-pending reconciliation rule moved into the
+Last updated: 2026-09-11 — sync_xyleme.py writes its module count to
+`action_items.xyleme_progress`, never `notes`. Prior: 2026-09-08 (ap_tracker
+prunes stale mirror rows gated on fetch completeness, `(ap_number, is_parent)`
+unique guard); 2026-09-08 (AP-pending reconciliation rule moved into the
 shared `ap_pending.py` (per-field settle, tracker wins when newer, fixture
 exclusion); the status/category maps live there now). Earlier:
 2026-09-02 (three-digest inventory + Vercel-owns-scheduling rule).
@@ -41,6 +42,13 @@ Scheduled sync and automation scripts for the SAM COS and ORiON systems.
   the tracker while still open. Read-only; `--dry-run` renders locally (set
   `PYTHONIOENCODING=utf-8` on Windows, bug 49e0cbe9). Still on the GitHub
   `schedule:` (weekdays 12:00 UTC) — not yet moved to Vercel.
+- `sync_xyleme.py` — Xyleme modernization + exams Smartsheets to ORiON
+  `action_items` (`source='xyleme_import'`, one row per course, every 30 min
+  on GitHub Actions). Since 2026-09-11 the module-count summary goes to
+  `action_items.xyleme_progress`, a column the sync owns; the sync NEVER
+  writes `notes` (append-only human log) and `assert_notes_untouched()`
+  raises if a payload ever carries it (bug 8ffd6cb7, decision
+  `2026-09-11-sync-xyleme-notes-guard-progress-field.md`).
 - `sync_repo_docs.py` — repo reasoning docs to SAM COS Supabase. Vendored
   identically into four repos; samcos is canonical.
 - **Three digests, three separate everything.** `send_pll_digest.py` (daily,

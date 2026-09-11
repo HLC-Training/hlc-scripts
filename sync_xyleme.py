@@ -9,6 +9,11 @@ Flow:
     from Smartsheet (read-only — Smartsheet is SOURCE OF TRUTH).
   - Aggregates at the Course_Integration level (one ORION task per course).
   - Upserts into ORION Supabase action_items on action_text.
+  - The module-count summary is written to action_items.xyleme_progress —
+    NEVER to notes. notes is an append-only human log (orion-pll
+    knowledge/help/delivery-module.md); this script wrote the count there
+    until 2026-09-11 and wiped every PLL entry on each run (bug 8ffd6cb7,
+    decision 2026-09-11-sync-xyleme-notes-guard-progress-field.md).
   - Status rollup: any active modules → In Progress; all on hold → Deferred;
     all complete → Done; all pending/blank → Open.
   - Smartsheet is read-only. PLLs update progress in Smartsheet directly.
@@ -20,8 +25,8 @@ Exam join (verified against live data, Jul 2026):
   Exams Transfer Tracker (the level-0 course grouping header), matched
   by normalized name against Course_Integration values. NOTE: today the
   two trackers use disjoint course taxonomies (115 exam course groups vs
-  6 modernization courses), so few or no exams join — the notes field
-  simply omits the exam line until the taxonomies align. Unjoined counts
+  6 modernization courses), so few or no exams join — the progress
+  summary simply omits the exam line until the taxonomies align. Unjoined counts
   are logged every run.
 
 Schedule: GitHub Actions — every 30 minutes (same as sync_ap.py).
@@ -318,6 +323,20 @@ def match_exam_groups(course: str, exams: dict[str, dict]) -> tuple[int, int, se
     return live, review, matched
 
 
+# ─── NOTES GUARD ────────────────────────────────────────────────
+def assert_notes_untouched(payload: dict, action_text: str) -> None:
+    """
+    Hard stop if any action_items write payload carries `notes`. notes is an
+    append-only human log; this sync must never write it (bug 8ffd6cb7). A
+    silent regression here is a data-loss bug, so it fails loudly instead.
+    """
+    if "notes" in payload:
+        raise RuntimeError(
+            f"sync_xyleme.py attempted to write notes for {action_text!r} — "
+            "notes is the PLL's log; use xyleme_progress instead"
+        )
+
+
 # ─── STATUS ROLLUP ──────────────────────────────────────────────
 def rollup_status(c: dict) -> str:
     """Derive ORION status from module counts."""
@@ -372,18 +391,20 @@ def build_tasks(
         exam_live, exam_review, matched = match_exam_groups(course, exams)
         joined_groups |= matched
 
-        # Build notes summary
-        notes_parts = [
+        # Build the progress summary. This lands in xyleme_progress, a column
+        # the sync owns end-to-end. Do NOT route it to notes: notes is a
+        # human-appended log and the sync must never write it.
+        progress_parts = [
             f"Modules: {c['complete']}/{c['total']} complete",
         ]
         if c["active"]:
-            notes_parts.append(f"{c['active']} in dev/review")
+            progress_parts.append(f"{c['active']} in dev/review")
         if c["on_hold"]:
-            notes_parts.append(f"{c['on_hold']} on hold")
+            progress_parts.append(f"{c['on_hold']} on hold")
         if c["pending"]:
-            notes_parts.append(f"{c['pending']} pending")
+            progress_parts.append(f"{c['pending']} pending")
         if exam_live or exam_review:
-            notes_parts.append(f"Exams: {exam_live} live | {exam_review} in review")
+            progress_parts.append(f"Exams: {exam_live} live | {exam_review} in review")
 
         tasks.append({
             "course":     course,
@@ -391,7 +412,7 @@ def build_tasks(
             "pll_name":   pll_name,
             "status":     status,
             "due_date":   due_date,
-            "notes":      " | ".join(notes_parts),
+            "progress":   " | ".join(progress_parts),
             "action_text": f"Xyleme Modernization: {course}",
         })
 
@@ -447,7 +468,7 @@ def main():
     # Load existing xyleme_import rows keyed by action_text
     try:
         existing_resp = db.table('action_items') \
-            .select('id, action_text, status, due_date, notes, owner_id') \
+            .select('id, action_text, status, due_date, xyleme_progress, owner_id') \
             .eq('source', SOURCE) \
             .execute()
         existing = {r['action_text']: r for r in (existing_resp.data or [])}
@@ -468,8 +489,8 @@ def main():
                 fields["status"]   = task["status"]
             if task["due_date"] != ex.get("due_date"):
                 fields["due_date"] = task["due_date"]
-            if task["notes"]    != ex.get("notes"):
-                fields["notes"]    = task["notes"]
+            if task["progress"] != ex.get("xyleme_progress"):
+                fields["xyleme_progress"] = task["progress"]
             if task["owner_id"] and task["owner_id"] != ex.get("owner_id"):
                 # Keep owner current in case PLL mapping changes, but only
                 # write it when it actually differs — an unconditional write
@@ -479,6 +500,7 @@ def main():
 
             if fields:
                 fields["last_updated"] = datetime.now(timezone.utc).isoformat()
+                assert_notes_untouched(fields, action_text)
                 try:
                     db.table('action_items').update(fields).eq('id', ex['id']).execute()
                     updated += 1
@@ -494,7 +516,8 @@ def main():
                 'action_text':  action_text,
                 'status':       task["status"],
                 'due_date':     task["due_date"],
-                'notes':        task["notes"],
+                'xyleme_progress': task["progress"],
+                # notes deliberately absent — it is the PLL's log, not ours.
                 'priority':     'Tier 2',
                 'source':       SOURCE,
                 # action_items_category_check allows only Safety/Quality/
@@ -507,6 +530,7 @@ def main():
                 'last_updated': datetime.now(timezone.utc).isoformat(),
                 'escalation_needed': False,
             }
+            assert_notes_untouched(new_row, action_text)
             try:
                 db.table('action_items').insert(new_row).execute()
                 inserted += 1

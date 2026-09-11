@@ -866,3 +866,14 @@ table, the project id, the path, the column name — the empty set does not tell
 you which of those you got wrong. When a live record (here, the SAM COS action
 item `f86bd75e` notes) already states the answer, read it before contradicting
 a human's own correct account.
+
+## 2026-09-11 — a sync that owns one meaning of a field must not write a field a human also writes
+sync_xyleme.py put a machine-generated status string into `notes`, a field the UI
+treats as an append-only human log. Every run wiped what a PLL wrote. The fix
+wasn't to guard notes — it was to stop the sync writing notes at all and give the
+machine value its own column (`xyleme_progress`). When a sync needs to surface a
+computed value, give it a field the sync owns end-to-end; never borrow a field a
+human also writes. Also: the machine string had three format variants, so the
+backfill keyed off the `Modules:` prefix, not a literal match. Same family as the
+8/11 and 8/12 fixes — and the third time this one script needed a per-field guard,
+which is why it now has a hard `assert_notes_untouched()` on every write payload.
