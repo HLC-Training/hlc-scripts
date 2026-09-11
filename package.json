@@ -1,0 +1,27 @@
+{
+  "name": "hlc-scripts",
+  "version": "1.0.0",
+  "description": "GitHub Actions automation for HLC Training operations.\r Replaces Windows Task Scheduler scripts previously running on ARGUS.",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HLC-Training/hlc-scripts.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/HLC-Training/hlc-scripts/issues"
+  },
+  "homepage": "https://github.com/HLC-Training/hlc-scripts#readme",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.116.0"
+  }
+}
