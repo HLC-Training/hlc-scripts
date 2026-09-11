@@ -48,6 +48,7 @@ weekdays 12:00 UTC (7:00 AM Houston, CDT).
 """
 
 import os
+import sys
 import html
 import logging
 import argparse
@@ -59,6 +60,10 @@ from ap_pending import (
     TERMINAL_STATUSES, is_fixture, in_episode, latest_episode_entries,
     classify_pending, row_is_reconciled, pick_tracker_row,
 )
+
+# Ensure stdout is UTF-8 encoded (safe on py3.7+; no-op where already utf-8)
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
 
 # ─── CONFIG ─────────────────────────────────────────────────────
 SUPABASE_URL         = "https://czdkctjbejnwuopigxta.supabase.co"
@@ -310,11 +315,8 @@ def reason_lines(r: dict, escaped: bool) -> list[str]:
     if not r['reasons']:
         return ["not yet captured"]
     fmt = esc if escaped else (lambda v: v if v not in (None, '') else '—')
-    # ASCII arrow on purpose — same reason as sync_ap.py's divergence
-    # rendering: this string is printed on Windows consoles (cp1252), which
-    # has no glyph for U+2192 and raises UnicodeEncodeError on print().
     return [
-        f"{fmt(e['field'])}: {fmt(e['old_value'])} -> {fmt(e['new_value'])} — {fmt(e['reason'])}"
+        f"{fmt(e['field'])}: {fmt(e['old_value'])} → {fmt(e['new_value'])} — {fmt(e['reason'])}"
         for e in r['reasons']
     ]
 
