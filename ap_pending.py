@@ -34,6 +34,19 @@ A row's flag clears iff every episode field is matched or tracker_newer.
 Rows flagged with NO episode entries (legacy flags, or an unlogged writer)
 fall back to the pre-existing whole-row rule in sync_ap.py, unchanged.
 
+Dirty mirror (2026-09-14, October full-AP review pilot — orion-pll decision
+2026-09-14-october-full-ap-review-pilot.md): the Ops-tab (AP-manager) save
+writes the STORED ap_tracker row itself, with orion_dirty=true and the
+written keys in orion_written_value, before the sheet has seen the value.
+Judged against that stored row a held field (Current Finish — dependency-
+controlled on the sheet, never pushed, bug 6b9c4342) reads as `matched`
+against ORiON's own write and would drop out of the digest while the sheet
+still holds the old date. So a field whose mirror key is in the row's
+orion_written_value while orion_dirty is set is `pending` — the mirror is
+carrying an un-echoed ORiON write, not the sheet's value. Only the digest
+ever passes a stored row here; sync_ap.py passes the fresh sheet capture
+(no orion_dirty key), so its judgement is unaffected.
+
 Blank tracker cells: a None tracker value counts as `matched` for every
 field except pc.description. This preserves bug ac29261e (wont_fix) — a
 blanked Smartsheet date releases the hold as "caught up" (source of truth
@@ -194,6 +207,33 @@ _PROJECTORS = {
 # the module docstring (ac29261e, 8/12 null-guard rulings).
 BLANK_IS_INTENT = {('pc', 'description')}
 
+# Module field -> the ap_tracker key the Ops-tab save stamps into
+# orion_written_value for it (orion-pll lib/ap-reconcile-rules.ts
+# MODULE_FIELD_BY_MIRROR_KEY, inverted). Only keys the app can write appear;
+# start_date is projected from start_date_only, which the app never writes,
+# so it has no entry on purpose.
+MIRROR_WRITE_KEY = {
+    ('delivery', 'due_date'):      'current_finish',
+    ('delivery', 'status'):        'overall_status',
+    ('pc', 'target_end_date'):     'current_finish',
+    ('pc', 'status'):              'overall_status',
+    ('pc', 'title'):               'improvement',
+    ('pc', 'description'):         'description',
+}
+
+
+def mirror_holds_unechoed_write(module: str, field: str, tracker_row: dict) -> bool:
+    """True when the STORED tracker row is dirty and its orion_written_value
+    carries this field's mirror key — i.e. the value in the row is ORiON's
+    own write awaiting the sheet's echo, not the sheet's value."""
+    if not tracker_row or not tracker_row.get('orion_dirty'):
+        return False
+    key = MIRROR_WRITE_KEY.get((module, field))
+    if key is None:
+        return False
+    written = tracker_row.get('orion_written_value') or {}
+    return isinstance(written, dict) and key in written
+
 _WS_RE = re.compile(r"\s+")
 
 
@@ -319,6 +359,9 @@ def classify_pending(module: str, tracker_row: dict | None, episode: dict,
     out = {}
     for field, entry in episode.items():
         if tracker_row is None:
+            out[field] = 'pending'
+            continue
+        if mirror_holds_unechoed_write(module, field, tracker_row):
             out[field] = 'pending'
             continue
         out[field] = classify_field(

@@ -34,7 +34,18 @@ Flow:
     next run with the same rule; this filter only keeps the two from
     disagreeing in the window between.
   - Fixtures never render: ap_pending.is_fixture() (AP-99xx range, "TEST
-    FIXTURE" titles) filters both sections.
+    FIXTURE" titles) filters every section.
+  - Master-tracker section (2026-09-14, October full-AP review pilot —
+    orion-pll decision 2026-09-14-october-full-ap-review-pilot.md): an
+    AP-manager edit of Current Finish on an AP with NO Delivery/P&C
+    projection has no module row to flag, so the app logs it against the
+    ap_tracker row itself (ap_change_log module 'ops', item_id = mirror id)
+    and the mirror's own orion_dirty stamp is the flag. This section lists
+    those rows — dirty mirror rows whose written key has a person-authored
+    ops entry with that exact value — with the same columns as the module
+    table. A dirty row with no such entry is an ordinary push awaiting its
+    echo and is not listed. Author-blind like the rest: the reason text is
+    the app's workflow wording ("Apply in Smartsheet …").
   - Removed-from-tracker section lists rows that are still OPEN in ORiON
     (the section's own wording) — a closed row that later dropped out of
     the sheet is not something Jen needs to review.
@@ -145,9 +156,11 @@ def fetch_tracker_rows(db, ap_numbers: set) -> dict:
     aps = sorted(a for a in ap_numbers if a)
     if not aps:
         return {}
+    # orion_dirty / orion_written_value feed ap_pending's dirty-mirror rule
+    # (a held Ops-tab write is `pending`, not `matched` against itself).
     cols = ('id, ap_number, is_parent, is_child, smartsheet_row_id, smartsheet_modified_at, '
             'last_synced_at, improvement, description, overall_status, sqdcgp, '
-            'start_date_only, current_finish')
+            'start_date_only, current_finish, orion_dirty, orion_written_value')
     by_ap: dict = {}
     for i in range(0, len(aps), 100):
         resp = db.table('ap_tracker').select(cols).in_('ap_number', aps[i:i + 100]).execute()
@@ -191,6 +204,66 @@ def reconcile_rows(rows: list[dict], reasons_by_item: dict, tracker_by_ap: dict)
         r['reasons'] = [e for e in entries if e.get('field') in open_fields]
         kept.append(r)
     return kept, dropped
+
+
+def fetch_master_pending_rows(db) -> list[dict]:
+    """Dirty ap_tracker rows carrying a person-authored 'ops' change-log
+    entry for a key they still hold as written — the Ops-only held-field
+    rail (module docstring). Returned in the module-row shape (module
+    'master', action_text, due_date, ap_pending_since, reasons) so the
+    rendering below is shared."""
+    resp = db.table('ap_tracker') \
+        .select('id, ap_number, improvement, overall_status, current_finish, original_finish, '
+                'owner_user_id, lead_display, smartsheet_row_id, orion_written_value, orion_written_at') \
+        .eq('orion_dirty', True) \
+        .execute()
+    dirty = resp.data or []
+    if not dirty:
+        return []
+    ids = [r['id'] for r in dirty]
+    log = db.table('ap_change_log').select('*').eq('module', 'ops').in_('item_id', ids).order('changed_at').execute()
+    by_item: dict = {}
+    for e in (log.data or []):
+        by_item.setdefault(e['item_id'], []).append(e)
+
+    rows = []
+    for r in dirty:
+        written = r.get('orion_written_value') or {}
+        if not isinstance(written, dict):
+            continue
+        reasons = held_mirror_entries(written, by_item.get(r['id'], []))
+        if not reasons:
+            continue
+        rows.append({
+            'id':                r['id'],
+            'module':            'master',
+            'ap_number':         r.get('ap_number'),
+            'action_text':       r.get('improvement') or r.get('ap_number') or '',
+            'status':            r.get('overall_status'),
+            'due_date':          r.get('current_finish'),
+            'original_due_date': r.get('original_finish'),
+            'ap_pending_since':  r.get('orion_written_at'),
+            'owner_id':          r.get('owner_user_id'),
+            'lead_display':      r.get('lead_display'),
+            'smartsheet_row_id': r.get('smartsheet_row_id'),
+            'reasons':           reasons,
+        })
+    return rows
+
+
+def held_mirror_entries(written: dict, ops_entries: list[dict]) -> list[dict]:
+    """For each key the mirror still holds as written, the latest 'ops'
+    entry a person wrote with that exact value (orion-pll
+    lib/ap-reconcile-rules.ts heldMirrorEntries — keep in step). Sync-
+    authored conflict/supersede rows (changed_by null) never qualify."""
+    out = []
+    for key, value in written.items():
+        matches = [e for e in ops_entries
+                   if e.get('field') == key and e.get('changed_by')
+                   and (e.get('new_value') or None) == (None if value in (None, '') else str(value))]
+        if matches:
+            out.append(max(matches, key=lambda e: e.get('changed_at') or ''))
+    return sorted(out, key=lambda e: e['field'])
 
 
 def fetch_orphaned_delivery_rows(db) -> list[dict]:
@@ -267,7 +340,7 @@ def enrich_rows(rows: list[dict], owner_names: dict, reasons_by_item: dict) -> l
         age_days = (now - pending_since).days if pending_since else None
         enriched.append({
             **r,
-            'owner_name':    owner_names.get(r.get('owner_id'), 'Unknown'),
+            'owner_name':    owner_names.get(r.get('owner_id')) or r.get('lead_display') or 'Unknown',
             'pending_since': pending_since,
             'age_days':      age_days,
             'flagged':       age_days is not None and age_days > AGE_CALLOUT_DAYS,
@@ -308,7 +381,11 @@ def enrich_orphans(rows: list[dict], owner_names: dict) -> list[dict]:
 
 
 def module_label(module: str) -> str:
-    return "P&C" if module == 'pc' else "Delivery"
+    if module == 'pc':
+        return "P&C"
+    if module == 'master':
+        return "Master tracker"
+    return "Delivery"
 
 
 def reason_lines(r: dict, escaped: bool) -> list[str]:
@@ -531,6 +608,8 @@ def main():
 
     pending_raw = [r for r in fetch_pending_delivery_rows(db) + fetch_pending_pc_rows(db) if _not_fixture(r)]
     orphan_raw  = [r for r in fetch_orphaned_delivery_rows(db) + fetch_orphaned_pc_rows(db) if _not_fixture(r)]
+    master_raw  = [r for r in fetch_master_pending_rows(db)
+                   if not is_fixture(r.get('ap_number'), r.get('action_text'), r.get('smartsheet_row_id'))]
 
     # Reconcile against the live tracker (shared rule with sync_ap.py).
     reasons_by_item = fetch_change_log_reasons(db, pending_raw)
@@ -539,6 +618,13 @@ def main():
     if reconciled:
         log.info(f"{len(reconciled)} flagged row(s) already reconciled or superseded in the tracker — omitted: "
                  + ", ".join(sorted(r['ap_number'] for r in reconciled)))
+    # Master-tracker rail: the mirror's dirty stamp is the flag; the sync
+    # clears it on echo. Nothing to reconcile against — the row IS the
+    # tracker copy, and its written value is by definition not on the sheet.
+    if master_raw:
+        log.info(f"{len(master_raw)} master-tracker row(s) holding an un-pushed AP-manager edit: "
+                 + ", ".join(sorted(str(r['ap_number']) for r in master_raw)))
+    rows = rows + master_raw
 
     # Removed-from-tracker: only rows still open in ORiON (the section says
     # so); a closed row that was later deleted from the sheet needs no review.
@@ -555,7 +641,9 @@ def main():
         return
 
     delivery_rows = [r for r in rows if r['module'] == 'delivery']
-    pc_rows = [r for r in rows if r['module'] == 'pc']
+    # master rows carry a portal_users id (ap_tracker.owner_user_id) — same
+    # roster as P&C owners.
+    pc_rows = [r for r in rows if r['module'] in ('pc', 'master')]
     delivery_owner_ids = {r['owner_id'] for r in delivery_rows + [o for o in orphan_rows if o['module'] == 'delivery'] if r.get('owner_id')}
     pc_owner_ids = {r['owner_id'] for r in pc_rows + [o for o in orphan_rows if o['module'] == 'pc'] if r.get('owner_id')}
     owner_names = fetch_owner_names(db, delivery_owner_ids, pc_owner_ids)

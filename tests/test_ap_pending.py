@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from ap_pending import (  # noqa: E402
     classify_field, classify_pending, latest_episode_entries, row_is_reconciled,
     is_fixture, pick_tracker_row, project_tracker_field, NOT_COMPARABLE,
-    in_episode, EPISODE_SKEW_SECONDS,
+    in_episode, EPISODE_SKEW_SECONDS, mirror_holds_unechoed_write,
 )
 
 EDIT_AT = "2026-09-01T14:37:28.512976+00:00"
@@ -148,6 +148,32 @@ def test_pick_tracker_row_prefers_shape_then_freshness():
     assert pick_tracker_row([parent, child_stale, child_live], pure_parent=False) is child_live   # AP-214-8-1 case
     assert pick_tracker_row([parent, child_stale, child_live], pure_parent=True) is parent        # AP-036 twins
     assert pick_tracker_row([], pure_parent=False) is None
+
+
+def test_dirty_mirror_holds_the_orion_write_so_the_field_stays_pending():
+    # 2026-09-14 October pilot: the Ops-tab save writes the STORED mirror row
+    # (current_finish = the new date, orion_dirty, written key) — judged
+    # against itself the held field would read `matched` and vanish from the
+    # digest while the sheet still holds the old date.
+    t = tracker(current_finish='2026-10-31', orion_dirty=True,
+                orion_written_value={'current_finish': '2026-10-31'})
+    episode = {'due_date': entry('due_date', '2026-10-31', old_value='2026-10-15')}
+    states = classify_pending('delivery', t, episode, lambda _f, e: e['new_value'])
+    assert states == {'due_date': 'pending'}
+    assert not row_is_reconciled(states)
+    # Same row, P&C shape.
+    states = classify_pending('pc', t, {'target_end_date': entry('target_end_date', '2026-10-31')},
+                              lambda _f, e: e['new_value'])
+    assert states == {'target_end_date': 'pending'}
+    # A field the write did NOT touch is judged normally (status matches the sheet copy).
+    states = classify_pending('delivery', t, {'status': entry('status', 'Open')}, lambda _f, e: e['new_value'])
+    assert states == {'status': 'matched'}
+    # Once the sync echoes (dirty cleared), the same values settle as matched.
+    assert classify_pending('delivery', tracker(current_finish='2026-10-31'), episode,
+                            lambda _f, e: e['new_value']) == {'due_date': 'matched'}
+    # The sheet capture sync_ap.py passes carries no orion_dirty key — never affected.
+    assert not mirror_holds_unechoed_write('delivery', 'due_date', tracker(current_finish='2026-10-31'))
+    assert not mirror_holds_unechoed_write('delivery', 'start_date', t)   # start_date_only is never app-written
 
 
 if __name__ == '__main__':
