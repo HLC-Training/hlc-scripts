@@ -42,7 +42,17 @@ grouped by TPM owner, with up to six sections:
      "+N more" line, same convention as Overdue / Approaching Stale. This
      section ships behind the same TEST-mode gate as the rest of this
      digest — inert (renders to Jim only) until Jim flips TPM_DIGEST_LIVE.
-If every TPM is empty across all five sections, NO email is sent —
+  6. "AP date changes awaiting acknowledgment" — per TPM, the top-level
+     APs whose end date moved in the Action Plan Tracker
+     (ap_end_date_changes, written by sync_ap.py) that the TPM has not
+     acknowledged in ORiON (ap_end_date_acks), over their non-terminal
+     projects. One line per AP (latest old → new, "+N earlier"),
+     uncapped, grouped by TPM like every other section. Rendered right
+     after "Awaiting your review". Points back to ORiON's P&C banner —
+     deliberately NO email-side ack and NO tokenized link (bug ca9beaeb
+     Phase 3, 2026-09-14; SAM COS 5bd11694). Shared data layer:
+     ap_date_acks.py (same rule as the PLL digest and the in-app banner).
+If every TPM is empty across all seven sections, NO email is sent —
 there is nothing here for the once-a-day habit to protect.
 
 Nothing is ever sent to a TPM. Michele is the sole live recipient; Jim
@@ -110,6 +120,8 @@ from zoneinfo import ZoneInfo
 from supabase import create_client
 
 from ge_holidays import send_decision
+from ap_date_acks import (fetch_unacked_ap_date_changes, ap_change_label,
+                          ap_change_meta_text)
 
 # ─── CONFIG ─────────────────────────────────────────────────────
 SUPABASE_URL = "https://czdkctjbejnwuopigxta.supabase.co"
@@ -273,10 +285,12 @@ def business_days_since(raw_ts: str, today: date) -> int:
 # ─── DIGEST ASSEMBLY ────────────────────────────────────────────
 def build_digest(tpm: dict, projects: list[dict], approaching_items: list[dict],
                  incomplete_items: list[dict],
-                 watermark: datetime, today: date) -> dict | None:
-    """Five sections for one TPM; None if all empty."""
+                 watermark: datetime, today: date,
+                 unacked_ap_changes: dict[str, list[dict]] | None = None) -> dict | None:
+    """Seven sections for one TPM; None if all empty."""
     own = [p for p in projects
            if p['owner_id'] == tpm['id'] and p.get('status') not in DONE_STATUSES]
+    own_ap_changes = (unacked_ap_changes or {}).get(tpm['id'], [])
     own_approaching = [p for p in approaching_items if p['owner_id'] == tpm['id']]
     own_incomplete = [p for p in incomplete_items if p['owner_id'] == tpm['id']]
 
@@ -314,12 +328,13 @@ def build_digest(tpm: dict, projects: list[dict], approaching_items: list[dict],
     )
 
     if not new_items and not due_soon and not overdue_all and not approaching_all \
-            and not incomplete_all and not pending_review:
+            and not incomplete_all and not pending_review and not own_ap_changes:
         return None
 
     return {
         'tpm':                  tpm,
         'pending_review':       pending_review,
+        'ap_date_changes':      own_ap_changes,
         'new_items':            new_items,
         'due_soon':             due_soon,
         'overdue':              overdue_all[:OVERDUE_CAP],
@@ -439,6 +454,48 @@ def incomplete_blocks(results: list[dict]) -> list[str]:
     return blocks
 
 
+# Point-back link only — a plain, un-tokenized URL to the module whose
+# banner carries the Acknowledge button. Never an email-side ack.
+AP_ACK_URL = f"{ORION_URL}/pc/projects"
+
+
+def ap_change_row_html(entry: dict, zebra: bool) -> str:
+    bg = f'background-color:{ZEBRA};' if zebra else ''
+    meta = (f"End date moved <strong>{fmt_date(entry['old_end_date'])} &rarr; "
+            f"{fmt_date(entry['new_end_date'])}</strong>")
+    if entry['earlier']:
+        meta += (f" &middot; +{entry['earlier']} earlier change"
+                 f"{'s' if entry['earlier'] > 1 else ''}, acknowledged together")
+    meta += f" &middot; {entry['rows']} of their project{'s' if entry['rows'] != 1 else ''}"
+    return (
+        f'<tr><td style="{bg}padding:8px 14px 8px 28px;border-bottom:1px solid {BORDER};'
+        f'font-family:{FONT};font-size:14px;color:{NIGHT};line-height:1.4;">'
+        f'{esc(ap_change_label(entry))}'
+        f'<br><span style="font-size:12px;color:{MUTED};">{meta}</span>'
+        f'</td></tr>'
+    )
+
+
+def ap_change_blocks(results: list[dict]) -> list[str]:
+    """One tpm_group_html block per TPM with outstanding AP date acks."""
+    blocks = []
+    for r in results:
+        d = r['digest']
+        if d is None or not d.get('ap_date_changes'):
+            continue
+        rows = [ap_change_row_html(e, idx % 2 == 1)
+                for idx, e in enumerate(d['ap_date_changes'])]
+        blocks.append(tpm_group_html(r['tpm']['name'], rows))
+    if blocks:
+        blocks.append(
+            f'<tr><td style="padding:8px 14px 0 28px;font-family:{FONT};font-size:13px;'
+            f'color:{MUTED};">Owners acknowledge in ORiON: '
+            f'<a href="{AP_ACK_URL}" target="_blank" style="color:{ION_INK};">'
+            f'{AP_ACK_URL}</a></td></tr>'
+        )
+    return blocks
+
+
 def section_blocks(results: list[dict], key: str, meta_fn) -> list[str]:
     """One tpm_group_html block per TPM that has items in this section."""
     blocks = []
@@ -486,6 +543,11 @@ def build_html_body(results: list[dict], today: date, questions_count: int = 0) 
             intro="Submissions waiting on your approve or reject decision "
                   "&mdash; the same queue as the ORiON inbox, with the same "
                   "wait the submitter sees."),
+        section_html("AP date changes awaiting acknowledgment", ap_change_blocks(results),
+            intro="The Action Plan Tracker moved these APs&rsquo; end dates &mdash; nobody "
+                  "in ORiON made the change. Each owner sees the same list on a banner at "
+                  "the top of P&amp;C and clears it with one <strong>Acknowledge</strong> "
+                  "per AP; until then their status changes on those projects are held."),
         section_html("New projects", section_blocks(
             results, 'new_items',
             lambda p: f"Logged {fmt_logged(p['created_at'])} &middot; {esc(p.get('status'))}"
@@ -616,6 +678,32 @@ def incomplete_text_section(results: list[dict]) -> list[str]:
     return lines
 
 
+def ap_change_text_section(results: list[dict]) -> list[str]:
+    heading = "AP date changes awaiting acknowledgment"
+    lines = []
+    any_block = False
+    for r in results:
+        d = r['digest']
+        if d is None or not d.get('ap_date_changes'):
+            continue
+        if not any_block:
+            lines.append(heading)
+            lines.append("-" * len(heading))
+            lines.append("The Action Plan Tracker moved these APs' end dates -- nobody in "
+                         "ORiON made the change. Each owner sees the same list on a banner "
+                         "at the top of P&C and clears it with one Acknowledge per AP; "
+                         "until then their status changes on those projects are held.")
+            any_block = True
+        lines.append(f"{r['tpm']['name']}:")
+        for e in d['ap_date_changes']:
+            lines.append(f"  - {ap_change_label(e)}")
+            lines.append(f"      {ap_change_meta_text(e, fmt_date).replace('of your item', 'of their project')}")
+    if any_block:
+        lines.append(f"Owners acknowledge in ORiON: {AP_ACK_URL}")
+        lines.append("")
+    return lines
+
+
 def build_text_body(results: list[dict], today: date, questions_count: int = 0) -> str:
     lines = [
         "Hi Michele, here's where your team's P&C projects stand this morning "
@@ -635,6 +723,7 @@ def build_text_body(results: list[dict], today: date, questions_count: int = 0) 
                           intro="Submissions waiting on your approve or reject decision "
                                 "-- the same queue as the ORiON inbox, with the same "
                                 "wait the submitter sees.")
+    lines += ap_change_text_section(results)
     lines += text_section("New projects", results, 'new_items',
                           lambda p: f"Logged {fmt_logged(p['created_at'])} | {p.get('status')}")
     lines += text_section("Coming up in the next two weeks", results, 'due_soon',
@@ -743,6 +832,8 @@ def main():
         approaching = fetch_approaching(db, [t['id'] for t in tpms])
         incomplete = fetch_incomplete(db, [t['id'] for t in tpms])
         questions_count = fetch_recipient_open_questions(db, MICHELE_EMAIL)
+        unacked_ap_changes = fetch_unacked_ap_date_changes(
+            db, [t['id'] for t in tpms], 'pc_projects', sorted(DONE_STATUSES))
         watermark = fetch_state(db)
     except Exception as e:
         log.error(f"Supabase fetch failed — aborting without sending: {e}")
@@ -752,7 +843,8 @@ def main():
         watermark = now_chicago.astimezone(timezone.utc) - timedelta(hours=FALLBACK_WINDOW_HOURS)
         log.info(f"No watermark row — fallback window since {watermark.isoformat()}.")
 
-    results = [{'tpm': t, 'digest': build_digest(t, projects, approaching, incomplete, watermark, today)} for t in tpms]
+    results = [{'tpm': t, 'digest': build_digest(t, projects, approaching, incomplete, watermark, today,
+                                                 unacked_ap_changes)} for t in tpms]
     to_report = [r for r in results if r['digest'] is not None]
     log.info(f"{len(tpms)} TPMs — {len(to_report)} with items to report, "
              f"{len(tpms) - len(to_report)} suppressed (no items).")
@@ -806,6 +898,7 @@ def _advance_watermark(db, watermark: datetime, live: bool, results: list[dict],
                     'due_soon': len(r['digest']['due_soon']),
                     'overdue':  len(r['digest']['overdue']),
                     'overflow': r['digest']['overdue_overflow'],
+                    'ap_date_changes': len(r['digest'].get('ap_date_changes', [])),
                 }
             ) for r in results
         },

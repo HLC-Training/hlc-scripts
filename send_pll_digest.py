@@ -27,7 +27,16 @@ ORiON-branded email with up to five sections:
      the predicate). Closed rows (status = 'Done') excluded, matching the
      in-app Mechanism 2 prompt exactly. Capped at 5 with a "+N more" line,
      same convention as Past due / Approaching Stale.
-A PLL with zero items across all five sections gets NO email.
+  6. "AP date changes awaiting your acknowledgment" — top-level APs
+     whose end date moved in the Action Plan Tracker (ap_end_date_changes,
+     written by sync_ap.py) that this PLL has not acknowledged in ORiON
+     (ap_end_date_acks), over their non-Done rows. One line per AP, latest
+     old → new plus "+N earlier". Rendered FIRST and uncapped: it is the
+     one section asking for a click. Points back to ORiON's Delivery
+     banner to acknowledge — deliberately NO email-side ack and NO
+     tokenized link (bug ca9beaeb Phase 3, 2026-09-14; the section deferred
+     from 1d039530 as SAM COS 5bd11694). Shared data layer: ap_date_acks.py.
+A PLL with zero items across all six sections gets NO email.
 Jim gets one consolidated roll-up per run (not a cc on each email),
 including per-PLL Approaching counts.
 
@@ -76,6 +85,8 @@ from zoneinfo import ZoneInfo
 from supabase import create_client
 
 from ge_holidays import HOLIDAYS, send_decision
+from ap_date_acks import (fetch_unacked_ap_date_changes, ap_change_label,
+                          ap_change_meta_text)
 
 # ─── CONFIG ─────────────────────────────────────────────────────
 SUPABASE_URL = "https://czdkctjbejnwuopigxta.supabase.co"
@@ -237,9 +248,11 @@ def parse_date(raw) -> date | None:
 # ─── DIGEST ASSEMBLY ────────────────────────────────────────────
 def build_digest(pll: dict, items: list[dict], approaching_items: list[dict],
                  incomplete_items: list[dict], questions_count: int,
-                 watermark_date: date, prev_section1_ids: set, today: date) -> dict | None:
-    """Six sections for one PLL; None if all empty (→ no email)."""
+                 watermark_date: date, prev_section1_ids: set, today: date,
+                 unacked_ap_changes: dict[str, list[dict]] | None = None) -> dict | None:
+    """Seven sections for one PLL; None if all empty (→ no email)."""
     own = [i for i in items if i['owner_id'] == pll['id']]
+    own_ap_changes = (unacked_ap_changes or {}).get(pll['id'], [])
     own_approaching = [i for i in approaching_items if i['owner_id'] == pll['id']]
     own_incomplete = [i for i in incomplete_items if i['owner_id'] == pll['id']]
 
@@ -270,12 +283,13 @@ def build_digest(pll: dict, items: list[dict], approaching_items: list[dict],
     incomplete_all = sorted(own_incomplete, key=lambda i: i['title'])
 
     if (not new_items and not due_soon and not overdue_all and not approaching_all
-            and not incomplete_all and questions_count == 0):
+            and not incomplete_all and questions_count == 0 and not own_ap_changes):
         return None
 
     return {
         'pll':                  pll,
         'questions_count':      questions_count,
+        'ap_date_changes':      own_ap_changes,
         'new_items':            new_items,
         'due_soon':             due_soon,
         'overdue':              overdue_all[:OVERDUE_CAP],
@@ -364,6 +378,28 @@ def section_html(heading: str, rows: list[str], extra_row: str = '', intro: str 
     )
 
 
+def ap_change_row_html(entry: dict, zebra: bool) -> str:
+    bg = f'background-color:{ZEBRA};' if zebra else ''
+    meta = (f"End date moved <strong>{fmt_date(entry['old_end_date'])} &rarr; "
+            f"{fmt_date(entry['new_end_date'])}</strong>")
+    if entry['earlier']:
+        meta += (f" &middot; +{entry['earlier']} earlier change"
+                 f"{'s' if entry['earlier'] > 1 else ''}, acknowledged together")
+    meta += f" &middot; {entry['rows']} of your item{'s' if entry['rows'] != 1 else ''}"
+    return (
+        f'<tr><td style="{bg}padding:10px 14px;border-bottom:1px solid {BORDER};'
+        f'font-family:{FONT};font-size:14px;color:{NIGHT};line-height:1.4;">'
+        f'{esc(ap_change_label(entry))}'
+        f'<br><span style="font-size:12px;color:{MUTED};">{meta}</span>'
+        f'</td></tr>'
+    )
+
+
+# Point-back link only — a plain, un-tokenized URL to the module whose
+# banner carries the Acknowledge button. Never an email-side ack.
+AP_ACK_URL = f"{ORION_URL}/delivery/actions"
+
+
 def build_html_body(digest: dict, today: date) -> str:
     pll = digest['pll']
     greeting = (
@@ -374,6 +410,21 @@ def build_html_body(digest: dict, today: date) -> str:
     )
 
     sections = []
+    if digest.get('ap_date_changes'):
+        rows = [ap_change_row_html(e, idx % 2 == 1)
+                for idx, e in enumerate(digest['ap_date_changes'])]
+        extra = (
+            f'<tr><td style="padding:10px 14px;font-family:{FONT};font-size:13px;'
+            f'color:{MUTED};">Acknowledge in ORiON: '
+            f'<a href="{AP_ACK_URL}" target="_blank" style="color:{ION_INK};">'
+            f'{AP_ACK_URL}</a></td></tr>'
+        )
+        sections.append(section_html(
+            "AP date changes awaiting your acknowledgment", rows, extra,
+            intro="The Action Plan Tracker moved these APs&rsquo; end dates. Nobody in "
+                  "ORiON made the change &mdash; open Delivery and click "
+                  "<strong>Acknowledge</strong> on the banner at the top so it&rsquo;s "
+                  "confirmed you&rsquo;ve seen it. That&rsquo;s all it asks."))
     if digest['new_items']:
         rows = [
             item_row_html(
@@ -507,6 +558,17 @@ def build_text_body(digest: dict, today: date) -> str:
         "or something's already wrapped up, updating it in ORiON keeps this list honest.",
         "",
     ]
+    if digest.get('ap_date_changes'):
+        lines.append("AP date changes awaiting your acknowledgment")
+        lines.append("-" * 44)
+        lines.append("The Action Plan Tracker moved these APs' end dates. Nobody in ORiON "
+                     "made the change -- open Delivery and click Acknowledge on the banner "
+                     "at the top so it's confirmed you've seen it. That's all it asks.")
+        for e in digest['ap_date_changes']:
+            lines.append(f"- {ap_change_label(e)}")
+            lines.append(f"    {ap_change_meta_text(e, fmt_date)}")
+        lines.append(f"Acknowledge in ORiON: {AP_ACK_URL}")
+        lines.append("")
     if digest['new_items']:
         lines.append("Added since your last update")
         lines.append("-" * 28)
@@ -708,6 +770,8 @@ def main():
         approaching = fetch_approaching(db, [p['id'] for p in plls])
         incomplete = fetch_incomplete(db, [p['id'] for p in plls])
         open_questions = fetch_open_questions_by_email(db)
+        unacked_ap_changes = fetch_unacked_ap_date_changes(
+            db, [p['id'] for p in plls], 'action_items', ['Done'])
         watermark, prev_section1_ids = fetch_state(db)
     except Exception as e:
         log.error(f"Supabase fetch failed — aborting without sending: {e}")
@@ -723,7 +787,8 @@ def main():
     for pll in plls:
         questions_count = open_questions.get((pll.get('email') or '').lower(), 0)
         digest = build_digest(pll, items, approaching, incomplete, questions_count,
-                              watermark_date, prev_section1_ids, today)
+                              watermark_date, prev_section1_ids, today,
+                              unacked_ap_changes)
         results.append({'pll': pll, 'digest': digest, 'result': None})
 
     to_send = [r for r in results if r['digest'] is not None]
@@ -780,6 +845,7 @@ def main():
                     'due_soon': len(r['digest']['due_soon']),
                     'overdue':  len(r['digest']['overdue']),
                     'overflow': r['digest']['overdue_overflow'],
+                    'ap_date_changes': len(r['digest'].get('ap_date_changes', [])),
                 }
             ) for r in results
         },
