@@ -908,3 +908,19 @@ data proof is `gh workflow run <digest>.yml -f dry_run=true -f
 force_date_gate=true` against main and reading the run log — dry-run sends
 nothing and writes no state. Push first: `workflow_dispatch` runs the ref's
 committed code, not the working tree.
+
+**Update, same day — cause confirmed and resolved:** the blocker was Windows
+**Smart App Control** (SAC), not a generic/unnamed "Application Control"
+policy — SAC's binary-signature allowlist was rejecting `_cffi_backend`'s
+compiled extension. Disabling SAC on HERMES (2026-09-14) fixed the import:
+`& (Get-Command python).Source -c "import supabase; print(supabase.__version__)"`
+now prints `2.31.0` and local `--dry-run` runs work directly, including
+against live ORiON data — no more stub-and-Actions detour needed on this
+machine going forward. Two things to hold onto: (1) **disabling SAC is
+one-way** — Microsoft does not offer a re-enable path short of a clean
+Windows reinstall, so this was not a reversible toggle; (2) that makes it a
+**standing security-posture tradeoff**, not merely a Python fix — HERMES is
+a GE-issued machine, and SAC being off is now a permanent property of this
+box, worth knowing before assuming any other machine's Python behaves the
+same way. The stub-module render-test technique above is still the right
+move on any machine where SAC (or an equivalent control) is still on.
