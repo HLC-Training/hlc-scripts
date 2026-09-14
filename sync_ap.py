@@ -32,9 +32,21 @@ Flow:
     population's widening is deferred.
   - ALL statuses project, Complete/Cancelled included — ORiON is becoming
     the system of record and holds terminal history.
-  - In-scope rows (the ones that route to a module, or that already hold a
-    module row) land FIRST in the ap_tracker mirror table (full-row shape,
-    keyed on smartsheet_row_id — decision 69ba45bd, 2026-08-26); the module
+  - EVERY AP-numbered row lands FIRST in the ap_tracker mirror table —
+    the ORiON master AP table (full-row shape, keyed on smartsheet_row_id —
+    decision 69ba45bd, 2026-08-26; widened from in-scope-families-only to
+    the whole tracker 2026-09-14, Phase 4 master, decision doc
+    orion-pll/knowledge/decisions/2026-09-14-master-ap-table-phase4.md).
+    Family scoping below decides only which rows PROJECT into the module
+    tables; it no longer decides what mirrors. Each mirror row also
+    carries Smartsheet's own parentId (smartsheet_parent_row_id — the
+    machine nesting key; ap_number is a display label and is NOT unique:
+    AP-036/AP-174 are parent+child twins) and the lead resolved to a
+    portal_users id across every role (owner_user_id / owner_email, via
+    the same resolve_lead_email the module routing uses) plus the module
+    routing outcome (owner_resolution). A row whose sheet facts are
+    unchanged since the last run is skipped, not rewritten (the
+    every-row-rewrites class, bug adee6b56). The module
     tables below are projections of that landing zone. The mirror carries
     the loop-prevention state (orion_written_value/orion_written_at/
     orion_dirty + the row-level Smartsheet modifiedAt) for the future
@@ -592,6 +604,10 @@ def build_mirror_capture(row: dict, cells: dict, raw: dict, display_raw: dict) -
     return {
         'smartsheet_row_id':     row.get('id'),
         'smartsheet_row_number': row.get('rowNumber'),
+        # Smartsheet's own parentId — the parent row's PERMANENT id (the
+        # nesting key; NULL on top-level rows). The sheet's "Parent ID" /
+        # "ParentID" text columns below are formula display text, not keys.
+        'smartsheet_parent_row_id': row.get('parentId'),
         'smartsheet_created_at': row.get('createdAt'),
         # Row-level modifiedAt — the loop-prevention timestamp (decision
         # e217604f at row grain; cell-level modified time is not in the
@@ -742,6 +758,38 @@ def check_and_flag_wip_overages(db, owner_ids: set, log) -> int:
 
 
 # ─── AP TRACKER MIRROR (Ops Phase 2 foundation) ─────────────────
+# Mirror payload keys that are sync bookkeeping, not sheet facts — never
+# part of the "did the row change" comparison (re-stamped on every write).
+MIRROR_SYNC_STATE_KEYS = frozenset({
+    'orion_dirty', 'orion_written_value', 'orion_written_at', 'last_synced_at',
+})
+# timestamptz columns: Smartsheet hands back '...Z', Postgres hands back
+# '...+00:00' — compared as parsed datetimes, never as strings (the same
+# trap parse_iso_ts exists for in the loop-prevention comparison).
+MIRROR_TS_KEYS = frozenset({
+    'smartsheet_created_at', 'smartsheet_modified_at', 'created_at_cell', 'modified_at_cell',
+})
+
+
+def mirror_row_changed(existing: dict, payload: dict) -> bool:
+    """True iff any sheet-fact key in payload differs from the stored
+    ap_tracker row. Phase 4 master (2026-09-14): the mirror used to
+    rewrite every candidate every run — bug adee6b56's class
+    (sync_xyleme rewrote every owned row, so its rows could never look
+    stale). A key the stored row lacks (a column added by migration
+    before the sync learned it) reads as changed, so it gets written."""
+    for k, v in payload.items():
+        if k in MIRROR_SYNC_STATE_KEYS:
+            continue
+        ev = existing.get(k)
+        if k in MIRROR_TS_KEYS:
+            if parse_iso_ts(v) != parse_iso_ts(ev):
+                return True
+        elif v != ev:
+            return True
+    return False
+
+
 def plan_mirror_writes(existing_mirror: dict, mirror_candidates: dict, dry_run: bool):
     """
     Loop-prevention planner for the ap_tracker mirror (decision e217604f:
@@ -761,22 +809,30 @@ def plan_mirror_writes(existing_mirror: dict, mirror_candidates: dict, dry_run: 
           * fields differ but Smartsheet is NOT newer -> Smartsheet hasn't
             seen the ORiON write yet: PROTECT — skip the upsert entirely,
             keep the dirty flag.
-      - anything else -> plain upsert; the payload carries
-        orion_dirty=false / orion_written_* = null, which is a no-op for
-        rows that were never dirty. (Known Phase 2 limit: a dirty stamp
-        landing between this run's read and write would be cleared — the
-        live ORiON write path arrives in the second brief, which owns
-        closing that race.)
+      - existing row, not dirty, every sheet fact identical to what's
+        stored (mirror_row_changed False) -> UNCHANGED: no write at all
+        (Phase 4, 2026-09-14 — the idempotency gate: a second run against
+        an unchanged sheet must write 0 rows). last_synced_at therefore
+        means "when the sync last WROTE this row", not "last run"; row
+        liveness is the prune's job (presence in the fetch), never this
+        stamp. existing_mirror must carry the FULL row for this — main()
+        loads select('*').
+      - anything else (new row, or changed facts) -> plain upsert; the
+        payload carries orion_dirty=false / orion_written_* = null, which
+        is a no-op for rows that were never dirty. (Known Phase 2 limit: a
+        dirty stamp landing between this run's read and write would be
+        cleared — the live ORiON write path arrived in the second brief,
+        which owns closing that race.)
 
     Returns (to_upsert, conflict_rows, conflicted_row_ids, echo_cleared,
-    conflicts_ingested, protected_pending). conflicted_row_ids maps the
-    conflict rows back to their mirror payloads: the write phase inserts
-    conflict rows BEFORE the upserts, and on a failed conflict insert it
-    withholds those rows' upserts so the dirty state (and therefore the
-    conflict evidence) survives to the next run — same events-before-titles
-    ordering discipline as the end-date capture below (a cleared flag with
-    no logged conflict is a lost record; a duplicate conflict row on retry
-    is absorbable).
+    conflicts_ingested, protected_pending, unchanged). conflicted_row_ids
+    maps the conflict rows back to their mirror payloads: the write phase
+    inserts conflict rows BEFORE the upserts, and on a failed conflict
+    insert it withholds those rows' upserts so the dirty state (and
+    therefore the conflict evidence) survives to the next run — same
+    events-before-titles ordering discipline as the end-date capture below
+    (a cleared flag with no logged conflict is a lost record; a duplicate
+    conflict row on retry is absorbable).
     """
     to_upsert       = []
     conflict_rows   = []
@@ -784,6 +840,7 @@ def plan_mirror_writes(existing_mirror: dict, mirror_candidates: dict, dry_run: 
     echo_cleared    = 0
     conflicts_ingested = 0
     protected_pending  = 0
+    unchanged          = 0
     now_iso = datetime.now(timezone.utc).isoformat()
 
     for row_id in sorted(mirror_candidates):
@@ -830,6 +887,9 @@ def plan_mirror_writes(existing_mirror: dict, mirror_candidates: dict, dry_run: 
                     if dry_run:
                         print(f"[DRY RUN] PROTECT  {str(ap_num):14} mirror — ORiON write pending mirror-out, row skipped")
                     continue
+        elif ex is not None and not mirror_row_changed(ex, payload):
+            unchanged += 1
+            continue
 
         payload['orion_dirty']         = False
         payload['orion_written_value'] = None
@@ -837,8 +897,8 @@ def plan_mirror_writes(existing_mirror: dict, mirror_candidates: dict, dry_run: 
         payload['last_synced_at']      = now_iso
         to_upsert.append(payload)
 
-    return to_upsert, conflict_rows, conflicted_row_ids, echo_cleared, conflicts_ingested, protected_pending
-
+    return (to_upsert, conflict_rows, conflicted_row_ids, echo_cleared,
+            conflicts_ingested, protected_pending, unchanged)
 
 def prune_stale_mirror_rows(db, existing_mirror: dict, all_sheet_row_ids: set,
                             fetch_complete: bool, mirror_load_failed: bool) -> tuple[int, bool]:
@@ -1252,7 +1312,8 @@ def build_sync_accounting(*, child_tasks_total, inserted_delivery, updated_deliv
                           date_baselines, date_events_detected, date_events_written,
                           date_events_skipped_inactive,
                           title_capture_failed,
-                          mirror_candidates_total, mirror_upserted, mirror_echo_cleared,
+                          mirror_candidates_total, mirror_upserted, mirror_unchanged,
+                          mirror_echo_cleared,
                           mirror_conflicts_ingested, mirror_protected_pending,
                           mirror_conflict_rows_logged, mirror_failed):
     """
@@ -1316,11 +1377,13 @@ def build_sync_accounting(*, child_tasks_total, inserted_delivery, updated_deliv
         # counted once.
         'split_projection': split_projection,
         # Third stream (Ops Phase 2): the ap_tracker mirror landing. Its own
-        # identity — candidates = upserted + protected_pending (+ failed);
-        # echo/conflict counts are overlays on upserted rows, never terms.
+        # identity — candidates = upserted + unchanged + protected_pending
+        # (+ failed); echo/conflict counts are overlays on upserted rows,
+        # never terms. mirror_unchanged added Phase 4 (2026-09-14).
         'mirror': {
             'mirror_candidates_total':     mirror_candidates_total,
             'mirror_upserted':             mirror_upserted,
+            'mirror_unchanged':            mirror_unchanged,
             'mirror_echo_cleared':         mirror_echo_cleared,
             'mirror_conflicts_ingested':   mirror_conflicts_ingested,
             'mirror_protected_pending':    mirror_protected_pending,
@@ -1408,6 +1471,17 @@ def main(dry_run: bool = False):
         director_email_to_id = {
             p['email'].strip().lower(): p['id']
             for p in portal_resp.data if p.get('email') and p.get('role') == 'director'
+        }
+        # Master owner attribution (Phase 4, 2026-09-14): the ap_tracker
+        # master is unfiltered by module, so its owner lookup is unfiltered
+        # by role — EVERY portal_users row with an email (pll, tpm, director,
+        # ops, tdm, cpm, executive; the 29 Phase 1 accounts included). This
+        # map feeds ONLY ap_tracker.owner_user_id; module routing (which
+        # table a row projects into, and whose ownership rules apply there)
+        # stays on the role-narrowed maps above via resolve_owner.
+        portal_any_email_to_id = {
+            p['email'].strip().lower(): p['id']
+            for p in portal_resp.data if p.get('email')
         }
         log.info(f"Portal users loaded: {len(portal_email_to_id)} eligible (tpm), "
                 f"{len(director_email_to_id)} eligible (director) of {len(portal_resp.data)} total")
@@ -1540,12 +1614,29 @@ def main(dry_run: bool = False):
     mirror_load_failed = False
     existing_mirror = {}
     try:
-        mirror_resp = db.table('ap_tracker') \
-            .select('id, smartsheet_row_id, ap_number, orion_dirty, orion_written_value, orion_written_at') \
-            .execute()
+        # FULL rows (select('*')) — plan_mirror_writes diffs every sheet
+        # fact against the stored row to skip unchanged rows (Phase 4).
+        # Paginated: PostgREST caps a response at 1000 rows and the master
+        # now holds the whole tracker (834 rows on 2026-09-14, growing);
+        # a silently truncated load would miss dirty state on the rows
+        # past the cap and write over a pending ORiON edit.
+        mirror_rows = []
+        _page_size = 1000
+        _offset = 0
+        while True:
+            mirror_resp = db.table('ap_tracker') \
+                .select('*') \
+                .order('smartsheet_row_id') \
+                .range(_offset, _offset + _page_size - 1) \
+                .execute()
+            _chunk = mirror_resp.data or []
+            mirror_rows.extend(_chunk)
+            if len(_chunk) < _page_size:
+                break
+            _offset += _page_size
         existing_mirror = {
             r['smartsheet_row_id']: r
-            for r in (mirror_resp.data or [])
+            for r in mirror_rows
             if r.get('smartsheet_row_id') is not None
         }
         log.info(f"Existing ap_tracker mirror rows: {len(existing_mirror)}")
@@ -1662,10 +1753,10 @@ def main(dry_run: bool = False):
     planned_primary_insert = {'delivery': 0, 'pc': 0}
     planned_primary_update = {'delivery': 0, 'pc': 0}
     sec_planned = {'insert': 0, 'update': 0, 'unchanged': 0, 'clear_pending': 0, 'skip_pending': 0}
-    # ap_tracker landing set: every row of every in-scope family/standalone
-    # (2026-08-27 widening — the mirror holds the complete in-scope tree),
-    # plus any out-of-scope row that still holds a module row (legacy
-    # close/settle set). Keyed by smartsheet_row_id.
+    # ap_tracker landing set — since Phase 4 (2026-09-14) EVERY AP-numbered
+    # row, filled in the routing pre-pass below. Before that: in-scope
+    # families only (2026-08-27 widening) plus out-of-scope rows that still
+    # held a module row. Keyed by smartsheet_row_id.
     mirror_candidates = {}
     unmapped_leads       = set()
     ambiguous_leads      = set()
@@ -1708,6 +1799,18 @@ def main(dry_run: bool = False):
         task['owner_id'] = owner_id
         if task['family'] and destination in ('delivery', 'pc') and not via_director:
             fam_modules[task['family']].add(destination)
+        # Master owner attribution (Phase 4): same resolved lead email the
+        # routing above used, looked up across every portal_users role;
+        # the routing outcome rides along so Ops can see WHY a row has no
+        # module home. A row whose lead resolves to nobody carries NULLs
+        # here and keeps lead_display (the raw sheet text) for humans.
+        task['mirror']['owner_email']      = task['lead_email']
+        task['mirror']['owner_user_id']    = portal_any_email_to_id.get(task['lead_email']) if task['lead_email'] else None
+        task['mirror']['owner_resolution'] = destination
+        # Phase 4 (2026-09-14): EVERY AP-numbered row is a mirror candidate
+        # — the master holds the whole tracker. Scoping below decides
+        # projection only.
+        mirror_candidates[task['mirror']['smartsheet_row_id']] = task
 
     in_scope_families = set(fam_modules)
     n_split = sum(1 for mods in fam_modules.values() if len(mods) > 1)
@@ -1743,9 +1846,9 @@ def main(dry_run: bool = False):
         in_scope = task['family'] in in_scope_families
 
         if in_scope:
-            # ── In-scope family: every member row mirrors and projects
-            # (Task 2/3). All statuses project — terminal history included.
-            mirror_candidates[task['mirror']['smartsheet_row_id']] = task
+            # ── In-scope family: every member row projects (Task 2/3) —
+            # it already mirrors (every row does, Phase 4). All statuses
+            # project — terminal history included.
             if not ap_num or not task['action_text']:
                 # Both module tables have NOT NULL text/title; a blank-text
                 # row still mirrors but cannot project.
@@ -1813,11 +1916,6 @@ def main(dry_run: bool = False):
         # never fetched (no counters, no logs). Pending rows continue past
         # this block to the skip counters, exactly as before the widening.
         if not task['active']:
-            # Mirror landing (legacy set): an out-of-scope inactive row
-            # still mirrors iff a module row already exists for it (the
-            # close/pending-settle set).
-            if ap_num and (ap_num in existing_delivery_aps or ap_num in existing_pc_aps):
-                mirror_candidates[task['mirror']['smartsheet_row_id']] = task
             row_k = module_row_key(ap_num, is_pure_parent(task))
             delivery_pending = bool(existing_delivery.get(row_k, {}).get('ap_pending_update'))
             pc_pending = bool(existing_pc.get(row_k, {}).get('ap_pending_update'))
@@ -1944,11 +2042,11 @@ def main(dry_run: bool = False):
     if mirror_load_failed:
         to_upsert_mirror, mirror_conflict_rows = [], []
         mirror_conflicted_row_ids = set()
-        mirror_echo_cleared = mirror_conflicts_ingested = mirror_protected = 0
+        mirror_echo_cleared = mirror_conflicts_ingested = mirror_protected = mirror_unchanged = 0
     else:
         (to_upsert_mirror, mirror_conflict_rows, mirror_conflicted_row_ids,
          mirror_echo_cleared, mirror_conflicts_ingested,
-         mirror_protected) = plan_mirror_writes(
+         mirror_protected, mirror_unchanged) = plan_mirror_writes(
             existing_mirror, mirror_candidates, dry_run)
 
     if unmapped_leads:
@@ -1984,6 +2082,7 @@ def main(dry_run: bool = False):
         )
         mirror_summary = (
             f"Mirror   — candidates: {len(mirror_candidates)}, would upsert: {len(to_upsert_mirror)}, "
+            f"unchanged (no write): {mirror_unchanged}, "
             f"echo-cleared: {mirror_echo_cleared}, conflicts ingested: {mirror_conflicts_ingested}, "
             f"protected pending: {mirror_protected}, conflict rows to log: {len(mirror_conflict_rows)}"
             + (" [MIRROR LOAD FAILED — landing skipped]" if mirror_load_failed else "")
@@ -2052,6 +2151,7 @@ def main(dry_run: bool = False):
             title_capture_failed=title_capture_failed,
             mirror_candidates_total=len(mirror_candidates),
             mirror_upserted=len(to_upsert_mirror),
+            mirror_unchanged=mirror_unchanged,
             mirror_echo_cleared=mirror_echo_cleared,
             mirror_conflicts_ingested=mirror_conflicts_ingested,
             mirror_protected_pending=mirror_protected,
@@ -2104,7 +2204,7 @@ def main(dry_run: bool = False):
     if to_upsert_mirror or mirror_conflict_rows:
         log.info(
             f"Mirror: {mirror_upserted} upserted of {len(mirror_candidates)} candidate(s), "
-            f"{mirror_echo_cleared} echo-cleared, {mirror_conflicts_ingested} conflict(s) ingested, "
+            f"{mirror_unchanged} unchanged (no write), {mirror_echo_cleared} echo-cleared, {mirror_conflicts_ingested} conflict(s) ingested, "
             f"{mirror_protected} protected pending, {mirror_conflict_rows_logged} conflict row(s) logged"
         )
 
@@ -2425,6 +2525,7 @@ def main(dry_run: bool = False):
         f"end-date events: {len(date_events)} detected, {date_events_written} written, "
         f"{date_events_skipped_inactive} skipped (inactive) | "
         f"mirror: {mirror_upserted}/{len(mirror_candidates)} upserted, "
+        f"{mirror_unchanged} unchanged, "
         f"{mirror_echo_cleared} echo, {mirror_conflicts_ingested} conflict, "
         f"{mirror_protected} protected"
         + (f" [INSERT FAILURES: {failed_inserts_delivery} Delivery, {failed_inserts_pc} P&C]"
@@ -2518,7 +2619,7 @@ def main(dry_run: bool = False):
                     f'date_baselines={date_baselines} '
                     f'insert_failures={failed_inserts_delivery + failed_inserts_pc} '
                     f'title_capture_failed={title_capture_failed} '
-                    f'mirror_upserted={mirror_upserted} mirror_echo={mirror_echo_cleared} '
+                    f'mirror_upserted={mirror_upserted} mirror_unchanged={mirror_unchanged} mirror_echo={mirror_echo_cleared} '
                     f'mirror_conflicts={mirror_conflicts_ingested} mirror_protected={mirror_protected} '
                     f'mirror_failed={int(mirror_load_failed) + mirror_failed_writes}'
                 ),
@@ -2566,6 +2667,7 @@ def main(dry_run: bool = False):
                 title_capture_failed=title_capture_failed,
                 mirror_candidates_total=len(mirror_candidates),
                 mirror_upserted=mirror_upserted,
+                mirror_unchanged=mirror_unchanged,
                 mirror_echo_cleared=mirror_echo_cleared,
                 mirror_conflicts_ingested=mirror_conflicts_ingested,
                 mirror_protected_pending=mirror_protected,
