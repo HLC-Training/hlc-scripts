@@ -1,6 +1,14 @@
 # hlc-scripts
 
-Last updated: 2026-09-11 — sync_ap.py's parent-AP end-date event logger
+Last updated: 2026-09-14 — `ap_tracker` is now the ORiON MASTER AP table:
+sync_ap.py mirrors EVERY AP-numbered tracker row into it (834 on ship
+day, was 609 in-scope-only), stamps Smartsheet's `parentId` as
+`smartsheet_parent_row_id`, resolves the Lead to a portal_users id across
+every role (`owner_user_id`/`owner_email`/`owner_resolution`), and skips
+unchanged rows instead of rewriting all of them (orion-pll decision doc
+`2026-09-14-master-ap-table-phase4.md`). Family scoping now decides
+projection into the module tables only.
+Prior: 2026-09-11 — sync_ap.py's parent-AP end-date event logger
 (`ap_end_date_changes`) now gates on the parent row's own status
 (`ACTIVE_STATUSES`); a Complete/Cancelled/On-Hold parent still baselines
 its stored `ap_titles.end_date` but never fires an owner-facing event
@@ -18,10 +26,13 @@ Scheduled sync and automation scripts for the SAM COS and ORiON systems.
 ## What lives here
 
 - `sync_ap.py` — Smartsheet AP tracker to ORiON Supabase (`czdkctjbejnwuopigxta`).
-  Still one-way and Delivery/P&C-scoped, but since 2026-08-26 in-scope rows
-  land FIRST in the `ap_tracker` mirror table (full-row shape, loop-prevention
-  sync state) and the module tables (`action_items`/`pc_projects`) are
-  projections of that landing zone (orion-pll decision 69ba45bd). The LIVE
+  Still one-way. Since 2026-08-26 rows land FIRST in the `ap_tracker`
+  mirror table (full-row shape, loop-prevention sync state) and the module
+  tables (`action_items`/`pc_projects`) are Delivery/P&C-scoped projections
+  of that landing zone (orion-pll decision 69ba45bd). Since 2026-09-14 the
+  mirror is the MASTER: every AP-numbered sheet row lands there, not just
+  in-scope families (Phase 4, orion-pll decision doc
+  `2026-09-14-master-ap-table-phase4.md`). The LIVE
   ORiON→Smartsheet write-back shipped 2026-08-26 in the orion-pll APP
   (`lib/smartsheet.ts` + `app/(protected)/operations/ap-actions.ts` — it
   fires from a user's save, so it cannot live in this cron script); this
@@ -97,7 +108,13 @@ commit that removes the Vercel cron, never both at once.
 
 ## ap_tracker is keyed on smartsheet_row_id; uniqueness is (ap_number, is_parent)
 
-The mirror upserts on `smartsheet_row_id`. Since 2026-09-08 (decision
+The mirror upserts on `smartsheet_row_id` and — since 2026-09-14 — holds
+EVERY AP-numbered sheet row (it is the ORiON master AP table), with
+`smartsheet_parent_row_id` (= the API's `row.parentId`) as the nesting key
+and `owner_user_id` resolved across every portal_users role. A row whose
+sheet facts are unchanged is skipped, not rewritten, so `last_synced_at`
+means "last WRITTEN by the sync", not "last run" — liveness is the prune's
+job. Since 2026-09-08 (decision
 `2026-09-08-ap-tracker-prune-and-composite-guard.md`, action item
 `3ca6c010`) `sync_ap.py` also PRUNES: `prune_stale_mirror_rows()`, called
 from `main()` right after the mirror upsert, deletes any `ap_tracker` row

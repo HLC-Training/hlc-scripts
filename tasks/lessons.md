@@ -924,3 +924,33 @@ a GE-issued machine, and SAC being off is now a permanent property of this
 box, worth knowing before assuming any other machine's Python behaves the
 same way. The stub-module render-test technique above is still the right
 move on any machine where SAC (or an equivalent control) is still on.
+
+## 2026-09-14 — Check for an existing table before building the one the brief names
+
+From the Phase 4 master-AP build (orion-pll decision
+`2026-09-14-master-ap-table-phase4.md`). The brief asked for a new "master
+table" keyed on Smartsheet's permanent row id, fed from sync_ap.py's single
+fetch. `ap_tracker` had been exactly that since 2026-08-26 — keyed on
+`smartsheet_row_id`, full sheet shape, same fetch — just scoped to in-scope
+families. The design record never mentioned it. Building the table as
+named would have produced two mirrors keyed on the same id from the same
+read: pure duplication, and a new divergence surface in a build whose
+purpose was to end one. The fix was to widen the existing table (four
+additive changes) and record the deviation.
+
+The lesson: "read the script end to end" (which the brief did mandate)
+must include asking "does the thing I'm about to create already exist
+under another name?" — grep the schema for the key you're about to make
+primary before writing the migration. A brief's vocabulary ("master") and
+the codebase's ("mirror") can name the same object.
+
+Two smaller ones from the same build: the mirror had been rewriting every
+candidate row every run since 8/26 (bug adee6b56's class, invisible
+because nothing read `last_synced_at` as a change signal) — a per-run
+stamp column will hide an every-row-rewrite until something starts
+reading it; and SQL persona impersonation must hardcode the uuid — a
+subquery on `portal_users` inside the same SELECT as
+`set_config('role','authenticated')` can evaluate after the role switch,
+return NULL under RLS, and make a valid policy look like it denies its
+own audience.
+
