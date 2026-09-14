@@ -38,23 +38,49 @@ DONE_STATUSES — the app's TERMINAL set):
      (public.staleness_state(), orion-pll knowledge/decisions/
      2026-08-11-approaching-stale-warning.md), staleness='approaching'.
      Read-only consumer, same rule.
+  5. "Unacknowledged AP date changes" — added 2026-09-14, closing the
+     last gap flagged at bug ca9beaeb Phase 3 close (SAM COS 5bd11694):
+     this weekly mail was the only owner-facing channel left with no ack
+     surface. The TPM's OWN top-level APs whose end date moved in the
+     Action Plan Tracker (ap_end_date_changes, written by sync_ap.py)
+     that they have not acknowledged in ORiON (ap_end_date_acks), over
+     their non-terminal projects. One line per AP (latest old → new,
+     "+N earlier"), uncapped like the other four. Points back to ORiON's
+     P&C banner (/pc/projects) to acknowledge — deliberately NO
+     email-side ack and NO tokenized link (the GE-mail-consumes-
+     single-use-tokens trap from the August TPM onboarding, bugs
+     cab4810f / 065c166e). Shared data layer ap_date_acks.py (same rule
+     as the PLL and TPM daily digests' Phase 3 sections) — never fork a
+     second copy of the "outstanding" predicate. This section is NOT
+     time-windowed, so it never touches window_phrase().
 
 NO DEDUP, NO PRECEDENCE: a project appears in EVERY section it
 qualifies for. A newly-assigned project that is also missing required
 fields shows under both — each section answers its own question
 ("what's new for me?" vs "what do I have to fix?"). This is a settled
 decision (2026-09-02 grill, option (a)); do not "tidy" it into a
-first-match-wins list.
+first-match-wins list. The AP date-change section follows the same
+rule by construction — it reads a different data shape (AP entries,
+not projects) than the other four, so nothing needs reconciling.
 
 UNCAPPED: unlike send_tpm_digest.py — which caps Overdue / Approaching
 / Incomplete at 5 PER TPM because Michele reads nine TPMs' worth in one
 email — each TPM here sees only their own projects, so every section
 renders in full with no "+N more" line. Deliberate (2026-09-02 grill
 6b). Note that this makes a heavy TPM's email genuinely long; that is
-the accepted trade for "your list is your list".
+the accepted trade for "your list is your list". The AP date-change
+section is per-owner unacked events — inherently low-volume, not the
+cap driver — so it stays uncapped with the rest by the same rule. IF a
+future cap is ever added to this digest, the AP date-change section
+caps with it (coupling recorded in knowledge/decisions/
+2026-09-14-tpm-individual-ap-ack-section.md); do not add a cap here
+today.
 
-SUPPRESSION: a TPM with nothing in ANY of the four sections gets NO
-email. This is a STANDING WEEKLY STATUS email, not a change-only one —
+SUPPRESSION: a TPM with nothing in ANY of the five sections gets NO
+email — including a TPM whose ONLY content is one unacked AP date
+change (the ack section flips a previously-suppressed TPM to sent,
+intentionally: the ack is the point). This is a STANDING WEEKLY STATUS
+email, not a change-only one —
 a TPM with nothing newly assigned but one overdue project still gets
 their email. The only silence is a genuinely empty week.
 
@@ -140,6 +166,9 @@ from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from supabase import create_client
+
+from ap_date_acks import (fetch_unacked_ap_date_changes, ap_change_label,
+                          ap_change_meta_text)
 
 # NOTE: ge_holidays is deliberately NOT imported — see CADENCE above.
 
@@ -300,8 +329,9 @@ def parse_date(raw) -> date | None:
 # ─── DIGEST ASSEMBLY (pure — no DB, no I/O) ─────────────────────
 def build_digest(tpm: dict, projects: list[dict], approaching_items: list[dict],
                  incomplete_items: list[dict],
-                 watermark: datetime, today: date) -> dict | None:
-    """Four uncapped sections for ONE TPM; None if all four are empty.
+                 watermark: datetime, today: date,
+                 unacked_ap_changes: dict[str, list[dict]] | None = None) -> dict | None:
+    """Five uncapped sections for ONE TPM; None if all five are empty.
 
     Pure function: takes rows, returns a render model. Per-TPM scoping
     and empty-suppression are therefore provable in memory against
@@ -316,6 +346,7 @@ def build_digest(tpm: dict, projects: list[dict], approaching_items: list[dict],
            if p['owner_id'] == tpm['id'] and p.get('status') not in DONE_STATUSES]
     own_approaching = [p for p in approaching_items if p['owner_id'] == tpm['id']]
     own_incomplete = [p for p in incomplete_items if p['owner_id'] == tpm['id']]
+    own_ap_changes = (unacked_ap_changes or {}).get(tpm['id'], [])
 
     newly_assigned = sorted(
         (p for p in own if parse_timestamp(p['created_at']) > watermark),
@@ -332,18 +363,22 @@ def build_digest(tpm: dict, projects: list[dict], approaching_items: list[dict],
         key=lambda p: p.get('updated_at') or '',   # oldest updated_at first = longest quiet
     )
     incomplete = sorted(own_incomplete, key=lambda p: p['title'])
+    ap_changes = sorted(own_ap_changes, key=lambda e: e['ap'])
 
-    if not newly_assigned and not overdue and not approaching and not incomplete:
+    if not newly_assigned and not overdue and not approaching and not incomplete \
+            and not ap_changes:
         return None
 
     # No caps and no overflow counts anywhere — each TPM sees their own
-    # full list (2026-09-02 grill 6b).
+    # full list (2026-09-02 grill 6b). The AP date-change section is
+    # per-owner and inherently low-volume, so it follows the same rule.
     return {
         'tpm':            tpm,
         'newly_assigned': newly_assigned,
         'overdue':        overdue,
         'incomplete':     incomplete,
         'approaching':    approaching,
+        'ap_changes':     ap_changes,
     }
 
 
@@ -400,6 +435,29 @@ def item_row_html(project: dict, meta: str, zebra: bool) -> str:
     )
 
 
+# Point-back link only — a plain, un-tokenized URL to the module whose
+# banner carries the Acknowledge button. Never an email-side ack (the
+# GE-mail-consumes-single-use-tokens trap, bugs cab4810f / 065c166e).
+AP_ACK_URL = f"{ORION_URL}/pc/projects"
+
+
+def ap_change_row_html(entry: dict, zebra: bool) -> str:
+    bg = f'background-color:{ZEBRA};' if zebra else ''
+    meta = (f"End date moved <strong>{fmt_date(entry['old_end_date'])} &rarr; "
+            f"{fmt_date(entry['new_end_date'])}</strong>")
+    if entry['earlier']:
+        meta += (f" &middot; +{entry['earlier']} earlier change"
+                 f"{'s' if entry['earlier'] > 1 else ''}, acknowledged together")
+    meta += f" &middot; {entry['rows']} of your project{'s' if entry['rows'] != 1 else ''}"
+    return (
+        f'<tr><td style="{bg}padding:8px 14px;border-bottom:1px solid {BORDER};'
+        f'font-family:{FONT};font-size:14px;color:{NIGHT};line-height:1.4;">'
+        f'{esc(ap_change_label(entry))}'
+        f'<br><span style="font-size:12px;color:{MUTED};">{meta}</span>'
+        f'</td></tr>'
+    )
+
+
 def incomplete_row_html(project: dict, zebra: bool) -> str:
     # Single-line row — same shape as send_tpm_digest.py's incomplete row.
     bg = f'background-color:{ZEBRA};' if zebra else ''
@@ -445,6 +503,14 @@ def build_html_body(digest: dict, today: date, watermark: datetime) -> str:
     )
 
     sections = [
+        section_html(
+            "Unacknowledged AP date changes",
+            [ap_change_row_html(e, idx % 2 == 1)
+             for idx, e in enumerate(digest['ap_changes'])],
+            intro="The Action Plan Tracker moved these APs&rsquo; end dates &mdash; nobody "
+                  "in ORiON made the change. Acknowledge in ORiON to clear it: "
+                  f'<a href="{AP_ACK_URL}" target="_blank" style="color:{ION_INK};">'
+                  f'{AP_ACK_URL}</a>.'),
         section_html(
             "Newly assigned to you this week",
             [item_row_html(
@@ -547,6 +613,13 @@ def build_text_body(digest: dict, today: date, watermark: datetime) -> str:
         "already wrapped up, updating it in ORiON keeps this list honest.",
         "",
     ]
+    lines += text_section(
+        "Unacknowledged AP date changes", digest['ap_changes'],
+        lambda e: [f"  - {ap_change_label(e)}",
+                   f"      {ap_change_meta_text(e, fmt_date)}"],
+        intro="The Action Plan Tracker moved these APs' end dates -- nobody in "
+              "ORiON made the change. Acknowledge in ORiON to clear it: "
+              f"{AP_ACK_URL}")
     lines += text_section(
         "Newly assigned to you this week", digest['newly_assigned'],
         lambda p: [f"  - {p['title']}",
@@ -665,6 +738,8 @@ def main():
         projects = fetch_projects(db, owner_ids)
         approaching = fetch_approaching(db, owner_ids)
         incomplete = fetch_incomplete(db, owner_ids)
+        unacked_ap_changes = fetch_unacked_ap_date_changes(
+            db, owner_ids, 'pc_projects', sorted(DONE_STATUSES))
         watermark = fetch_state(db)
     except Exception as e:
         log.error(f"Supabase fetch failed — aborting without sending: {e}")
@@ -677,7 +752,8 @@ def main():
                  f"since {watermark.isoformat()}.")
 
     results = [{'tpm': t,
-                'digest': build_digest(t, projects, approaching, incomplete, watermark, today)}
+                'digest': build_digest(t, projects, approaching, incomplete, watermark, today,
+                                       unacked_ap_changes)}
                for t in tpms]
     to_send = [r for r in results if r['digest'] is not None]
     log.info(f"{len(tpms)} TPMs — {len(to_send)} with items to report, "
@@ -764,6 +840,7 @@ def _advance_watermark(db, watermark: datetime, live: bool, results: list[dict],
                     'overdue':        len(r['digest']['overdue']),
                     'incomplete':     len(r['digest']['incomplete']),
                     'approaching':    len(r['digest']['approaching']),
+                    'ap_changes':     len(r['digest']['ap_changes']),
                 }
             ) for r in results
         },
