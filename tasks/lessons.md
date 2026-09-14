@@ -954,3 +954,37 @@ subquery on `portal_users` inside the same SELECT as
 return NULL under RLS, and make a valid policy look like it denies its
 own audience.
 
+
+## 2026-09-14 — A reconciliation rule that compares ORiON to the stored mirror is blind to writers that write the mirror
+
+October full-AP review pilot (orion-pll decision
+`2026-09-14-october-full-ap-review-pilot.md`). The 2026-09-08 per-field
+settle rule judges a flagged module field against the STORED `ap_tracker`
+row and calls it `matched` when the values agree — correct for PLL/TPM
+edits, which never touch the mirror. The Ops-tab (AP-manager) save DOES
+write the mirror first (`current_finish` = the new date, `orion_dirty`,
+`orion_written_value`), so a held finish-date edit compared itself against
+itself, read `matched`, and the digest silently dropped the one row it
+existed to show — while the sync (which judges against the fresh sheet
+capture) kept protecting it. Two consumers, one rule, two different
+"tracker" inputs; the docstring even said "judged against the LIVE
+ap_tracker row" as if stored and live were the same thing. The fix is in
+the rule (`mirror_holds_unechoed_write`: dirty + key in written → pending),
+not in the digest, so both consumers still share one implementation.
+Generalizes: when a mirror table can be written by more than one side,
+"equals the mirror" is not "equals the source" — check `orion_dirty` /
+`orion_written_value` before trusting a mirror value as the sheet's, and
+prove it with a fixture whose write goes through the mirror-writing path,
+not just the module path.
+
+## 2026-09-14 — Fixture-exclusion rules hide the very rows a behavioral gate needs to see
+
+Same build. `is_fixture()` (AP-99xx, "TEST FIXTURE", row-id band) keeps
+seeded rows out of Jen's inbox — and therefore out of the digest dry-run
+and the new worklist, so a gate written as "the fixture appears in the
+digest" can never pass on a fixture-named row. What worked: seed under
+fixture names for the write-path proofs, then temporarily rename the rows
+(number, title, row id outside the band) for the render proofs, then
+rename back and delete, all inside one sync window (the 15-minute prune
+deletes un-fetched `ap_tracker` rows, so seed right after a run completes).
+Say so in the evidence rather than weakening the exclusion.

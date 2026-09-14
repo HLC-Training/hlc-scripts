@@ -1,6 +1,18 @@
 # hlc-scripts
 
-Last updated: 2026-09-14 — `ap_tracker` is now the ORiON MASTER AP table:
+Last updated: 2026-09-14 (later) — October full-AP review pilot (orion-pll
+decision doc `2026-09-14-october-full-ap-review-pilot.md`): `ap_pending.py`
+now treats a field as `pending` when the STORED `ap_tracker` row is
+`orion_dirty` and its `orion_written_value` carries that field's mirror
+key (`MIRROR_WRITE_KEY`) — the mirror holds ORiON's own un-echoed write, so
+judging against it would falsely read `matched`. Only the digest passes a
+stored row; `sync_ap.py` passes the sheet capture and is unaffected.
+`send_ap_pending_digest.py` gained a "Master tracker" section: dirty mirror
+rows whose held Current Finish was logged against the mirror itself
+(`ap_change_log` module `ops`, `item_id` = tracker id, person-authored,
+value still as written) — the rail for Ops-only master rows that have no
+module projection to flag. Same email, recipient, cadence.
+Prior: 2026-09-14 — `ap_tracker` is now the ORiON MASTER AP table:
 sync_ap.py mirrors EVERY AP-numbered tracker row into it (834 on ship
 day, was 609 in-scope-only), stamps Smartsheet's `parentId` as
 `smartsheet_parent_row_id`, resolves the Lead to a portal_users id across
@@ -52,14 +64,22 @@ Scheduled sync and automation scripts for the SAM COS and ORiON systems.
   post-dates the edit; blank tracker cells stay "caught up" except
   `pc.description` (ac29261e preserved); `is_fixture()` keeps AP-99xx /
   "TEST FIXTURE" rows out of every email. `STATUS_MAP` / `PC_STATUS_MAP` /
-  `SQDCG_MAP` are defined here and re-exported by `sync_ap.py`. Both
+  `SQDCG_MAP` are defined here and re-exported by `sync_ap.py`. Since
+  2026-09-14 a field is `pending` whenever the stored tracker row is
+  `orion_dirty` with that field's mirror key in `orion_written_value`
+  (`mirror_holds_unechoed_write`) — an AP-manager Ops-tab edit writes the
+  mirror before the sheet has it, and the digest must not read that as
+  reconciled. Both
   `sync_ap.py` (clears the flag, logs superseded values first) and
   `send_ap_pending_digest.py` (renders only what is still pending) import
   it — never re-derive the rule in either script. Tests:
   `python tests/test_ap_pending.py`.
 - `send_ap_pending_digest.py` — daily digest to Jen Wright of AP rows
-  still flagged `ap_pending_update` (both modules) plus rows orphaned from
-  the tracker while still open. Read-only; `--dry-run` renders locally (set
+  still flagged `ap_pending_update` (both modules), dirty `ap_tracker` rows
+  holding a held (dependency-blocked) AP-manager Current Finish edit with no
+  module projection ("Master tracker" section, since 2026-09-14 — the
+  orion-pll app logs those against the mirror row as `ap_change_log`
+  module `ops`), plus rows orphaned from the tracker while still open. Read-only; `--dry-run` renders locally (set
   `PYTHONIOENCODING=utf-8` on Windows, bug 49e0cbe9). Still on the GitHub
   `schedule:` (weekdays 12:00 UTC) — not yet moved to Vercel.
 - `sync_xyleme.py` — Xyleme modernization + exams Smartsheets to ORiON
