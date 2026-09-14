@@ -894,3 +894,17 @@ verification. The fix going forward: any backfill claim must be followed, in
 the same session, by an independent live re-query against the actual target
 table — not a cached variable, not the pre-write response object, a new
 `SELECT`. If the re-query isn't in the transcript, the backfill isn't proven.
+
+## 2026-09-14 — HERMES cannot run the digest scripts locally; stub `supabase` for render tests
+The ARM Python 3.12 on HERMES imports `postgrest` fine but `from supabase
+import create_client` dies in `_cffi_backend` ("An Application Control policy
+has blocked this file"). So no `--dry-run` from this machine. Two things that
+work instead, used for the ca9beaeb Phase 3 digest section: (1) a render test
+that inserts a stub `supabase` module into `sys.modules` before importing the
+digest, then calls `build_digest` / `build_html_body` / `build_text_body` with
+synthesized rows and a fake `db.table(...)` chain — proves rendering,
+suppression logic and the shared query helper's collapse rules; (2) the real
+data proof is `gh workflow run <digest>.yml -f dry_run=true -f
+force_date_gate=true` against main and reading the run log — dry-run sends
+nothing and writes no state. Push first: `workflow_dispatch` runs the ref's
+committed code, not the working tree.
