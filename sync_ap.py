@@ -953,6 +953,140 @@ def prune_stale_mirror_rows(db, existing_mirror: dict, all_sheet_row_ids: set,
         return 0, False
 
 
+MODULE_ROW_COLS = {
+    'action_items': ('id, ap_number, owner_id, action_text, status, due_date, start_date, priority, '
+                     'ap_pending_update, ap_pending_since, ap_orphaned, no_report_out, '
+                     'ap_is_parent, ap_is_child, ap_lead_display'),
+    'pc_projects':  ('id, ap_number, owner_id, title, description, status, category, start_date, '
+                     'target_end_date, target_date_moves, ap_pending_update, ap_pending_since, '
+                     'ap_orphaned, no_report_out, ap_is_parent, ap_is_child, ap_lead_display'),
+}
+MODULE_ROW_SOURCE = {'action_items': 'ap_import', 'pc_projects': 'ap_synced'}
+MODULE_TITLE_FIELD = {'action_items': 'action_text', 'pc_projects': 'title'}
+
+ORPHAN_REASON_TEXT = {
+    'deleted':    'AP number no longer in the tracker (sheet row deleted)',
+    'reassigned': 'sheet row gone and its AP number now belongs to a different action (renumber)',
+}
+ORPHAN_PENDING_CLEAR_REASON = (
+    'cleared: this ORiON row is orphaned from the AP tracker (its Smartsheet row was deleted, '
+    'or its AP number now belongs to a different action) — there is no live tracker row to '
+    'reconcile the edit against, so it cannot be applied in the sheet '
+    '(decision 2026-09-21-pc-renumber-zombies)'
+)
+
+
+def load_module_rows(db, table: str) -> tuple[list[dict], bool]:
+    """Load every sync-owned row of a module table. Returns (rows,
+    row_id_available). The projection tables gained `smartsheet_row_id`
+    on 2026-09-21 (decision 2026-09-21-pc-renumber-zombies); until that
+    migration is applied on a database the select falls back to the
+    pre-migration column list and returns row_id_available=False, so the
+    sync keeps running — identity stamps and stamp-keyed orphan detection
+    simply stay off (logged, never silent) until the column exists."""
+    cols = MODULE_ROW_COLS[table]
+    try:
+        resp = db.table(table).select(cols + ', smartsheet_row_id').eq('source', MODULE_ROW_SOURCE[table]).execute()
+        return (resp.data or []), True
+    except Exception as e:
+        if 'smartsheet_row_id' not in str(e):
+            raise
+        log.warning(
+            f"{table}.smartsheet_row_id is not present on this database — loading without it; "
+            f"identity stamps are off and orphan detection runs on the legacy AP-number/title rule "
+            f"this run (apply migration 2026-09-21_module_rows_smartsheet_row_id)"
+        )
+        resp = db.table(table).select(cols).eq('source', MODULE_ROW_SOURCE[table]).execute()
+        return (resp.data or []), False
+
+
+def _norm_title(value) -> str:
+    return re.sub(r'\s+', ' ', str(value or '')).strip().lower()
+
+
+def plan_orphan_flags(existing_rows: list[dict], visited: dict, tasks_by_ap: dict,
+                      all_sheet_row_ids: set, fetch_complete: bool, title_field: str,
+                      row_id_available: bool = True) -> dict:
+    """Per-row liveness verdict for ONE module table (action_items or
+    pc_projects) — decision 2026-09-21-pc-renumber-zombies (action item
+    35988c9e, bug 4dfe07fd). Pure: plans writes, performs none.
+
+    Before 2026-09-21 a module row was "live" iff its ap_number appeared
+    anywhere in the fetch. A delete-and-recreate renumber defeats that: the
+    old row's number is re-issued to a DIFFERENT action, the number-existence
+    check sees it as present, and the stale projection survives as a zombie
+    (the AP-0785-3-x P&C subtree Jen's 2026-09-21 notice came from). Module
+    rows carry no Smartsheet identity of their own, so liveness is now
+    judged in this order:
+
+      1. visited — this run's projection matched the row by module_row_key
+         (any disposition: update, unchanged, pending-skip, clear, close).
+         Live; the matching sheet row's id becomes its identity stamp.
+      2. stamped (`smartsheet_row_id` set, not visited) — live iff that row
+         id is still in the fetch. Same identity the ap_tracker prune keys
+         on; a reassigned number cannot fool it because the old sheet row
+         is gone even though its number lives on. Verdict 'deleted'.
+      3. legacy (never stamped, not visited): no sheet row carries the
+         number → 'deleted' (the pre-2026-09-21 rule, preserved — the
+         -3-5/-3-6/-4-4 class). The number IS present → the row is live
+         only if one of the sheet rows carrying it is the SAME action
+         (normalised title equality; the row would otherwise have been
+         visited); a same-title match stamps it, no match → 'reassigned'.
+
+    Orphans are FLAGGED, never deleted or closed (Jim's ruling, 2026-08-20).
+    New flags need fetch_complete — an incomplete fetch reads every
+    un-fetched row as vanished (the prune's lesson, 2026-09-08); live
+    verdicts (unflag, stamp) never need the gate. A row that is orphaned
+    after this run and still carries ap_pending_update has no tracker row
+    to settle against, so its flag is cleared (audit row first — see the
+    write phase) rather than left to raise a pending ask forever.
+
+    Returns {'to_orphan': [(id, ap, reason)], 'to_unorphan': [(id, ap)],
+             'to_stamp': [(id, ap, smartsheet_row_id)],
+             'to_clear_pending': [(id, ap)]}."""
+    out = {'to_orphan': [], 'to_unorphan': [], 'to_stamp': [], 'to_clear_pending': []}
+    for r in existing_rows:
+        ap = r.get('ap_number')
+        if not ap:
+            continue
+        rid = r['id']
+        stored = r.get('smartsheet_row_id') if row_id_available else None
+        live, live_row_id, reason = False, None, None
+        if rid in visited:
+            live, live_row_id = True, visited[rid]
+        elif stored is not None:
+            if stored in all_sheet_row_ids:
+                live, live_row_id = True, stored
+            else:
+                reason = 'deleted'
+        else:
+            candidates = tasks_by_ap.get(ap) or []
+            if not candidates:
+                reason = 'deleted'
+            else:
+                mine = _norm_title(r.get(title_field))
+                same = [t for t in candidates if _norm_title(t.get('action_text')) == mine]
+                if same:
+                    pure_parent = bool(r.get('ap_is_parent')) and not bool(r.get('ap_is_child'))
+                    same.sort(key=lambda t: is_pure_parent(t) != pure_parent)  # same shape first
+                    live, live_row_id = True, (same[0].get('mirror') or {}).get('smartsheet_row_id')
+                else:
+                    reason = 'reassigned'
+        if live:
+            if r.get('ap_orphaned'):
+                out['to_unorphan'].append((rid, ap))
+            if row_id_available and live_row_id is not None and stored != live_row_id:
+                out['to_stamp'].append((rid, ap, live_row_id))
+            continue
+        if not fetch_complete:
+            continue
+        if not r.get('ap_orphaned'):
+            out['to_orphan'].append((rid, ap, reason))
+        if r.get('ap_pending_update'):
+            out['to_clear_pending'].append((rid, ap))
+    return out
+
+
 def user_is_ap_manager(db, user_id: str) -> bool:
     """True iff portal_users.is_ap_manager is set for user_id. The push
     gate below depends on this being checked HERE, in code: the sync and
@@ -1089,6 +1223,7 @@ def build_delivery_insert(task: dict, owner_id, shared: dict, status: str) -> di
         'ap_is_parent':      bool(task['is_parent']),
         'ap_is_child':       bool(task['is_child']),
         'ap_lead_display':   shared['lead_display'],
+        'smartsheet_row_id': (task.get('mirror') or {}).get('smartsheet_row_id'),
         'created_date':      datetime.now().strftime('%Y-%m-%d'),
         'last_updated':      datetime.now(timezone.utc).isoformat(),
     }
@@ -1132,6 +1267,7 @@ def build_pc_insert(task: dict, owner_id, shared: dict, status: str) -> dict:
         'ap_is_parent':         bool(task['is_parent']),
         'ap_is_child':          bool(task['is_child']),
         'ap_lead_display':      shared['lead_display'],
+        'smartsheet_row_id':    (task.get('mirror') or {}).get('smartsheet_row_id'),
     }
 
 
@@ -1203,6 +1339,9 @@ def plan_module_projection(task: dict, mod: dict, owner_id, shared: dict,
             print(f"[DRY RUN] INSERT   {ap_num:14} {mod['plabel']} — owner {owner_id or shared['lead_display'] or '(none)'}, status {status}")
         return 'insert'
 
+    # Liveness + identity for orphan detection (decision 2026-09-21): this
+    # sheet row matched the module row by key, whatever happens next.
+    mod.setdefault('visited', {})[ex['id']] = (task.get('mirror') or {}).get('smartsheet_row_id')
     content, meta = mod['build_diff'](task, ex, owner_id, shared, status)
 
     if ex.get('ap_pending_update'):
@@ -1545,16 +1684,13 @@ def main(dry_run: bool = False):
     # (ap_number, pure_parent) — see module_row_key for why bare ap_number
     # stopped being a safe key when parents started projecting.
     try:
-        existing_resp = db.table('action_items') \
-            .select('id, ap_number, owner_id, status, due_date, start_date, priority, ap_pending_update, ap_pending_since, ap_orphaned, no_report_out, ap_is_parent, ap_is_child, ap_lead_display') \
-            .eq('source', 'ap_import') \
-            .execute()
+        existing_delivery_rows, delivery_row_id_available = load_module_rows(db, 'action_items')
         existing_delivery = {
             module_row_key(r['ap_number'], bool(r.get('ap_is_parent')) and not bool(r.get('ap_is_child'))): r
-            for r in (existing_resp.data or [])
+            for r in existing_delivery_rows
             if r.get('ap_number')
         }
-        existing_delivery_aps = {r['ap_number'] for r in (existing_resp.data or []) if r.get('ap_number')}
+        existing_delivery_aps = {r['ap_number'] for r in existing_delivery_rows if r.get('ap_number')}
         log.info(f"Existing Delivery AP items in Supabase: {len(existing_delivery)}")
     except Exception as e:
         log.error(f"Failed to load existing Delivery AP items: {e}")
@@ -1562,16 +1698,13 @@ def main(dry_run: bool = False):
 
     # Load existing P&C (pc_projects) rows — same keying.
     try:
-        existing_pc_resp = db.table('pc_projects') \
-            .select('id, ap_number, owner_id, title, description, status, category, start_date, target_end_date, target_date_moves, ap_pending_update, ap_pending_since, ap_orphaned, no_report_out, ap_is_parent, ap_is_child, ap_lead_display') \
-            .eq('source', 'ap_synced') \
-            .execute()
+        existing_pc_rows, pc_row_id_available = load_module_rows(db, 'pc_projects')
         existing_pc = {
             module_row_key(r['ap_number'], bool(r.get('ap_is_parent')) and not bool(r.get('ap_is_child'))): r
-            for r in (existing_pc_resp.data or [])
+            for r in existing_pc_rows
             if r.get('ap_number')
         }
-        existing_pc_aps = {r['ap_number'] for r in (existing_pc_resp.data or []) if r.get('ap_number')}
+        existing_pc_aps = {r['ap_number'] for r in existing_pc_rows if r.get('ap_number')}
         log.info(f"Existing P&C AP items in Supabase: {len(existing_pc)}")
     except Exception as e:
         log.error(f"Failed to load existing P&C AP items: {e}")
@@ -1820,9 +1953,14 @@ def main(dry_run: bool = False):
         f"{len({t['family'] for t in tasks if t['family']}) - len(in_scope_families)} families with zero routed members stay out"
     )
 
+    # Rows this run's projection matched by key, id -> sheet row id — the
+    # first liveness signal orphan detection reads (decision 2026-09-21).
+    visited_delivery: dict = {}
+    visited_pc: dict = {}
     module_specs = {
         'delivery': {
             'label': 'delivery', 'plabel': 'delivery', 'esc_module': 'delivery',
+            'visited': visited_delivery,
             'existing': existing_delivery, 'status_map': STATUS_MAP, 'default_status': 'Open',
             'build_insert': build_delivery_insert, 'build_diff': build_delivery_diff,
             'ts_field': 'last_updated',
@@ -1832,6 +1970,7 @@ def main(dry_run: bool = False):
         },
         'pc': {
             'label': 'P&C', 'plabel': 'P&C     ', 'esc_module': 'pc',
+            'visited': visited_pc,
             'existing': existing_pc, 'status_map': PC_STATUS_MAP, 'default_status': 'approved',
             'build_insert': build_pc_insert, 'build_diff': build_pc_diff,
             'ts_field': 'updated_at',
@@ -1932,12 +2071,16 @@ def main(dry_run: bool = False):
                 # Lead cell must not leave a finished row showing active
                 # forever. Only status moves (bug b75a59f6 reasoning).
                 d_ex = existing_delivery.get(row_k)
+                if d_ex:
+                    visited_delivery[d_ex['id']] = task['mirror']['smartsheet_row_id']
                 d_status = STATUS_MAP.get(task['status_raw'])
                 if d_ex and d_status and d_ex.get('status') != d_status:
                     to_close_delivery.append((d_ex['id'], d_status, ap_num))
                     if dry_run:
                         print(f"[DRY RUN] CLOSE    {ap_num:14} delivery — {d_ex.get('status')} -> {d_status} (Smartsheet: {task['status_raw']})")
                 pc_ex = existing_pc.get(row_k)
+                if pc_ex:
+                    visited_pc[pc_ex['id']] = task['mirror']['smartsheet_row_id']
                 pc_close_status = PC_STATUS_MAP.get(task['status_raw'])
                 if pc_ex and pc_close_status and pc_ex.get('status') != pc_close_status:
                     to_close_pc.append((pc_ex['id'], pc_close_status, ap_num))
@@ -1991,49 +2134,60 @@ def main(dry_run: bool = False):
             print(f"[DRY RUN] SKIP     {ap_num:14} lead does not resolve in users or portal_users(tpm) ({lead_display_for_log})")
         continue
 
-    # ── Orphan detection (bug c4494694) ─────────────────────────
-    # A row whose ap_number is absent from the FULL fetch (active AND
-    # inactive, EVERY shape — the fetch now captures parents and
-    # standalones too, so their module rows can never be mis-orphaned by
-    # the detector; Task 6 of the 2026-08-27 widening) was deleted from
-    # the tracker — distinct from Complete/Cancelled/On Hold, which remain
-    # in the sheet and take a status/close path. Detection FLAGS
-    # (ap_orphaned + ap_orphaned_since), never deletes and never
-    # auto-closes (Jim's ruling, 2026-08-20). The sheet set is scope-blind
-    # on purpose: a family dropping out of scope must not orphan its
-    # existing module rows — the rows still exist in the sheet.
+    # ── Orphan detection (bug c4494694; reworked 2026-09-21, bug 4dfe07fd) ──
+    # Liveness is judged per row by plan_orphan_flags(): visited by this
+    # run's projection → stamped sheet row id still in the fetch → legacy
+    # rows by AP number + same-title match. The old rule ("ap_number appears
+    # somewhere in the fetch") is what a delete-and-recreate renumber
+    # defeats: the number is re-issued to a different action and the stale
+    # projection reads as live. Detection FLAGS (ap_orphaned +
+    # ap_orphaned_since), never deletes and never auto-closes (Jim's
+    # ruling, 2026-08-20). Still scope-blind on purpose: a family dropping
+    # out of scope must not orphan its rows — they still exist in the sheet,
+    # and their stamp (or same-title match) says so.
     sheet_ap_numbers = {t['ap_number'] for t in tasks if t['ap_number']}
-    to_orphan_delivery   = []  # (id, ap_number)
-    to_unorphan_delivery = []  # (id, ap_number)
-    to_orphan_pc         = []
-    to_unorphan_pc       = []
+    tasks_by_ap: dict = defaultdict(list)
+    for t in tasks:
+        if t['ap_number']:
+            tasks_by_ap[t['ap_number']].append(t)
+    orphan_plan = {m: {'to_orphan': [], 'to_unorphan': [], 'to_stamp': [], 'to_clear_pending': []}
+                   for m in ('delivery', 'pc')}
     if not sheet_ap_numbers:
         # tasks is non-empty here (checked at fetch), so an empty AP-number
         # set means every row lost its AP# — sheet damage, not mass
         # deletion. Never mass-flag on that.
         log.error("Orphan detection skipped — fetch produced zero AP numbers")
     else:
-        for r in existing_delivery.values():
-            ap = r['ap_number']
-            if ap not in sheet_ap_numbers and not r.get('ap_orphaned'):
-                to_orphan_delivery.append((r['id'], ap))
-            elif ap in sheet_ap_numbers and r.get('ap_orphaned'):
-                to_unorphan_delivery.append((r['id'], ap))
-        for r in existing_pc.values():
-            ap = r['ap_number']
-            if ap not in sheet_ap_numbers and not r.get('ap_orphaned'):
-                to_orphan_pc.append((r['id'], ap))
-            elif ap in sheet_ap_numbers and r.get('ap_orphaned'):
-                to_unorphan_pc.append((r['id'], ap))
-        if dry_run:
-            for item_id, ap in to_orphan_delivery:
-                print(f"[DRY RUN] ORPHAN   {ap:14} delivery — not in tracker, would flag ap_orphaned")
-            for item_id, ap in to_orphan_pc:
-                print(f"[DRY RUN] ORPHAN   {ap:14} P&C      — not in tracker, would flag ap_orphaned")
-            for item_id, ap in to_unorphan_delivery:
-                print(f"[DRY RUN] UNORPHAN {ap:14} delivery — back in tracker, would clear ap_orphaned")
-            for item_id, ap in to_unorphan_pc:
-                print(f"[DRY RUN] UNORPHAN {ap:14} P&C      — back in tracker, would clear ap_orphaned")
+        if not fetch_complete:
+            log.warning("Orphan detection: fetch did not pass the totalRowCount cross-check — "
+                        "no new orphan flags this run (unflag/stamp verdicts still apply)")
+        orphan_plan['delivery'] = plan_orphan_flags(
+            existing_delivery_rows, visited_delivery, tasks_by_ap, all_sheet_row_ids,
+            fetch_complete, MODULE_TITLE_FIELD['action_items'], delivery_row_id_available)
+        orphan_plan['pc'] = plan_orphan_flags(
+            existing_pc_rows, visited_pc, tasks_by_ap, all_sheet_row_ids,
+            fetch_complete, MODULE_TITLE_FIELD['pc_projects'], pc_row_id_available)
+    to_orphan_delivery   = orphan_plan['delivery']['to_orphan']    # (id, ap_number, reason)
+    to_unorphan_delivery = orphan_plan['delivery']['to_unorphan']  # (id, ap_number)
+    to_orphan_pc         = orphan_plan['pc']['to_orphan']
+    to_unorphan_pc       = orphan_plan['pc']['to_unorphan']
+    to_stamp_delivery    = orphan_plan['delivery']['to_stamp']     # (id, ap_number, smartsheet_row_id)
+    to_stamp_pc          = orphan_plan['pc']['to_stamp']
+    to_clear_orphan_pending_delivery = orphan_plan['delivery']['to_clear_pending']  # (id, ap_number)
+    to_clear_orphan_pending_pc       = orphan_plan['pc']['to_clear_pending']
+    if dry_run:
+        for item_id, ap, reason in to_orphan_delivery:
+            print(f"[DRY RUN] ORPHAN   {ap:14} delivery — {ORPHAN_REASON_TEXT[reason]}, would flag ap_orphaned")
+        for item_id, ap, reason in to_orphan_pc:
+            print(f"[DRY RUN] ORPHAN   {ap:14} P&C      — {ORPHAN_REASON_TEXT[reason]}, would flag ap_orphaned")
+        for item_id, ap in to_unorphan_delivery:
+            print(f"[DRY RUN] UNORPHAN {ap:14} delivery — back in tracker, would clear ap_orphaned")
+        for item_id, ap in to_unorphan_pc:
+            print(f"[DRY RUN] UNORPHAN {ap:14} P&C      — back in tracker, would clear ap_orphaned")
+        for item_id, ap in to_clear_orphan_pending_delivery:
+            print(f"[DRY RUN] CLEAR    {ap:14} delivery — orphaned row still flagged ap_pending_update; would log + clear (no tracker row to settle against)")
+        for item_id, ap in to_clear_orphan_pending_pc:
+            print(f"[DRY RUN] CLEAR    {ap:14} P&C      — orphaned row still flagged ap_pending_update; would log + clear (no tracker row to settle against)")
 
     # ── Mirror landing plan (Ops Phase 2, decisions 69ba45bd/e217604f) ──
     # Planned pre-gate so dry runs report it; the actual writes run FIRST
@@ -2076,9 +2230,14 @@ def main(dry_run: bool = False):
             f"ambiguous lead: {skipped_ambiguous}, owner is viewer: {skipped_viewer}, "
             f"pending Smartsheet update: {skipped_pending}, unchanged: {skipped_unchanged}"
         )
+        _reassigned = sum(1 for _, _, rsn in to_orphan_delivery + to_orphan_pc if rsn == 'reassigned')
         orphan_summary = (
-            f"Orphans  — would flag: {len(to_orphan_delivery)} delivery + {len(to_orphan_pc)} P&C, "
-            f"would clear: {len(to_unorphan_delivery)} delivery + {len(to_unorphan_pc)} P&C"
+            f"Orphans  — would flag: {len(to_orphan_delivery)} delivery + {len(to_orphan_pc)} P&C "
+            f"({_reassigned} reassigned-number, {len(to_orphan_delivery) + len(to_orphan_pc) - _reassigned} deleted), "
+            f"would clear: {len(to_unorphan_delivery)} delivery + {len(to_unorphan_pc)} P&C, "
+            f"orphaned-pending flags to clear: {len(to_clear_orphan_pending_delivery) + len(to_clear_orphan_pending_pc)}, "
+            f"identity stamps: {len(to_stamp_delivery)} delivery + {len(to_stamp_pc)} P&C"
+            + ("" if (delivery_row_id_available and pc_row_id_available) else " [smartsheet_row_id column missing — stamps off]")
         )
         mirror_summary = (
             f"Mirror   — candidates: {len(mirror_candidates)}, would upsert: {len(to_upsert_mirror)}, "
@@ -2244,13 +2403,14 @@ def main(dry_run: bool = False):
         else:
             failed_inserts_pc += 1
 
-    def _strip(payload):
-        return {k: v for k, v in payload.items() if k != '_secondary'}
+    def _strip(payload, row_id_available=True):
+        return {k: v for k, v in payload.items()
+                if k != '_secondary' and (row_id_available or k != 'smartsheet_row_id')}
 
     for i in range(0, len(to_insert_delivery), 25):
         batch = to_insert_delivery[i:i + 25]
         try:
-            db.table('action_items').insert([_strip(p) for p in batch]).execute()
+            db.table('action_items').insert([_strip(p, delivery_row_id_available) for p in batch]).execute()
             for item in batch:
                 _count_insert(item, 'delivery')
                 inserted_delivery_items.append(item)
@@ -2258,7 +2418,7 @@ def main(dry_run: bool = False):
             log.error(f"Delivery insert batch failed ({len(batch)} rows) — retrying per row: {e}")
             for item in batch:
                 try:
-                    db.table('action_items').insert(_strip(item)).execute()
+                    db.table('action_items').insert(_strip(item, delivery_row_id_available)).execute()
                     _count_insert(item, 'delivery')
                     inserted_delivery_items.append(item)
                 except Exception as row_e:
@@ -2334,14 +2494,14 @@ def main(dry_run: bool = False):
     for i in range(0, len(to_insert_pc), 25):
         batch = to_insert_pc[i:i + 25]
         try:
-            db.table('pc_projects').insert([_strip(p) for p in batch]).execute()
+            db.table('pc_projects').insert([_strip(p, pc_row_id_available) for p in batch]).execute()
             for item in batch:
                 _count_insert(item, 'pc')
         except Exception as e:
             log.error(f"P&C insert batch failed ({len(batch)} rows) — retrying per row: {e}")
             for item in batch:
                 try:
-                    db.table('pc_projects').insert(_strip(item)).execute()
+                    db.table('pc_projects').insert(_strip(item, pc_row_id_available)).execute()
                     _count_insert(item, 'pc')
                 except Exception as row_e:
                     _count_insert_failure(item, 'pc')
@@ -2399,24 +2559,24 @@ def main(dry_run: bool = False):
     orphaned_pc       = 0
     unorphaned        = 0
     _orphan_now = datetime.now(timezone.utc).isoformat()
-    for item_id, ap_num in to_orphan_delivery:
+    for item_id, ap_num, reason in to_orphan_delivery:
         try:
             db.table('action_items') \
                 .update({'ap_orphaned': True, 'ap_orphaned_since': _orphan_now}) \
                 .eq('id', item_id) \
                 .execute()
             orphaned_delivery += 1
-            log.warning(f"{ap_num}: ORPHANED (Delivery) — ap_number no longer in the tracker; flagged, not touched")
+            log.warning(f"{ap_num}: ORPHANED (Delivery) — {ORPHAN_REASON_TEXT[reason]}; flagged, not touched")
         except Exception as e:
             log.error(f"Orphan flag failed for {ap_num} (Delivery): {e}")
-    for item_id, ap_num in to_orphan_pc:
+    for item_id, ap_num, reason in to_orphan_pc:
         try:
             db.table('pc_projects') \
                 .update({'ap_orphaned': True, 'ap_orphaned_since': _orphan_now}) \
                 .eq('id', item_id) \
                 .execute()
             orphaned_pc += 1
-            log.warning(f"{ap_num}: ORPHANED (P&C) — ap_number no longer in the tracker; flagged, not touched")
+            log.warning(f"{ap_num}: ORPHANED (P&C) — {ORPHAN_REASON_TEXT[reason]}; flagged, not touched")
         except Exception as e:
             log.error(f"Orphan flag failed for {ap_num} (P&C): {e}")
     for table, pairs in (('action_items', to_unorphan_delivery), ('pc_projects', to_unorphan_pc)):
@@ -2430,6 +2590,53 @@ def main(dry_run: bool = False):
                 log.info(f"{ap_num}: back in the tracker — ap_orphaned cleared ({table})")
             except Exception as e:
                 log.error(f"Orphan clear failed for {ap_num} ({table}): {e}")
+
+    # ── Identity stamps (decision 2026-09-21): the sheet row id each live
+    # module row was matched to this run. A column the sync owns — never
+    # content; a stamp that fails just retries next run.
+    stamped = 0
+    for table, triples in (('action_items', to_stamp_delivery), ('pc_projects', to_stamp_pc)):
+        for item_id, ap_num, row_id in triples:
+            try:
+                db.table(table).update({'smartsheet_row_id': row_id}).eq('id', item_id).execute()
+                stamped += 1
+            except Exception as e:
+                log.error(f"Identity stamp failed for {ap_num} ({table}, row {row_id}): {e}")
+    if stamped:
+        log.info(f"Identity stamps written: {stamped} module row(s) now carry their smartsheet_row_id")
+
+    # ── Orphaned rows still flagged ap_pending_update: clear, audit-first.
+    # An orphan has no tracker row to settle against under the per-field
+    # rule (decision 2026-09-08), so the flag could never clear on its own
+    # and the digest would keep asking Jen to apply an edit to a sheet row
+    # that no longer exists — the AP-0785-3-3 notice of 2026-09-21. Same
+    # log-first/clear-after discipline as the supersede path: a failed
+    # audit insert withholds the clear.
+    orphan_pending_cleared = 0
+    for table, module_key, pairs in (('action_items', 'delivery', to_clear_orphan_pending_delivery),
+                                     ('pc_projects', 'pc', to_clear_orphan_pending_pc)):
+        for item_id, ap_num in pairs:
+            audit = [{
+                'module':     module_key,
+                'item_id':    item_id,
+                'ap_number':  ap_num,
+                'field':      'ap_pending_update',
+                'old_value':  'true',
+                'new_value':  'false',
+                'reason':     ORPHAN_PENDING_CLEAR_REASON,
+                'changed_by': None,
+            }]
+            if not _log_supersede(audit, ap_num):
+                continue
+            try:
+                db.table(table) \
+                    .update({'ap_pending_update': False, 'ap_pending_since': None}) \
+                    .eq('id', item_id) \
+                    .execute()
+                orphan_pending_cleared += 1
+                log.warning(f"{ap_num}: ap_pending_update cleared ({table}) — row is orphaned from the tracker, nothing to reconcile against")
+            except Exception as e:
+                log.error(f"Orphaned-pending clear failed for {ap_num} ({table}): {e}")
 
     # ── End-date change events (diffed pre-gate; deliberately AFTER the
     # child sync, and BEFORE the ap_titles upsert: if the stored end_date
@@ -2520,6 +2727,7 @@ def main(dry_run: bool = False):
         f"pending Smartsheet updates: {len(pending)}, "
         f"escalated: {len(escalations)}, "
         f"orphans flagged: {orphaned_delivery + orphaned_pc}, orphans cleared: {unorphaned}, "
+        f"orphaned-pending flags cleared: {orphan_pending_cleared}, identity stamps: {stamped}, "
         f"WIP flags set: {wip_flagged} | "
         f"AP titles: captured {len(parent_titles)}, written {titles_written}, "
         f"end-date events: {len(date_events)} detected, {date_events_written} written, "
@@ -2613,6 +2821,7 @@ def main(dry_run: bool = False):
                     f'pc_closed={closed_pc} '
                     f'pc_pending_cleared={cleared_pending_pc} skipped={skipped_total} '
                     f'orphans_flagged={orphaned_delivery + orphaned_pc} orphans_cleared={unorphaned} '
+                    f'orphan_pending_cleared={orphan_pending_cleared} identity_stamps={stamped} '
                     f'titles_captured={len(parent_titles)} titles_written={titles_written} '
                     f'date_events_detected={len(date_events)} date_events_written={date_events_written} '
                     f'date_events_skipped_inactive={date_events_skipped_inactive} '

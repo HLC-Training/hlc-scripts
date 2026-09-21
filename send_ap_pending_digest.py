@@ -48,7 +48,17 @@ Flow:
     the app's workflow wording ("Apply in Smartsheet …").
   - Removed-from-tracker section lists rows that are still OPEN in ORiON
     (the section's own wording) — a closed row that later dropped out of
-    the sheet is not something Jen needs to review.
+    the sheet is not something Jen needs to review. Since 2026-09-21
+    (decision 2026-09-21-pc-renumber-zombies, bug 4dfe07fd) "removed"
+    also covers a row whose AP number was re-issued to a DIFFERENT action
+    by a delete-and-recreate renumber — sync_ap.py flags those as orphans
+    too (the AP-0785-3-x P&C subtree that produced a mislabeled notice).
+  - Orphaned state WINS over pending (same decision): a row flagged BOTH
+    ap_orphaned and ap_pending_update has no live tracker row to reconcile
+    against, so it is never rendered as an "apply in Smartsheet" ask — it
+    appears only in the removed-from-tracker section (if still open). The
+    sync clears such a flag on its next run (audit row first); this filter
+    keeps the digest honest in the window between.
   - Sent via Resend (same endpoint/from-address as orion-pll/lib/resend.ts).
     A send failure raises and fails the job — a missed daily digest
     should page, not vanish silently.
@@ -121,7 +131,7 @@ log = logging.getLogger(__name__)
 # ─── DATA ───────────────────────────────────────────────────────
 def fetch_pending_delivery_rows(db) -> list[dict]:
     resp = db.table('action_items') \
-        .select('id, ap_number, action_text, status, due_date, original_due_date, ap_pending_since, owner_id, ap_is_parent, ap_is_child') \
+        .select('id, ap_number, action_text, status, due_date, original_due_date, ap_pending_since, owner_id, ap_is_parent, ap_is_child, ap_orphaned') \
         .eq('source', 'ap_import') \
         .eq('ap_pending_update', True) \
         .execute()
@@ -137,7 +147,7 @@ def fetch_pending_pc_rows(db) -> list[dict]:
     # original_target_date. Normalized into the same due_date/
     # original_due_date keys here so downstream rendering is module-agnostic.
     resp = db.table('pc_projects') \
-        .select('id, ap_number, title, status, target_end_date, original_target_date, ap_pending_since, owner_id, ap_is_parent, ap_is_child') \
+        .select('id, ap_number, title, status, target_end_date, original_target_date, ap_pending_since, owner_id, ap_is_parent, ap_is_child, ap_orphaned') \
         .eq('ap_pending_update', True) \
         .execute()
     rows = resp.data or []
@@ -204,6 +214,23 @@ def reconcile_rows(rows: list[dict], reasons_by_item: dict, tracker_by_ap: dict)
         r['reasons'] = [e for e in entries if e.get('field') in open_fields]
         kept.append(r)
     return kept, dropped
+
+
+def suppress_orphaned_pending(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Orphaned state wins (decision 2026-09-21-pc-renumber-zombies): a
+    flagged row that is ALSO ap_orphaned has no live tracker row for Jen to
+    apply the edit to, so it must not raise a pending ask. Returns
+    (still_pending, suppressed). The suppressed rows are not dropped from
+    the email — the removed-from-tracker section lists them if still open."""
+    pending, suppressed = [], []
+    for r in rows:
+        if r.get('ap_orphaned'):
+            suppressed.append(r)
+            log.warning(f"{r.get('ap_number')} ({r['module']}): flagged ap_pending_update but orphaned from the tracker — "
+                        f"not listed as pending (no live tracker row to apply it to); see removed-from-tracker section")
+        else:
+            pending.append(r)
+    return pending, suppressed
 
 
 def fetch_master_pending_rows(db) -> list[dict]:
@@ -417,10 +444,11 @@ def build_orphan_html_section(orphans: list[dict]) -> str:
     intro = (
         f"<p style=\"margin-top:24px;\"><strong>Removed from the tracker — needs review "
         f"({len(orphans)} item{'s' if len(orphans) != 1 else ''}).</strong> "
-        "These AP items are still open in ORiON but their AP number is no longer "
-        "in the Action Plan Tracker (the row was deleted). Nothing has been "
-        "changed in ORiON — please review whether the deletion was intentional "
-        "and either close the ORiON item or restore the tracker row.</p>"
+        "These AP items are still open in ORiON but the tracker row they came from "
+        "is gone — either the row was deleted, or its AP number now belongs to a "
+        "different action after a renumber. Nothing has been changed in ORiON — "
+        "please review whether that was intentional and either close the ORiON "
+        "item or restore the tracker row.</p>"
     )
     header = (
         "<tr>"
@@ -536,10 +564,11 @@ def build_text_body(rows: list[dict], orphans: list[dict] | None = None) -> str:
     if orphans:
         lines += [
             f"REMOVED FROM THE TRACKER — NEEDS REVIEW ({len(orphans)} item{'s' if len(orphans) != 1 else ''})",
-            "These AP items are still open in ORiON but their AP number is no",
-            "longer in the Action Plan Tracker (the row was deleted). Nothing has",
-            "been changed in ORiON — please review whether the deletion was",
-            "intentional and either close the ORiON item or restore the tracker row.",
+            "These AP items are still open in ORiON but the tracker row they came",
+            "from is gone — either the row was deleted, or its AP number now belongs",
+            "to a different action after a renumber. Nothing has been changed in",
+            "ORiON — please review whether that was intentional and either close",
+            "the ORiON item or restore the tracker row.",
             "",
         ]
         for r in orphans:
@@ -607,6 +636,7 @@ def main():
         return True
 
     pending_raw = [r for r in fetch_pending_delivery_rows(db) + fetch_pending_pc_rows(db) if _not_fixture(r)]
+    pending_raw, orphaned_pending = suppress_orphaned_pending(pending_raw)
     orphan_raw  = [r for r in fetch_orphaned_delivery_rows(db) + fetch_orphaned_pc_rows(db) if _not_fixture(r)]
     master_raw  = [r for r in fetch_master_pending_rows(db)
                    if not is_fixture(r.get('ap_number'), r.get('action_text'), r.get('smartsheet_row_id'))]
@@ -658,7 +688,8 @@ def main():
     if args.dry_run:
         print(f"Subject: {subject}\n")
         print(text_body)
-        log.info(f"[DRY RUN] {len(enriched)} row(s), {flagged_count} over {AGE_CALLOUT_DAYS}d, {len(enriched_orphans)} orphan(s), {len(reconciled)} reconciled row(s) omitted — not sent.")
+        log.info(f"[DRY RUN] {len(enriched)} row(s), {flagged_count} over {AGE_CALLOUT_DAYS}d, {len(enriched_orphans)} orphan(s), "
+                 f"{len(reconciled)} reconciled row(s) omitted, {len(orphaned_pending)} orphaned-pending row(s) suppressed — not sent.")
         return
 
     to_email = args.to or JENNIFER_EMAIL
