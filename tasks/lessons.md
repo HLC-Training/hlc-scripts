@@ -988,3 +988,38 @@ fixture names for the write-path proofs, then temporarily rename the rows
 rename back and delete, all inside one sync window (the 15-minute prune
 deletes un-fetched `ap_tracker` rows, so seed right after a run completes).
 Say so in the evidence rather than weakening the exclusion.
+
+## 2026-09-21 — For P&C, `ap_change_log.item_id` points at `pc_projects.id`, not `ap_tracker.id`
+
+From the P&C renumber-zombies build (action item 35988c9e, bug 4dfe07fd). An
+early chat triage joined `ap_change_log.item_id` against `ap_tracker.id`, got
+148/149 misses, and reported "change-log item_ids are orphaned / row UUIDs
+churn on sync." Wrong table: for module rows the log's `item_id` is the
+module row (`pc_projects.id` for module `pc`, `action_items.id` for
+`delivery`); only module `ops` entries point at the mirror (`ap_tracker.id`).
+The join resolved fine (`8e5e4fd1` → the pc_projects row) once aimed at the
+right table, and the real defect was much smaller: one un-pruned projection
+row plus an ap_number-keyed orphan check. Same trap as the 2026-09-08 entry
+above — an empty/failed join is evidence of nothing until the target table is
+confirmed. `ap_change_log.module` tells you which table `item_id` lives in;
+read it before joining.
+
+## 2026-09-21 — A number is not an identity: detection keyed on "does this AP# still exist" cannot see a reassigned number
+
+Same build. `ap_tracker` was pruned correctly on 2026-09-08 because it is
+keyed on `smartsheet_row_id` — the row's permanent identity. The module
+projections (`pc_projects`, `action_items`) had no such column, so their
+orphan check could only ask "is this ap_number still in the sheet?" A
+delete-and-recreate renumber re-issues the old number to a *different*
+action; the check answers "yes" and the stale row lives on as a zombie
+(seven of them, both modules, one of which took a UI edit and produced a
+digest notice under a number that now names another action). Two rules
+from it: (1) any "still exists?" check must key on the source system's
+permanent identity, not on a human-facing number that can be reassigned —
+give the projection that identity (`smartsheet_row_id` stamp) rather than
+inferring it; (2) when a mirror table gets prune/identity parity, every
+table projected FROM it needs the same parity in the same build, or the
+next renumber finds the gap. Also: a zombie's flag can never settle under
+the per-field rule (no tracker row to judge against), so "orphaned wins
+over pending" has to be an explicit rule in both the sync and the digest,
+or the row raises the same wrong ask forever.

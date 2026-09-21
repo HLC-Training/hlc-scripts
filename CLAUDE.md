@@ -1,6 +1,21 @@
 # hlc-scripts
 
-Last updated: 2026-09-14 (later) — October full-AP review pilot (orion-pll
+Last updated: 2026-09-21 — P&C renumber zombies (decision
+`2026-09-21-pc-renumber-zombies.md`, action item `35988c9e`, bug
+`4dfe07fd`): module-row orphan detection in `sync_ap.py` no longer keys on
+ap_number existence — `plan_orphan_flags()` judges each `pc_projects` /
+`action_items` row by liveness (visited by this run's projection → stamped
+`smartsheet_row_id` still in the fetch → legacy rows by same-title match
+under their number), so a number re-issued to a different action by a
+delete-and-recreate renumber flags as an orphan (reason `reassigned`).
+Flags only, never deletes. An orphaned row still flagged
+`ap_pending_update` gets an audit row and the flag cleared; the digest
+never renders an `ap_orphaned` row as pending ("orphaned wins"). New
+nullable `smartsheet_row_id` on both module tables — **migration NOT yet
+applied** (orion-pll `docs/migrations/2026-09-21_module_rows_smartsheet_row_id.sql`,
+handed to Jim); until it is, `load_module_rows()` logs a warning every run
+and detection runs without stamps.
+Prior: 2026-09-14 (later) — October full-AP review pilot (orion-pll
 decision doc `2026-09-14-october-full-ap-review-pilot.md`): `ap_pending.py`
 now treats a field as `pending` when the STORED `ap_tracker` row is
 `orion_dirty` and its `orion_written_value` carries that field's mirror
@@ -52,7 +67,14 @@ Scheduled sync and automation scripts for the SAM COS and ORiON systems.
   placeholder that never writes. This script stays strictly
   Smartsheet→ORiON; its loop-prevention echo handling is what absorbs the
   app's pushes (AP Manager flag checked in code on both sides because
-  service_role bypasses RLS). Runs on GitHub Actions. Parent-AP end-date
+  service_role bypasses RLS). Runs on GitHub Actions. Module-row orphan
+  detection (since 2026-09-21, `plan_orphan_flags()`): a projection row is
+  live if this run's projection visited it, else if its stamped
+  `smartsheet_row_id` is still in the fetch, else (legacy, unstamped) if a
+  sheet row under its number carries the same title; anything else is
+  flagged `ap_orphaned` with reason `deleted` or `reassigned`, gated on
+  `fetch_complete`. Flag/unflag/stamp only — never a delete or a close.
+  Parent-AP end-date
   moves (`ap_titles.end_date` diff → `ap_end_date_changes`, consumed by
   orion-pll's ack flow) only fire an event for ACTIVE parent APs since
   2026-09-11 (`ACTIVE_STATUSES` gate, bug `ca9beaeb` Phase 2) — a
@@ -73,13 +95,19 @@ Scheduled sync and automation scripts for the SAM COS and ORiON systems.
   `sync_ap.py` (clears the flag, logs superseded values first) and
   `send_ap_pending_digest.py` (renders only what is still pending) import
   it — never re-derive the rule in either script. Tests:
-  `python tests/test_ap_pending.py`.
+  `python tests/test_ap_pending.py`. An `ap_orphaned` row is outside this
+  rule entirely (no tracker row to judge against): the sync clears its
+  flag with an audit row, the digest suppresses it from the pending table
+  (`suppress_orphaned_pending`, tests in
+  `tests/test_ap_pending_digest_orphan_suppression.py`).
 - `send_ap_pending_digest.py` — daily digest to Jen Wright of AP rows
   still flagged `ap_pending_update` (both modules), dirty `ap_tracker` rows
   holding a held (dependency-blocked) AP-manager Current Finish edit with no
   module projection ("Master tracker" section, since 2026-09-14 — the
   orion-pll app logs those against the mirror row as `ap_change_log`
-  module `ops`), plus rows orphaned from the tracker while still open. Read-only; `--dry-run` renders locally (set
+  module `ops`), plus rows orphaned from the tracker while still open
+  (deleted OR renumbered away — since 2026-09-21 a row that is both
+  orphaned and pending appears ONLY in that section, never as an ask). Read-only; `--dry-run` renders locally (set
   `PYTHONIOENCODING=utf-8` on Windows, bug 49e0cbe9). Still on the GitHub
   `schedule:` (weekdays 12:00 UTC) — not yet moved to Vercel.
 - `sync_xyleme.py` — Xyleme modernization + exams Smartsheets to ORiON
@@ -151,6 +179,18 @@ permits them (opposite `is_parent`) while blocking a stale-mirror duplicate
 Anything reading `ap_tracker` by AP number must still pick the row by shape
 and freshness (`ap_pending.pick_tracker_row`) rather than assuming one row
 per number.
+
+The module projections (`pc_projects`, `action_items`) are matched by
+`module_row_key(ap_number, pure_parent)` and, since 2026-09-21, carry the
+same permanent identity as a nullable `smartsheet_row_id` stamp (written
+on insert and on every projection match; migration pending — see the
+header). Their orphan detection keys on that stamp, not on the number:
+a renumber that re-issues a number to a different action leaves the OLD
+projection with a vanished stamp (or, unstamped, with no same-title sheet
+row under its number), and it is flagged `ap_orphaned` — never pruned
+(decision `2026-09-21-pc-renumber-zombies.md`). `ap_change_log.item_id`
+for module `pc`/`delivery` is the MODULE row id, not `ap_tracker.id`
+(only module `ops` points at the mirror) — join accordingly.
 
 ## Databases
 
