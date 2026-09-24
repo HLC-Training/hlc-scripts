@@ -1230,14 +1230,21 @@ def build_delivery_insert(task: dict, owner_id, shared: dict, status: str) -> di
 
 
 def build_delivery_diff(task: dict, ex: dict, owner_id, shared: dict, status: str) -> tuple[dict, dict]:
-    """(content_fields, meta_fields) for a Delivery row. Content rules are
-    byte-identical to the pre-widening diff: dates guarded against blank
-    clobber (bug 74ebd314), no_report_out unguarded (real boolean), priority
-    never re-forced (bug aaaa96ea), action_text/notes/category deliberately
-    not synced on update (pre-existing module asymmetry, preserved)."""
+    """(content_fields, meta_fields) for a Delivery row. Content rules:
+    dates guarded against blank clobber (bug 74ebd314), no_report_out
+    unguarded (real boolean), priority never re-forced (bug aaaa96ea),
+    notes/category deliberately not synced on update (pre-existing module
+    asymmetry, preserved). action_text refreshes every run since
+    2026-09-24 (bug 9b8caf18) — same unconditional inequality check as
+    build_pc_diff's title, no blank guard: the tracker's Improvement value
+    is never blank for a live row, and the field is now sync-owned in
+    orion-pll (lib/sync-owned-fields.ts) so there is no ORiON-side edit
+    for this to clobber."""
     fields = {}
     if owner_id != ex.get('owner_id'):
         fields['owner_id'] = owner_id
+    if task['action_text'] != ex.get('action_text'):
+        fields['action_text'] = task['action_text']
     if status != ex['status']:
         fields['status'] = status
     if shared['due_date'] is not None and shared['due_date'] != ex.get('due_date'):
