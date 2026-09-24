@@ -1,0 +1,48 @@
+# ORiON workload check-in answers → SAM COS pll_capacity_log (self_report).
+# Daily is sufficient (the check-in is monthly per PLL; the EOD consumer runs
+# once a day). Minute :23 on purpose: :00/:30 are the contended Actions cron
+# slots on this account (tasks/lessons.md). 11:23 UTC = 6:23 AM CDT / 5:23 CST,
+# ahead of the working day so the EOD skill's "new self_report rows since last
+# EOD" pass (phase 2, action item 0121bfc0) sees the same-day answers.
+# Every run is an idempotent reconcile over the lookback window, so a manual
+# dispatch produces the same result a scheduled run would.
+name: Sync workload check-ins to SAM COS
+
+on:
+  schedule:
+    - cron: '23 11 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (render only, do not write to SAM COS)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install supabase tzdata
+
+      - name: Unit tests (mapping table, Chicago date, row shape)
+        run: python tests/test_workload_checkin_mapping.py
+
+      - name: Sync
+        env:
+          ORION_SUPABASE_SERVICE_KEY: ${{ secrets.ORION_SUPABASE_SERVICE_KEY }}
+          SAMCOS_SERVICE_KEY: ${{ secrets.SAMCOS_SERVICE_KEY }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          ARGS=()
+          if [ "$DRY_RUN" = "true" ]; then ARGS+=(--dry-run); fi
+          python sync_workload_checkins.py "${ARGS[@]}"

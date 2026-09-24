@@ -1,6 +1,17 @@
 # hlc-scripts
 
-Last updated: 2026-09-24 — Delivery title refresh (decision
+Last updated: 2026-09-24 (later) — `sync_workload_checkins.py` added: ORiON
+`workload_checkins` (the monthly PLL workload check-in, orion-pll decision
+`2026-09-24-workload-checkin-v1.md`, SAM COS action item `ed6e818e`) →
+SAM COS `pll_capacity_log` rows with `source = 'self_report'`. This job is
+the ONE writer of that source; orion-pll never writes to SAM COS. Daily on
+GitHub Actions (`sync-workload-checkins.yml`, 11:23 UTC), idempotent on
+`pll_capacity_log.orion_checkin_id` (UNIQUE, `migrations/2026-09-24_
+pll_capacity_log_self_report.sql`, which also widened the `source` CHECK
+from `meeting|eod` to `meeting|eod|self_report`). Mapping table and
+Chicago session-date rules are in the script header and proven by
+`tests/test_workload_checkin_mapping.py`.
+Prior: 2026-09-24 — Delivery title refresh (decision
 `2026-09-24-sync-ap-delivery-title-refresh.md`, action item `5330c69a`,
 bug `9b8caf18`): `build_delivery_diff` in `sync_ap.py` now refreshes
 `action_items.action_text` from the tracker's Improvement value every
@@ -137,6 +148,15 @@ Scheduled sync and automation scripts for the SAM COS and ORiON systems.
   `2026-09-11-sync-xyleme-notes-guard-progress-field.md`).
 - `sync_repo_docs.py` — repo reasoning docs to SAM COS Supabase. Vendored
   identically into four repos; samcos is canonical.
+- `sync_workload_checkins.py` — ORiON `workload_checkins` → SAM COS
+  `pll_capacity_log` (`source='self_report'`), daily on GitHub Actions
+  (`sync-workload-checkins.yml`). Maps the PLL's raw answer keys to
+  `capacity_read` (Q1 sets the level, Q2 only moves the middle band —
+  table in the script header), `session_date` = submission instant in
+  America/Chicago, free text → `note`. Upserts on the UNIQUE
+  `orion_checkin_id` with ignore-duplicates, so every run is a safe
+  reconcile over a 120-day window. Never touches `meeting`/`eod` rows.
+  Tests (no DB): `python tests/test_workload_checkin_mapping.py`.
 - **Three digests, three separate everything.** `send_pll_digest.py` (daily,
   each PLL, Delivery `action_items`), `send_tpm_digest.py` (daily, **Michele
   only**, all-TPM P&C roll-up), `send_tpm_individual_digest.py` (**weekly
@@ -213,7 +233,8 @@ for module `pc`/`delivery` is the MODULE row id, not `ap_tracker.id`
 ## Databases
 
 - SAM COS `hucrkbomqsxpmokgypxg` — `action_items`, `bugs`, `decisions`,
-  `daily_log`, `context_store`, `vault_write_queue`, `repo_docs`
+  `daily_log`, `context_store`, `vault_write_queue`, `repo_docs`,
+  `pll_capacity_log` (self_report rows only)
 - ORiON `czdkctjbejnwuopigxta` — portal tables, prefixed `portal_`
 - GreenThumb `xfzjywareudbvuubzfye` — never used by anything in this repo
 
