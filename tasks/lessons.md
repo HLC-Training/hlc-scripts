@@ -1023,3 +1023,13 @@ next renumber finds the gap. Also: a zombie's flag can never settle under
 the per-field rule (no tracker row to judge against), so "orphaned wins
 over pending" has to be an explicit rule in both the sync and the digest,
 or the row raises the same wrong ask forever.
+
+## 2026-09-24 — Diff the update payloads, not just the insert payloads
+
+When two sync paths project the same source row into two module tables,
+compare what each one writes on UPDATE, field by field. P&C refreshed
+`title` every run; Delivery set `action_text` on insert and never again.
+Insert payloads matched, so nobody saw it until Jen renamed rows in the
+tracker, and ORiON showed 22 wrong titles across four APs, including a
+whole branch still named for the course it was cloned from. A projection
+that only ever inserts a field is a snapshot, not a sync.

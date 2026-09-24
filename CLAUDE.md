@@ -1,6 +1,24 @@
 # hlc-scripts
 
-Last updated: 2026-09-21 — P&C renumber zombies (decision
+Last updated: 2026-09-24 — Delivery title refresh (decision
+`2026-09-24-sync-ap-delivery-title-refresh.md`, action item `5330c69a`,
+bug `9b8caf18`): `build_delivery_diff` in `sync_ap.py` now refreshes
+`action_items.action_text` from the tracker's Improvement value every
+run, mirroring `build_pc_diff`'s unconditional `pc_projects.title` refresh
+(no blank guard) — before this, Delivery only ever set `action_text` on
+insert, so a tracker rename never reached ORiON (22 of 279 `ap_import`
+rows were stale at diagnosis). `notes`/`category` stay insert-only
+(unchanged, append-only human log). The field is now sync-owned in
+orion-pll (`lib/sync-owned-fields.ts`'s `ap_import: ["action_text"]`) —
+the Delivery Edit modal greys the field and the server refuses a
+client-submitted change, same pattern as the Xyleme dates — because
+`action_text` is NOT in orion-pll's `SYNC_MIRRORED_FIELDS.delivery`, so an
+ORiON-side edit would have had zero pending-flag protection (Jim's ruling:
+tracker wins outright, not extended into the pending mechanism). P&C's own
+title field has the identical UI gap (editable in the modal on `ap_synced`
+rows) but IS in `SYNC_MIRRORED_FIELDS.pc` and protected via the pending
+flag — reported, not changed by this build.
+Prior: 2026-09-21 — P&C renumber zombies (decision
 `2026-09-21-pc-renumber-zombies.md`, action item `35988c9e`, bug
 `4dfe07fd`): module-row orphan detection in `sync_ap.py` no longer keys on
 ap_number existence — `plan_orphan_flags()` judges each `pc_projects` /
