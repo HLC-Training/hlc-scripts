@@ -1,6 +1,12 @@
 # hlc-scripts
 
-Last updated: 2026-09-24 (later) — `sync_workload_checkins.py` added: ORiON
+Last updated: 2026-09-29 — send_ap_pending_digest.py groups rows by parent AP number
+(natural numeric sort via parse_ap_key(); Delivery, P&C and Master
+tracker rows interleave within a group in the one table, module label
+kept; group headers use the AP number string as stored; rows without an
+AP number last). Order only, filtering untouched. Origin: Jen Wright
+feedback, action item 509ede2d.
+Prior: 2026-09-24 (later) — `sync_workload_checkins.py` added: ORiON
 `workload_checkins` (the monthly PLL workload check-in, orion-pll decision
 `2026-09-24-workload-checkin-v1.md`, SAM COS action item `ed6e818e`) →
 SAM COS `pll_capacity_log` rows with `source = 'self_report'`. This job is

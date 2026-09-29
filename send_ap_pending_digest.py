@@ -428,6 +428,17 @@ def group_rows_by_parent_ap(rows: list[dict]) -> dict:
     return groups
 
 
+def get_group_ap_number_string(group_rows: list[dict]) -> str:
+    """Get the canonical AP number string for a group header.
+    Prefers parent row's string, falls back to first row's string."""
+    if not group_rows:
+        return ""
+    parent_row = next((r for r in group_rows if r.get('ap_is_parent') and not r.get('ap_is_child')), None)
+    if parent_row:
+        return parent_row.get('ap_number', '')
+    return group_rows[0].get('ap_number', '')
+
+
 def enrich_rows(rows: list[dict], owner_names: dict, reasons_by_item: dict) -> list[dict]:
     now = datetime.now(timezone.utc)
     enriched = []
@@ -540,9 +551,10 @@ def build_orphan_html_section(orphans: list[dict]) -> str:
             header_text = "No AP number"
             parent_title = ""
         else:
-            header_text = f"AP-{group_key}"
+            # Use the AP number string as stored (preserves padding like AP-0785 vs AP-785)
+            header_text = get_group_ap_number_string(group_orphans)
             # Find parent title if a parent row exists in this group
-            parent_row = next((r for r in group_orphans if not r.get('ap_is_child') or (r.get('ap_is_parent') and not r.get('ap_is_child'))), None)
+            parent_row = next((r for r in group_orphans if r.get('ap_is_parent') and not r.get('ap_is_child')), None)
             parent_title = f" — {parent_row['action_text']}" if parent_row and parent_row.get('action_text') else ""
 
         body_rows.append(
@@ -609,9 +621,10 @@ def build_html_body(rows: list[dict], orphans: list[dict] | None = None) -> str:
             header_text = "No AP number"
             parent_title = ""
         else:
-            header_text = f"AP-{group_key}"
+            # Use the AP number string as stored (preserves padding like AP-0785 vs AP-785)
+            header_text = get_group_ap_number_string(group_rows)
             # Find parent title if a parent row exists in this group
-            parent_row = next((r for r in group_rows if not r.get('ap_is_child') or (r.get('ap_is_parent') and not r.get('ap_is_child'))), None)
+            parent_row = next((r for r in group_rows if r.get('ap_is_parent') and not r.get('ap_is_child')), None)
             parent_title = f" — {parent_row['action_text']}" if parent_row and parent_row.get('action_text') else ""
 
         body_rows.append(
@@ -685,9 +698,10 @@ def build_text_body(rows: list[dict], orphans: list[dict] | None = None) -> str:
             header_text = "No AP number"
             parent_title = ""
         else:
-            header_text = f"AP-{group_key}"
+            # Use the AP number string as stored (preserves padding like AP-0785 vs AP-785)
+            header_text = get_group_ap_number_string(group_rows)
             # Find parent title if a parent row exists in this group
-            parent_row = next((r for r in group_rows if not r.get('ap_is_child') or (r.get('ap_is_parent') and not r.get('ap_is_child'))), None)
+            parent_row = next((r for r in group_rows if r.get('ap_is_parent') and not r.get('ap_is_child')), None)
             parent_title = f" — {parent_row['action_text']}" if parent_row and parent_row.get('action_text') else ""
 
         lines.append(f"{header_text}{parent_title}")
@@ -735,8 +749,9 @@ def build_text_body(rows: list[dict], orphans: list[dict] | None = None) -> str:
                 header_text = "No AP number"
                 parent_title = ""
             else:
-                header_text = f"AP-{group_key}"
-                parent_row = next((r for r in group_orphans if not r.get('ap_is_child') or (r.get('ap_is_parent') and not r.get('ap_is_child'))), None)
+                # Use the AP number string as stored (preserves padding like AP-0785 vs AP-785)
+                header_text = get_group_ap_number_string(group_orphans)
+                parent_row = next((r for r in group_orphans if r.get('ap_is_parent') and not r.get('ap_is_child')), None)
                 parent_title = f" — {parent_row['action_text']}" if parent_row and parent_row.get('action_text') else ""
 
             lines.append(f"{header_text}{parent_title}")

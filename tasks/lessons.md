@@ -1033,3 +1033,7 @@ Insert payloads matched, so nobody saw it until Jen renamed rows in the
 tracker, and ORiON showed 22 wrong titles across four APs, including a
 whole branch still named for the course it was cloned from. A projection
 that only ever inserts a field is a snapshot, not a sync.
+
+## 2026-09-29 — Reconstruct IDs from parsed ints only when rendering a parsed value; preserve the original string
+
+send_ap_pending_digest.py groups AP rows by parent number (parsed as integers for numeric sort, not string sort), and group headers need to show the AP number the rows carry. The initial fix reconstructed "AP-{parent_int}" in headers, losing the original padding: "AP-0785" became "AP-785". The rows still displayed correctly (`r['ap_number']` is the raw string), but headers disagreed with rows. The durable pattern: extract the parsed value for comparison and sorting; preserve the source string for display. For group headers, get the AP number string from the first row in the group (preferring the parent row's copy if present), never from reconstructed int-to-string. Any rendered value that came through parsing needs the original string preserved alongside it.
