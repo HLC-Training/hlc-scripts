@@ -86,6 +86,15 @@ from ap_pending import (
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
+# Load .env.local if it exists and environment variables are not set
+_env_local = Path(__file__).parent / ".env.local"
+if _env_local.exists():
+    for line in _env_local.read_text().strip().split('\n'):
+        if '=' in line and not line.startswith('#'):
+            key, value = line.split('=', 1)
+            if key.strip() not in os.environ:
+                os.environ[key.strip()] = value.strip()
+
 # ─── CONFIG ─────────────────────────────────────────────────────
 SUPABASE_URL         = "https://czdkctjbejnwuopigxta.supabase.co"
 # Project-scoped name (bug d2f44099, matching sync_ap.py / bug 306cea89) — the
