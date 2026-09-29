@@ -352,11 +352,71 @@ def fetch_change_log_reasons(db, rows: list[dict]) -> dict:
     }
 
 
+def parse_ap_key(ap_number: str) -> tuple | None:
+    """Parse AP number into (parent_int, tuple_of_child_ints) for sorting.
+
+    AP-189 → (189, ())
+    AP-0785 → (785, ())
+    AP-0785-2 → (785, (2,))
+    AP-0785-2-3 → (785, (2, 3))
+    "" or None → None
+    "not an AP" → None
+
+    Groups sort numerically by parent, then by (parent, children) ascending.
+    """
+    if not ap_number or not isinstance(ap_number, str):
+        return None
+    ap_number = ap_number.strip()
+    if not ap_number.startswith('AP-'):
+        return None
+    try:
+        parts = ap_number[3:].split('-')
+        if not parts or not parts[0]:
+            return None
+        parent = int(parts[0])
+        children = tuple(int(p) for p in parts[1:]) if len(parts) > 1 else ()
+        return (parent, children)
+    except (ValueError, IndexError):
+        return None
+
+
 def parse_timestamp(raw: str) -> datetime:
     ts = datetime.fromisoformat(raw.replace('Z', '+00:00'))
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
     return ts
+
+
+def sort_rows_by_ap_key(rows: list[dict]) -> list[dict]:
+    """Sort rows by parent AP number (numeric), then by child segments (numeric),
+    then by age (oldest first). Rows with no parseable AP number sort last."""
+    def sort_key(r):
+        ap_key = parse_ap_key(r.get('ap_number'))
+        if ap_key is None:
+            # Unparseables sort last, by age descending
+            return (float('inf'),) + (r['age_days'] if r.get('age_days') is not None else -1,)
+        parent, children = ap_key
+        # Rows with no parent sort first, then by age descending within the no-parent group
+        return (parent, children, -(r['age_days'] if r.get('age_days') is not None else -1))
+    return sorted(rows, key=sort_key)
+
+
+def group_rows_by_parent_ap(rows: list[dict]) -> dict:
+    """Group sorted rows by parent AP number. Returns {parent_int: [rows]} and
+    {'_no_ap': [rows]} for unparseable rows. Rows are already sorted by
+    sort_rows_by_ap_key."""
+    groups = {}
+    no_ap = []
+    for r in rows:
+        ap_key = parse_ap_key(r.get('ap_number'))
+        if ap_key is None:
+            no_ap.append(r)
+        else:
+            parent, _ = ap_key
+            groups.setdefault(parent, []).append(r)
+    if no_ap:
+        groups['_no_ap'] = no_ap
+    return groups
 
 
 def enrich_rows(rows: list[dict], owner_names: dict, reasons_by_item: dict) -> list[dict]:
@@ -375,9 +435,8 @@ def enrich_rows(rows: list[dict], owner_names: dict, reasons_by_item: dict) -> l
             # rows it never judged (no logged edits) fall back to the raw list.
             'reasons':       r.get('reasons', reasons_by_item.get(r['id'], [])),
         })
-    # Oldest (most overdue) first — the rows most in need of attention lead.
-    enriched.sort(key=lambda r: r['age_days'] if r['age_days'] is not None else -1, reverse=True)
-    return enriched
+    # Sort by parent AP number (numeric), then children (numeric), then age (oldest first).
+    return sort_rows_by_ap_key(enriched)
 
 
 # ─── RENDERING ──────────────────────────────────────────────────
@@ -403,8 +462,8 @@ def enrich_orphans(rows: list[dict], owner_names: dict) -> list[dict]:
             'orphaned_since': since,
             'orphan_age':     (now - since).days if since else None,
         })
-    enriched.sort(key=lambda r: r['orphan_age'] if r['orphan_age'] is not None else -1, reverse=True)
-    return enriched
+    # Sort by parent AP number (numeric), then children (numeric), then age (oldest first).
+    return sort_rows_by_ap_key(enriched)
 
 
 def module_label(module: str) -> str:
@@ -456,22 +515,48 @@ def build_orphan_html_section(orphans: list[dict]) -> str:
         "<th>Due Date</th><th>Not in tracker since</th>"
         "</tr>"
     )
+    groups = group_rows_by_parent_ap(orphans)
+    group_keys = sorted(
+        [k for k in groups.keys() if k != '_no_ap'],
+        key=lambda k: k if isinstance(k, int) else float('inf')
+    )
+    if '_no_ap' in groups:
+        group_keys.append('_no_ap')
+
     body_rows = []
-    for r in orphans:
-        since_str = r['orphaned_since'].strftime('%Y-%m-%d') if r['orphaned_since'] else '—'
-        if r['orphan_age'] is not None:
-            since_str += f" ({r['orphan_age']}d)"
+    for group_key in group_keys:
+        group_orphans = groups[group_key]
+        # Add group header row
+        if group_key == '_no_ap':
+            header_text = "No AP number"
+            parent_title = ""
+        else:
+            header_text = f"AP-{group_key}"
+            # Find parent title if a parent row exists in this group
+            parent_row = next((r for r in group_orphans if not r.get('ap_is_child') or (r.get('ap_is_parent') and not r.get('ap_is_child'))), None)
+            parent_title = f" — {parent_row['action_text']}" if parent_row and parent_row.get('action_text') else ""
+
         body_rows.append(
-            "<tr>"
-            f"<td>{esc(module_label(r['module']))}</td>"
-            f"<td>{esc(r['ap_number'])}</td>"
-            f"<td>{esc(r['action_text'])}</td>"
-            f"<td>{esc(r['status'])}</td>"
-            f"<td>{esc(r['owner_name'])}</td>"
-            f"<td>{esc(r['due_date'])}</td>"
-            f"<td>{esc(since_str)}</td>"
-            "</tr>"
+            f'<tr style="background-color:#f0f0f0;"><td colspan="7"><strong>{esc(header_text)}{esc(parent_title)}</strong></td></tr>'
         )
+
+        # Add data rows for this group
+        for r in group_orphans:
+            since_str = r['orphaned_since'].strftime('%Y-%m-%d') if r['orphaned_since'] else '—'
+            if r['orphan_age'] is not None:
+                since_str += f" ({r['orphan_age']}d)"
+            body_rows.append(
+                "<tr>"
+                f"<td>{esc(module_label(r['module']))}</td>"
+                f"<td>{esc(r['ap_number'])}</td>"
+                f"<td>{esc(r['action_text'])}</td>"
+                f"<td>{esc(r['status'])}</td>"
+                f"<td>{esc(r['owner_name'])}</td>"
+                f"<td>{esc(r['due_date'])}</td>"
+                f"<td>{esc(since_str)}</td>"
+                "</tr>"
+            )
+
     table = (
         '<table cellpadding="6" cellspacing="0" '
         'style="border-collapse:collapse;font-family:Calibri,Arial,sans-serif;font-size:13px;">'
@@ -497,27 +582,55 @@ def build_html_body(rows: list[dict], orphans: list[dict] | None = None) -> str:
         "<th>Age</th><th>Reason</th>"
         "</tr>"
     )
+    groups = group_rows_by_parent_ap(rows)
     body_rows = []
-    for r in rows:
-        age_cell = f"{r['age_days']}d" if r['age_days'] is not None else "—"
-        if r['flagged']:
-            age_cell += " ⚠"
-        pending_since_str = r['pending_since'].strftime('%Y-%m-%d') if r['pending_since'] else '—'
-        reason_cell = "<br>".join(reason_lines(r, escaped=True))
+
+    # Build rows in group order (groups are already keyed by parent AP number)
+    group_keys = sorted(
+        [k for k in groups.keys() if k != '_no_ap'],
+        key=lambda k: k if isinstance(k, int) else float('inf')
+    )
+    if '_no_ap' in groups:
+        group_keys.append('_no_ap')
+
+    for group_key in group_keys:
+        group_rows = groups[group_key]
+        # Add group header row
+        if group_key == '_no_ap':
+            header_text = "No AP number"
+            parent_title = ""
+        else:
+            header_text = f"AP-{group_key}"
+            # Find parent title if a parent row exists in this group
+            parent_row = next((r for r in group_rows if not r.get('ap_is_child') or (r.get('ap_is_parent') and not r.get('ap_is_child'))), None)
+            parent_title = f" — {parent_row['action_text']}" if parent_row and parent_row.get('action_text') else ""
+
         body_rows.append(
-            "<tr>"
-            f"<td>{esc(module_label(r['module']))}</td>"
-            f"<td>{esc(r['ap_number'])}</td>"
-            f"<td>{esc(r['action_text'])}</td>"
-            f"<td>{esc(r['status'])}</td>"
-            f"<td>{esc(r['owner_name'])}</td>"
-            f"<td>{esc(r['due_date'])}</td>"
-            f"<td>{esc(r['original_due_date'])}</td>"
-            f"<td>{esc(pending_since_str)}</td>"
-            f"<td>{age_cell}</td>"
-            f"<td>{reason_cell}</td>"
-            "</tr>"
+            f'<tr style="background-color:#f0f0f0;"><td colspan="10"><strong>{esc(header_text)}{esc(parent_title)}</strong></td></tr>'
         )
+
+        # Add data rows for this group
+        for r in group_rows:
+            age_cell = f"{r['age_days']}d" if r['age_days'] is not None else "—"
+            if r['flagged']:
+                age_cell += " ⚠"
+            pending_since_str = r['pending_since'].strftime('%Y-%m-%d') if r['pending_since'] else '—'
+            reason_cell = "<br>".join(reason_lines(r, escaped=True))
+            body_rows.append(
+                "<tr>"
+                f"<td>{esc(module_label(r['module']))}</td>"
+                f"<td>{esc(r['ap_number'])}</td>"
+                f"<td>{esc(r['action_text'])}</td>"
+                f"<td>{esc(r['status'])}</td>"
+                f"<td>{esc(r['owner_name'])}</td>"
+                f"<td>{esc(r['due_date'])}</td>"
+                f"<td>{esc(r['original_due_date'])}</td>"
+                f"<td>{esc(pending_since_str)}</td>"
+                f"<td>{age_cell}</td>"
+                f"<td>{reason_cell}</td>"
+                "</tr>"
+            )
+
     if rows:
         table = (
             '<table cellpadding="6" cellspacing="0" '
@@ -547,23 +660,49 @@ def build_text_body(rows: list[dict], orphans: list[dict] | None = None) -> str:
             "for the matching update in the Action Plan Tracker.",
             "",
         ]
-    for r in rows:
-        pending_since_str = r['pending_since'].strftime('%Y-%m-%d') if r['pending_since'] else '—'
-        age_str = f"{r['age_days']} days" if r['age_days'] is not None else 'unknown'
-        callout = f" — OVER {AGE_CALLOUT_DAYS} DAYS" if r['flagged'] else ""
-        lines.append(f"[{module_label(r['module'])}] {r['ap_number']} — {r['action_text']}")
-        lines.append(
-            f"  Status: {r['status'] or '—'} | Owner: {r['owner_name']} | "
-            f"Due: {r['due_date'] or '—'}"
-            + (f" (orig: {r['original_due_date']})" if r['original_due_date'] else "")
-        )
-        lines.append(f"  Pending since: {pending_since_str} ({age_str}){callout}")
-        for rl in reason_lines(r, escaped=False):
-            lines.append(f"  Reason: {rl}")
-        lines.append("")
+
+    groups = group_rows_by_parent_ap(rows)
+    group_keys = sorted(
+        [k for k in groups.keys() if k != '_no_ap'],
+        key=lambda k: k if isinstance(k, int) else float('inf')
+    )
+    if '_no_ap' in groups:
+        group_keys.append('_no_ap')
+
+    for group_key in group_keys:
+        group_rows = groups[group_key]
+        # Add group header
+        if group_key == '_no_ap':
+            header_text = "No AP number"
+            parent_title = ""
+        else:
+            header_text = f"AP-{group_key}"
+            # Find parent title if a parent row exists in this group
+            parent_row = next((r for r in group_rows if not r.get('ap_is_child') or (r.get('ap_is_parent') and not r.get('ap_is_child'))), None)
+            parent_title = f" — {parent_row['action_text']}" if parent_row and parent_row.get('action_text') else ""
+
+        lines.append(f"{header_text}{parent_title}")
+
+        # Add rows for this group
+        for r in group_rows:
+            pending_since_str = r['pending_since'].strftime('%Y-%m-%d') if r['pending_since'] else '—'
+            age_str = f"{r['age_days']} days" if r['age_days'] is not None else 'unknown'
+            callout = f" — OVER {AGE_CALLOUT_DAYS} DAYS" if r['flagged'] else ""
+            lines.append(f"[{module_label(r['module'])}] {r['ap_number']} — {r['action_text']}")
+            lines.append(
+                f"  Status: {r['status'] or '—'} | Owner: {r['owner_name']} | "
+                f"Due: {r['due_date'] or '—'}"
+                + (f" (orig: {r['original_due_date']})" if r['original_due_date'] else "")
+            )
+            lines.append(f"  Pending since: {pending_since_str} ({age_str}){callout}")
+            for rl in reason_lines(r, escaped=False):
+                lines.append(f"  Reason: {rl}")
+            lines.append("")
+
     if orphans:
         lines += [
-            f"REMOVED FROM THE TRACKER — NEEDS REVIEW ({len(orphans)} item{'s' if len(orphans) != 1 else ''})",
+            "REMOVED FROM THE TRACKER — NEEDS REVIEW",
+            f"({len(orphans)} item{'s' if len(orphans) != 1 else ''})",
             "These AP items are still open in ORiON but the tracker row they came",
             "from is gone — either the row was deleted, or its AP number now belongs",
             "to a different action after a renumber. Nothing has been changed in",
@@ -571,15 +710,38 @@ def build_text_body(rows: list[dict], orphans: list[dict] | None = None) -> str:
             "the ORiON item or restore the tracker row.",
             "",
         ]
-        for r in orphans:
-            since_str = r['orphaned_since'].strftime('%Y-%m-%d') if r['orphaned_since'] else '—'
-            age_str = f" ({r['orphan_age']}d)" if r['orphan_age'] is not None else ""
-            lines.append(f"[{module_label(r['module'])}] {r['ap_number']} — {r['action_text']}")
-            lines.append(
-                f"  Status: {r['status'] or '—'} | Owner: {r['owner_name']} | "
-                f"Due: {r['due_date'] or '—'} | Not in tracker since: {since_str}{age_str}"
-            )
-            lines.append("")
+
+        orphan_groups = group_rows_by_parent_ap(orphans)
+        orphan_keys = sorted(
+            [k for k in orphan_groups.keys() if k != '_no_ap'],
+            key=lambda k: k if isinstance(k, int) else float('inf')
+        )
+        if '_no_ap' in orphan_groups:
+            orphan_keys.append('_no_ap')
+
+        for group_key in orphan_keys:
+            group_orphans = orphan_groups[group_key]
+            # Add group header
+            if group_key == '_no_ap':
+                header_text = "No AP number"
+                parent_title = ""
+            else:
+                header_text = f"AP-{group_key}"
+                parent_row = next((r for r in group_orphans if not r.get('ap_is_child') or (r.get('ap_is_parent') and not r.get('ap_is_child'))), None)
+                parent_title = f" — {parent_row['action_text']}" if parent_row and parent_row.get('action_text') else ""
+
+            lines.append(f"{header_text}{parent_title}")
+
+            for r in group_orphans:
+                since_str = r['orphaned_since'].strftime('%Y-%m-%d') if r['orphaned_since'] else '—'
+                age_str = f" ({r['orphan_age']}d)" if r['orphan_age'] is not None else ""
+                lines.append(f"[{module_label(r['module'])}] {r['ap_number']} — {r['action_text']}")
+                lines.append(
+                    f"  Status: {r['status'] or '—'} | Owner: {r['owner_name']} | "
+                    f"Due: {r['due_date'] or '—'} | Not in tracker since: {since_str}{age_str}"
+                )
+                lines.append("")
+
     return "\n".join(lines)
 
 
@@ -688,6 +850,14 @@ def main():
     if args.dry_run:
         print(f"Subject: {subject}\n")
         print(text_body)
+        # Write outputs to files for inspection
+        out_dir = Path(__file__).parent / "out"
+        out_dir.mkdir(exist_ok=True)
+        html_file = out_dir / "ap_pending_digest_preview.html"
+        text_file = out_dir / "ap_pending_digest_preview.txt"
+        html_file.write_text(html_body, encoding='utf-8')
+        text_file.write_text(text_body, encoding='utf-8')
+        log.info(f"[DRY RUN] Digest preview written to {html_file} and {text_file}")
         log.info(f"[DRY RUN] {len(enriched)} row(s), {flagged_count} over {AGE_CALLOUT_DAYS}d, {len(enriched_orphans)} orphan(s), "
                  f"{len(reconciled)} reconciled row(s) omitted, {len(orphaned_pending)} orphaned-pending row(s) suppressed — not sent.")
         return
