@@ -1,9 +1,7 @@
 name: AP Sync Reconciliation Monitor
 
 on:
-  schedule:
-    - cron: '9,39 * * * *'    # Every 30 minutes, offset from sync-ap.yml's 13,43 and the :00/:30 load spikes
-  workflow_dispatch:            # Manual trigger for testing
+  workflow_dispatch:            # Triggered by samcos Vercel Cron (fire-ap-sync-monitor, 5,20,35,50); also manual
 
 jobs:
   monitor:
