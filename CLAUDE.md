@@ -243,6 +243,7 @@ for module `pc`/`delivery` is the MODULE row id, not `ap_tracker.id`
   `pll_capacity_log` (self_report rows only)
 - ORiON `czdkctjbejnwuopigxta` — portal tables, prefixed `portal_`
 - GreenThumb `xfzjywareudbvuubzfye` — never used by anything in this repo
+- **New functions in the ORiON database get explicit grants.** Default privileges no longer grant EXECUTE to anon, authenticated or public. Grant what a caller needs in the creating migration, with a comment saying why. To remove access, revoke from PUBLIC as well as anon. Trigger functions need no grants. See orion-pll/knowledge/learnings/2026-10-05-function-execute-grants.md.
 
 ## Machines
 
