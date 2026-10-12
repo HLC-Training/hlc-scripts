@@ -15,14 +15,23 @@ ap_pending_since; latest entry per field):
 
   matched        tracker value == the value ORiON holds / asked for
                  -> reconciled, drop.
-  tracker_newer  values differ, but the tracker row was modified AFTER the
-                 ORiON edit (smartsheet_modified_at > changed_at) -> the
+  tracker_newer  values differ, the sheet's value for THIS FIELD has moved
+                 away from the episode's starting value (the field's
+                 old_value on its first change-log entry), and the tracker
+                 row was modified AFTER the ORiON edit (smartsheet_modified_at
+                 > changed_at) -> the field changed on both sides, the
                  tracker is source of truth and Jen's later edit wins; the
                  flag clears, the digest does NOT ask her to re-apply.
-                 Row-grained on purpose: GET /sheets exposes only a row-level
-                 modifiedAt; a sheet-wide save therefore supersedes every
-                 older pending edit on the rows it touched (known, accepted,
-                 documented in the decision).
+                 Row modified time is the tiebreaker ONLY once the field
+                 itself moved on both sides (decision 2026-10-12-held-field-
+                 release-is-field-level, refining 2026-09-08): GET /sheets
+                 exposes only a row-level modifiedAt, and on 2026-10-12 nine
+                 held Current Finish dates were discarded because the SAME
+                 save had pushed Status/Comments live and bumped the row.
+                 If the sheet still holds the pre-edit value the sheet never
+                 touched the field, and the state is `pending` regardless of
+                 the row's modified time. A legacy entry with no old_value
+                 on record keeps the row-time rule.
   pending        values differ and the tracker is not newer -> still open;
                  the digest lists it, the sync protects the row.
   not_comparable the field has no tracker-side projection this module
@@ -274,15 +283,36 @@ def parse_ts(raw) -> datetime | None:
     return ts
 
 
+# Sentinel: "no starting value on record" (a legacy change-log entry without
+# old_value) — distinct from an old_value that is genuinely None.
+NO_ORIGIN = object()
+
+
+def sheet_untouched(tracker_value, origin_value) -> bool:
+    """True when the sheet's value for a field still equals the value the
+    ORiON episode started from — i.e. nobody has changed that field in the
+    sheet since the ORiON edit, whatever the row's modified time says.
+    False when no origin is on record (the caller falls back to row time)."""
+    if origin_value is NO_ORIGIN:
+        return False
+    return normalize(tracker_value) == normalize(origin_value)
+
+
 def classify_field(module: str, field: str, expected, tracker_value,
-                   tracker_modified_at, changed_at) -> str:
-    """One field's reconciliation state — see the module docstring."""
+                   tracker_modified_at, changed_at, origin_value=NO_ORIGIN) -> str:
+    """One field's reconciliation state — see the module docstring.
+    `origin_value` is the field's value when the episode started (the
+    old_value of its first change-log entry); a sheet still holding it has
+    not touched the field, so the field is `pending` even when the row's
+    modified time post-dates the edit (2026-10-12)."""
     if tracker_value is NOT_COMPARABLE:
         return 'not_comparable'
     if tracker_value is None and (module, field) not in BLANK_IS_INTENT:
         return 'matched'
     if normalize(expected) == normalize(tracker_value):
         return 'matched'
+    if sheet_untouched(tracker_value, origin_value):
+        return 'pending'
     sheet_mod = parse_ts(tracker_modified_at)
     edited_at = parse_ts(changed_at)
     if sheet_mod and edited_at and sheet_mod > edited_at:
@@ -335,6 +365,7 @@ def latest_episode_entries(module: str, entries: list[dict], pending_since) -> d
     sync-mirrored fields. Empty when the row has no logged mirrored edits."""
     mirrored = SYNC_MIRRORED_FIELDS.get(module, set())
     latest: dict = {}
+    earliest: dict = {}
     for e in entries:
         if e.get('field') not in mirrored:
             continue
@@ -344,7 +375,22 @@ def latest_episode_entries(module: str, entries: list[dict], pending_since) -> d
         cur = latest.get(e['field'])
         if cur is None or (ts and (parse_ts(cur.get('changed_at')) or ts) <= ts):
             latest[e['field']] = e
-    return latest
+        first = earliest.get(e['field'])
+        if first is None or (ts and (parse_ts(first.get('changed_at')) or ts) > ts):
+            earliest[e['field']] = e
+    # Each returned entry is a copy carrying the episode's ORIGIN for its
+    # field — the old_value of the field's FIRST entry in the episode, i.e.
+    # the value the sheet held when the ORiON edit began (2026-10-12). Two
+    # ORiON edits in one episode (10-30 -> 11-30 -> 12-15) still start from
+    # 10-30. Absent when that first entry carries no old_value key (legacy).
+    out = {}
+    for field, e in latest.items():
+        copy = dict(e)
+        first = earliest[field]
+        if 'old_value' in first:
+            copy['_episode_origin'] = first.get('old_value')
+        out[field] = copy
+    return out
 
 
 def classify_pending(module: str, tracker_row: dict | None, episode: dict,
@@ -370,8 +416,21 @@ def classify_pending(module: str, tracker_row: dict | None, episode: dict,
             project_tracker_field(module, field, tracker_row),
             tracker_row.get('smartsheet_modified_at'),
             entry.get('changed_at'),
+            episode_origin(entry),
         )
     return out
+
+
+def episode_origin(entry: dict):
+    """The value the sheet held when this field's episode began: the
+    `_episode_origin` latest_episode_entries stamps (first entry's
+    old_value), else the entry's own old_value when the caller built the
+    episode by hand, else NO_ORIGIN (legacy entry — row-time rule)."""
+    if '_episode_origin' in entry:
+        return entry['_episode_origin']
+    if 'old_value' in entry:
+        return entry['old_value']
+    return NO_ORIGIN
 
 
 def row_is_reconciled(states: dict) -> bool:

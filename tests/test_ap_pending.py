@@ -15,6 +15,7 @@ from ap_pending import (  # noqa: E402
     classify_field, classify_pending, latest_episode_entries, row_is_reconciled,
     is_fixture, pick_tracker_row, project_tracker_field, NOT_COMPARABLE,
     in_episode, EPISODE_SKEW_SECONDS, mirror_holds_unechoed_write,
+    sheet_untouched, NO_ORIGIN, episode_origin,
 )
 
 EDIT_AT = "2026-09-01T14:37:28.512976+00:00"
@@ -174,6 +175,83 @@ def test_dirty_mirror_holds_the_orion_write_so_the_field_stays_pending():
     # The sheet capture sync_ap.py passes carries no orion_dirty key — never affected.
     assert not mirror_holds_unechoed_write('delivery', 'due_date', tracker(current_finish='2026-10-31'))
     assert not mirror_holds_unechoed_write('delivery', 'start_date', t)   # start_date_only is never app-written
+
+
+# ─── 2026-10-12 Mid-Month pilot: a held field is released on the FIELD's own
+# sheet value, never on the row's modified time (decision
+# 2026-10-12-held-field-release-is-field-level.md). Each fixture is one row
+# from that day's ap_change_log evidence table: Jen held Current Finish
+# 2026-10-30 -> 2026-11-30 at 09:08 CT; the same save pushed Overall Status
+# and Comments live, which bumped the row's modifiedAt past changed_at while
+# the sheet's Current Finish still read 2026-10-30.
+HELD_AT   = "2026-10-12T14:08:53+00:00"   # Jen's ORiON save (09:08 CT)
+PUSHED_AT = "2026-10-12T14:08:55+00:00"   # status/comments push bumped the row
+LATER     = "2026-10-12T15:54:15+00:00"   # a later sheet edit to Current Finish
+
+
+def _held_episode(module, field):
+    return {field: entry(field, '2026-11-30', changed_at=HELD_AT, old_value='2026-10-30')}
+
+
+def test_held_finish_case_a_row_touched_but_sheet_finish_unchanged_is_pending():
+    # (a) AP-0619-5 09:15 discard: row modified after the edit by the
+    # status/comments push, Current Finish still the pre-edit value -> the
+    # sheet never touched the field -> pending (NOT tracker_newer).
+    t = tracker(current_finish='2026-10-30', smartsheet_modified_at=PUSHED_AT)
+    states = classify_pending('delivery', t, _held_episode('delivery', 'due_date'), lambda _f, e: e['new_value'])
+    assert states == {'due_date': 'pending'}, states
+    states = classify_pending('pc', t, _held_episode('pc', 'target_end_date'), lambda _f, e: e['new_value'])
+    assert states == {'target_end_date': 'pending'}, states
+    assert not row_is_reconciled(states)
+
+
+def test_held_finish_case_b_sheet_finish_moved_to_a_third_value_is_tracker_newer():
+    # (b) a genuine Jen-in-the-sheet change to a different date wins.
+    t = tracker(current_finish='2026-12-15', smartsheet_modified_at=LATER)
+    states = classify_pending('delivery', t, _held_episode('delivery', 'due_date'), lambda _f, e: e['new_value'])
+    assert states == {'due_date': 'tracker_newer'}, states
+
+
+def test_held_finish_case_c_sheet_finish_applied_to_the_held_value_is_matched():
+    # (c) Jen applies the held date in the sheet -> reconciled.
+    t = tracker(current_finish='2026-11-30', smartsheet_modified_at=LATER)
+    states = classify_pending('delivery', t, _held_episode('delivery', 'due_date'), lambda _f, e: e['new_value'])
+    assert states == {'due_date': 'matched'}, states
+    assert row_is_reconciled(states)
+
+
+def test_held_finish_case_d_row_touched_then_sheet_finish_changed_later_is_tracker_newer():
+    # (d) first an unrelated push bumps the row, then the sheet's own
+    # Current Finish moves to a third value -> the field changed on both
+    # sides and the row time is the tiebreaker -> tracker_newer.
+    t = tracker(current_finish='2026-12-31', smartsheet_modified_at=LATER)
+    states = classify_pending('pc', t, _held_episode('pc', 'target_end_date'), lambda _f, e: e['new_value'])
+    assert states == {'target_end_date': 'tracker_newer'}, states
+    # Row-time ordering alone never decides it: with the field moved but the
+    # row stamp NOT newer than the edit, it is still pending (unchanged rule).
+    t2 = tracker(current_finish='2026-12-31', smartsheet_modified_at=BEFORE)
+    assert classify_pending('pc', t2, _held_episode('pc', 'target_end_date'), lambda _f, e: e['new_value']) == {'target_end_date': 'pending'}
+
+
+def test_held_field_origin_is_the_episodes_first_old_value():
+    # Two ORiON edits in one episode (10-30 -> 11-30 -> 12-15): the sheet
+    # still holding 10-30 means it never touched the field, even though the
+    # LATEST entry's old_value is 11-30.
+    entries = [
+        entry('due_date', '2026-11-30', changed_at=HELD_AT, old_value='2026-10-30'),
+        entry('due_date', '2026-12-15', changed_at="2026-10-12T14:20:00+00:00", old_value='2026-11-30'),
+    ]
+    episode = latest_episode_entries('delivery', entries, HELD_AT)
+    assert episode['due_date']['new_value'] == '2026-12-15'
+    # Row bumped after BOTH edits (second save's status push), finish untouched.
+    t = tracker(current_finish='2026-10-30', smartsheet_modified_at="2026-10-12T14:20:02+00:00")
+    assert classify_pending('delivery', t, episode, lambda _f, e: e['new_value']) == {'due_date': 'pending'}
+    # A hand-built episode (the digest's shape) falls back to the entry's own old_value.
+    assert classify_pending('delivery', t, _held_episode('delivery', 'due_date'), lambda _f, e: e['new_value']) == {'due_date': 'pending'}
+    # Without an old_value on record (legacy entry) the row-time rule is unchanged.
+    t3 = tracker(current_finish='2026-10-30', smartsheet_modified_at=PUSHED_AT)
+    legacy = {'due_date': entry('due_date', '2026-11-30', changed_at=HELD_AT)}
+    assert classify_pending('delivery', t3, legacy, lambda _f, e: e['new_value']) == {'due_date': 'tracker_newer'}
 
 
 if __name__ == '__main__':

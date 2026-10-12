@@ -1,6 +1,19 @@
 # hlc-scripts
 
-Last updated: 2026-09-29 — send_ap_pending_digest.py groups rows by parent AP number
+Last updated: 2026-10-12 — held-field release is FIELD-level (decision
+`2026-10-12-held-field-release-is-field-level.md`, action items `7bf22072`
++ `dc6f52d6`, Jen feedback `da8a19f1`): `ap_pending.classify_field` and
+`sync_ap.plan_mirror_writes` no longer read a newer ROW `modifiedAt` as
+"the sheet changed this field". A field is `tracker_newer` / a mirror
+conflict only when the sheet's value for THAT field has moved away from
+the episode's origin (the first change-log entry's `old_value`; for the
+mirror, derived by `mirror_origin_values()` from person-authored entries
+since `last_synced_at`). Sheet still holding the pre-edit value → `pending`
+/ PROTECT, whatever the row stamp says. On 2026-10-12 nine held Mid-Month
+Current Finish dates were discarded within one sync cycle because the
+same save's Status/Comments push bumped the row. Tests:
+`tests/test_ap_pending.py` (cases a–d), `tests/test_mirror_conflict_field_level.py`.
+Prior: 2026-09-29 — send_ap_pending_digest.py groups rows by parent AP number
 (natural numeric sort via parse_ap_key(); Delivery, P&C and Master
 tracker rows interleave within a group in the one table, module label
 kept; group headers use the AP number string as stored; rows without an
@@ -126,7 +139,11 @@ Scheduled sync and automation scripts for the SAM COS and ORiON systems.
   `orion_dirty` with that field's mirror key in `orion_written_value`
   (`mirror_holds_unechoed_write`) — an AP-manager Ops-tab edit writes the
   mirror before the sheet has it, and the digest must not read that as
-  reconciled. Both
+  reconciled. Since 2026-10-12 `tracker_newer` is FIELD-level: it also
+  requires the sheet's value for that field to differ from the episode's
+  origin (`sheet_untouched`, `_episode_origin` stamped by
+  `latest_episode_entries`); a row touched elsewhere never releases a held
+  field (decision `2026-10-12-held-field-release-is-field-level.md`). Both
   `sync_ap.py` (clears the flag, logs superseded values first) and
   `send_ap_pending_digest.py` (renders only what is still pending) import
   it — never re-derive the rule in either script. Tests:

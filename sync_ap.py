@@ -108,6 +108,7 @@ from ap_pending import (  # noqa: F401 — re-exported names
     STATUS_MAP, PC_STATUS_MAP, SQDCG_MAP, map_status, map_category,
     latest_episode_entries, classify_pending, row_is_reconciled,
     project_tracker_field, NOT_COMPARABLE, parse_ts as _ap_parse_ts,
+    sheet_untouched, episode_origin, NO_ORIGIN, EPISODE_SKEW_SECONDS,
 )
 
 # ─── CONFIG ─────────────────────────────────────────────────────
@@ -790,25 +791,105 @@ def mirror_row_changed(existing: dict, payload: dict) -> bool:
     return False
 
 
-def plan_mirror_writes(existing_mirror: dict, mirror_candidates: dict, dry_run: bool):
+# Mirror key -> module field, for the keys whose value shape is IDENTICAL in
+# the mirror and the module tables (ISO dates). A module-row change-log
+# entry for one of these fields is therefore usable as the mirror key's
+# origin. Status is deliberately absent: the module stores a mapped vocabulary
+# (STATUS_MAP / PC_STATUS_MAP), not the sheet's picklist value.
+MIRROR_KEY_MODULE_DATE_FIELD = {
+    ('delivery', 'current_finish'): 'due_date',
+    ('pc',       'current_finish'): 'target_end_date',
+    ('delivery', 'current_start'):  'start_date',
+    ('pc',       'current_start'):  'start_date',
+}
+
+
+def mirror_origin_values(ex: dict, entries: list[dict]) -> dict:
+    """For a dirty ap_tracker row, key -> the sheet value ORiON last saw for
+    each key in orion_written_value: the old_value of the EARLIEST person-
+    authored ap_change_log entry for that key written since the sync last
+    wrote the row (last_synced_at, with the usual insert skew). Entries
+    qualify from either rail the Ops-tab save logs on — module 'ops'
+    against the mirror row itself (any key), or module 'delivery'/'pc'
+    against the row's projection (date keys only, see
+    MIRROR_KEY_MODULE_DATE_FIELD). A key with no such entry is absent (the
+    planner then falls back to the row-time rule for it).
+
+    Why last_synced_at bounds the window: the sync writes the mirror row
+    whenever it ingests or echoes a sheet value, so every person-authored
+    entry after that stamp is an un-ingested ORiON edit, and the first
+    one's old_value is what the sheet held when the edit began. A PROTECT
+    skips the write, so a held edit keeps its window open until the sheet
+    catches up. (Decision 2026-10-12-held-field-release-is-field-level.)"""
+    written = ex.get('orion_written_value') or {}
+    if not isinstance(written, dict) or not written:
+        return {}
+    floor = parse_iso_ts(ex.get('last_synced_at'))
+    out = {}
+    for key in written:
+        first = None
+        first_ts = None
+        for e in entries:
+            if not e.get('changed_by'):
+                continue  # sync-authored (conflict/supersede) rows never qualify
+            module = e.get('module')
+            if module == 'ops':
+                if e.get('item_id') != ex.get('id') or e.get('field') != key:
+                    continue
+            elif module in ('delivery', 'pc'):
+                if e.get('ap_number') != ex.get('ap_number'):
+                    continue
+                if MIRROR_KEY_MODULE_DATE_FIELD.get((module, key)) != e.get('field'):
+                    continue
+            else:
+                continue
+            ts = parse_iso_ts(e.get('changed_at'))
+            if floor and ts and (floor - ts).total_seconds() > EPISODE_SKEW_SECONDS:
+                continue  # already ingested — previous episode
+            if first is None or (ts and first_ts and ts < first_ts) or (ts and first_ts is None):
+                first, first_ts = e, ts
+        if first is not None and 'old_value' in first:
+            out[key] = first['old_value']
+    return out
+
+
+def plan_mirror_writes(existing_mirror: dict, mirror_candidates: dict, dry_run: bool,
+                       origins: dict | None = {}):
     """
     Loop-prevention planner for the ap_tracker mirror (decision e217604f:
-    (a) per-row sync state + (c) timestamp cursor; conflict rule 93113ee9).
+    (a) per-row sync state + (c) timestamp cursor; conflict rule 93113ee9,
+    refined FIELD-LEVEL by 2026-10-12-held-field-release-is-field-level).
+
+    `origins` maps smartsheet_row_id -> {written key: the sheet value ORiON
+    last saw for it} (mirror_origin_values). A key with no origin on record
+    (and the {} default) keeps the pre-2026-10-12 row-time rule. None means
+    the change log could NOT be read this run: every dirty row whose
+    written values differ from the sheet is PROTECTED (no conflict is
+    judged on unknown evidence — the never-act-on-incomplete-data
+    discipline of the prune). main() passes None explicitly on that failure.
 
     For each candidate row (keyed by smartsheet_row_id):
       - existing row with orion_dirty set:
           * every field in orion_written_value matches the fresh sheet
             value  -> ECHO: our own (future) write came back; clear the
             flag on the upsert, log NOTHING to ap_change_log.
-          * fields differ AND the row's Smartsheet modifiedAt is AFTER
-            orion_written_at -> REAL post-write change: ingest the sheet
-            values (last-write-wins), clear the flag, and record one
-            ap_change_log conflict row per differing field (old = what
-            ORiON wrote / the losing edit, new = the Smartsheet value).
-            Surfacing these to Jen's review queue is second-brief UI.
-          * fields differ but Smartsheet is NOT newer -> Smartsheet hasn't
-            seen the ORiON write yet: PROTECT — skip the upsert entirely,
-            keep the dirty flag.
+          * a differing field whose sheet value STILL EQUALS its origin is
+            UNTOUCHED — the sheet never changed that field (a held Current
+            Finish the AP manager has not applied yet); it is never a
+            conflict, whatever the row's modifiedAt says. On 2026-10-12
+            nine held dates were discarded because the same save's
+            Status/Comments push bumped the row.
+          * a differing field whose sheet value MOVED away from its origin
+            AND the row's Smartsheet modifiedAt is AFTER orion_written_at
+            -> REAL post-write change on that field: ingest the sheet
+            values (last-write-wins), and record one ap_change_log
+            conflict row per MOVED field (old = what ORiON wrote / the
+            losing edit, new = the Smartsheet value). Untouched keys on
+            the same row keep ORiON's written value in the payload and
+            the row stays dirty with orion_written_value narrowed to them.
+          * only untouched fields differ, or the sheet is NOT newer ->
+            Smartsheet hasn't caught up to the ORiON write: PROTECT — skip
+            the upsert entirely, keep the dirty flag.
       - existing row, not dirty, every sheet fact identical to what's
         stored (mirror_row_changed False) -> UNCHANGED: no write at all
         (Phase 4, 2026-09-14 — the idempotency gate: a second run against
@@ -862,12 +943,22 @@ def plan_mirror_writes(existing_mirror: dict, mirror_candidates: dict, dry_run: 
                 if dry_run:
                     print(f"[DRY RUN] ECHO     {str(ap_num):14} mirror — ORiON write reflected, would clear dirty flag")
             else:
+                if origins is None:
+                    protected_pending += 1
+                    log.warning(f"{ap_num}: mirror pending — change-log origins unavailable this run; protecting row on {sorted(diffs)}, no upsert")
+                    if dry_run:
+                        print(f"[DRY RUN] PROTECT  {str(ap_num):14} mirror — origins unavailable, row skipped ({sorted(diffs)})")
+                    continue
+                origin = origins.get(row_id) or {}
+                untouched = sorted(k for k, v in diffs.items()
+                                   if sheet_untouched(v, origin.get(k, NO_ORIGIN)))
+                moved = {k: v for k, v in diffs.items() if k not in untouched}
                 sheet_mod  = parse_iso_ts(payload.get('smartsheet_modified_at'))
                 written_at = parse_iso_ts(ex.get('orion_written_at'))
-                if sheet_mod and written_at and sheet_mod > written_at:
+                if moved and sheet_mod and written_at and sheet_mod > written_at:
                     conflicts_ingested += 1
                     conflicted_row_ids.add(row_id)
-                    for k, newv in diffs.items():
+                    for k, newv in moved.items():
                         conflict_rows.append({
                             'module':    'ops',
                             'item_id':   ex['id'],
@@ -878,14 +969,33 @@ def plan_mirror_writes(existing_mirror: dict, mirror_candidates: dict, dry_run: 
                             'reason':    'conflict: Smartsheet changed after ORiON write — last-write-wins (Smartsheet kept), losing ORiON edit recorded (decision 93113ee9)',
                             'changed_by': None,
                         })
-                    log.warning(f"{ap_num}: mirror conflict — Smartsheet changed after ORiON write ({sorted(diffs)}); ingesting Smartsheet values, conflict logged")
+                    log.warning(f"{ap_num}: mirror conflict — Smartsheet changed after ORiON write ({sorted(moved)}); ingesting Smartsheet values, conflict logged"
+                                + (f"; held value kept for untouched {untouched}" if untouched else ""))
                     if dry_run:
-                        print(f"[DRY RUN] CONFLICT {str(ap_num):14} mirror — Smartsheet newer on {sorted(diffs)}, would ingest + log")
+                        print(f"[DRY RUN] CONFLICT {str(ap_num):14} mirror — Smartsheet newer on {sorted(moved)}, would ingest + log"
+                              + (f"; keeps held {untouched}" if untouched else ""))
+                    if untouched:
+                        # The sheet never touched these keys: ORiON's write
+                        # stays the row's value and the row stays dirty for
+                        # exactly those keys, so the next echo/apply still
+                        # settles them (2026-10-12).
+                        for k in untouched:
+                            payload[k] = written.get(k)
+                        payload['orion_dirty']         = True
+                        payload['orion_written_value'] = {k: written.get(k) for k in untouched}
+                        payload['orion_written_at']    = ex.get('orion_written_at')
+                        payload['last_synced_at']      = now_iso
+                        to_upsert.append(payload)
+                        continue
                 else:
                     protected_pending += 1
-                    log.info(f"{ap_num}: mirror pending — Smartsheet not yet caught up to ORiON write; protecting row, no upsert")
+                    if not moved:
+                        why = f"sheet still holds the pre-edit value for {untouched} (held field, row touched elsewhere)"
+                    else:
+                        why = "Smartsheet not yet caught up to ORiON write"
+                    log.info(f"{ap_num}: mirror pending — {why}; protecting row, no upsert")
                     if dry_run:
-                        print(f"[DRY RUN] PROTECT  {str(ap_num):14} mirror — ORiON write pending mirror-out, row skipped")
+                        print(f"[DRY RUN] PROTECT  {str(ap_num):14} mirror — {why}, row skipped")
                     continue
         elif ex is not None and not mirror_row_changed(ex, payload):
             unchanged += 1
@@ -1368,6 +1478,10 @@ def plan_module_projection(task: dict, mod: dict, owner_id, shared: dict,
                 continue
             if _f not in content:
                 states[_f] = 'matched'
+            elif sheet_untouched(content[_f], episode_origin(episode[_f])):
+                # The resolved lead is still the episode's starting value:
+                # the sheet never touched this field (2026-10-12 rule).
+                states[_f] = 'pending'
             else:
                 _edited = _ap_parse_ts(episode[_f].get('changed_at'))
                 states[_f] = 'tracker_newer' if (sheet_mod and _edited and sheet_mod > _edited) else 'pending'
@@ -1783,6 +1897,39 @@ def main(dry_run: bool = False):
     except Exception as e:
         mirror_load_failed = True
         log.error(f"Failed to load ap_tracker mirror — mirror landing skipped this run: {e}")
+
+    # ── Mirror origins (decision 2026-10-12-held-field-release-is-field-
+    # level): for every DIRTY mirror row, the sheet value ORiON last saw
+    # per written key, from the person-authored change-log entries since
+    # the row was last written. The conflict planner judges each differing
+    # key against THIS, not against the row's modifiedAt. A failed load
+    # leaves mirror_origins None and the planner protects every differing
+    # dirty row this run (never a conflict on unknown evidence).
+    mirror_origins: dict | None = {}
+    if not mirror_load_failed:
+        dirty_rows = [r for r in existing_mirror.values() if r.get('orion_dirty')]
+        if dirty_rows:
+            try:
+                _cols = 'item_id, module, ap_number, field, old_value, new_value, changed_by, changed_at'
+                _entries = []
+                _ids = [r['id'] for r in dirty_rows]
+                _aps = sorted({r['ap_number'] for r in dirty_rows if r.get('ap_number')})
+                for i in range(0, len(_ids), 100):
+                    _resp = db.table('ap_change_log').select(_cols) \
+                        .in_('item_id', _ids[i:i + 100]).order('changed_at').execute()
+                    _entries.extend(_resp.data or [])
+                for i in range(0, len(_aps), 100):
+                    _resp = db.table('ap_change_log').select(_cols) \
+                        .in_('ap_number', _aps[i:i + 100]).in_('module', ['delivery', 'pc']) \
+                        .order('changed_at').execute()
+                    _entries.extend(_resp.data or [])
+                for r in dirty_rows:
+                    mirror_origins[r['smartsheet_row_id']] = mirror_origin_values(r, _entries)
+                log.info(f"Mirror origins: {len(dirty_rows)} dirty row(s), "
+                         f"{sum(1 for v in mirror_origins.values() if v)} with a logged origin")
+            except Exception as e:
+                mirror_origins = None
+                log.error(f"Failed to load ap_change_log origins for dirty mirror rows — every differing dirty row protected this run: {e}")
 
     # ── AP title diff (top-level parent rows → ap_titles) ───────
     # Diffed here (before the dry-run gate) so dry runs can report it;
@@ -2208,7 +2355,7 @@ def main(dry_run: bool = False):
         (to_upsert_mirror, mirror_conflict_rows, mirror_conflicted_row_ids,
          mirror_echo_cleared, mirror_conflicts_ingested,
          mirror_protected, mirror_unchanged) = plan_mirror_writes(
-            existing_mirror, mirror_candidates, dry_run)
+            existing_mirror, mirror_candidates, dry_run, mirror_origins)
 
     if unmapped_leads:
         log.info(f"Lead emails that don't resolve in users or portal_users(tpm) (skipped): {sorted(unmapped_leads)}")
