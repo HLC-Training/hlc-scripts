@@ -1566,6 +1566,7 @@ def build_sync_accounting(*, child_tasks_total, inserted_delivery, updated_deliv
                           cleared_pending_pc, closed_delivery, closed_pc, skipped_pending,
                           skipped_no_ap, skipped_ambiguous, skipped_viewer, skipped_unmapped,
                           skipped_inactive_noop, skipped_inactive_wrongtable,
+                          projected_secondary_only,
                           failed_inserts_delivery, failed_inserts_pc,
                           split_projection,
                           parent_titles_total, titles_new_or_changed, titles_written,
@@ -1612,6 +1613,10 @@ def build_sync_accounting(*, child_tasks_total, inserted_delivery, updated_deliv
         'skipped_unmapped':            skipped_unmapped,
         'skipped_inactive_noop':       skipped_inactive_noop,
         'skipped_inactive_wrongtable': skipped_inactive_wrongtable,
+        # Added 2026-10-14 (bug 6a9e3545): in-scope row whose primary module
+        # is outside its family's module set — counted here, projected via
+        # split_projection. Joins the identity sum automatically.
+        'projected_secondary_only':    projected_secondary_only,
         'failed_inserts_delivery':     failed_inserts_delivery,
         'failed_inserts_pc':           failed_inserts_pc,
     }
@@ -2033,6 +2038,12 @@ def main(dry_run: bool = False):
     # len(tasks) == sum(all dispositions) can close (action 9278f68e).
     skipped_inactive_noop       = 0  # out-of-scope inactive, non-pending, no close queued
     skipped_inactive_wrongtable = 0  # preserved counter; the in-scope path no longer produces it
+    # Bug 6a9e3545 (decision 2026-10-14-ap-sync-residual-and-repage.md): the
+    # third uncounted exit. An in-scope pure parent whose OWN primary module
+    # (a director lead -> 'pc', via_director) is outside its family's module
+    # set (delivery-only) projects solely through the secondary stream, so no
+    # primary counter ever saw it. Counted here, once per row.
+    projected_secondary_only    = 0
     # Primary-row dispositions planned per module (the accounting identity
     # counts each ROW exactly once; a projection into the second module of
     # a split family — pure parents and null-owner rows — is tracked in
@@ -2196,6 +2207,18 @@ def main(dry_run: bool = False):
                         cleared_pending_pc_planned += 1
                 elif disposition == 'skip_pending':
                     skipped_pending += 1
+            if primary_module not in row_modules:
+                # No iteration above was primary, so nothing counted this row.
+                # Its projection(s) are real and stay in split_projection (the
+                # overlay); this bucket is the row's one child-stream count.
+                projected_secondary_only += 1
+                log.info(
+                    f"{ap_num}: primary module {primary_module!r} is outside the family's "
+                    f"modules {row_modules} — projected secondary-only (counted in "
+                    f"projected_secondary_only)"
+                )
+                if dry_run:
+                    print(f"[DRY RUN] SECONDARY-ONLY {ap_num:14} primary {primary_module} not in family modules {row_modules}")
             continue
 
         # ── Out-of-scope row (family has zero routed members, or blank-AP
@@ -2377,7 +2400,8 @@ def main(dry_run: bool = False):
         scope_summary = (
             f"Scope    — in-scope families/standalones: {len(in_scope_families)} "
             f"({n_split} split across both modules); secondary parent projections: "
-            f"{sum(sec_planned.values())} ({sec_planned})"
+            f"{sum(sec_planned.values())} ({sec_planned}); "
+            f"secondary-only rows (primary module outside family): {projected_secondary_only}"
         )
         skip_summary = (
             f"Skipped  — no AP#/text: {skipped_no_ap}, unmapped lead: {skipped_unmapped}, "
@@ -2450,6 +2474,7 @@ def main(dry_run: bool = False):
             skipped_unmapped=skipped_unmapped,
             skipped_inactive_noop=skipped_inactive_noop,
             skipped_inactive_wrongtable=skipped_inactive_wrongtable,
+            projected_secondary_only=projected_secondary_only,
             failed_inserts_delivery=0,
             failed_inserts_pc=0,
             split_projection={'planned': dict(sec_planned), 'inserted': 0, 'updated': 0,
@@ -2876,7 +2901,7 @@ def main(dry_run: bool = False):
         f"closed {closed_pc}, pending cleared {cleared_pending_pc} | "
         f"families in scope: {len(in_scope_families)} ({n_split} split; "
         f"secondary parent ops: {sec_written['inserted']}i/{sec_written['updated']}u, "
-        f"{sec_written['failed']} failed) | "
+        f"{sec_written['failed']} failed; secondary-only rows: {projected_secondary_only}) | "
         f"skipped: {skipped_total}, "
         f"pending Smartsheet updates: {len(pending)}, "
         f"escalated: {len(escalations)}, "
@@ -2974,6 +2999,7 @@ def main(dry_run: bool = False):
                     f'pc_inserted={inserted_pc} pc_updated={updated_pc} '
                     f'pc_closed={closed_pc} '
                     f'pc_pending_cleared={cleared_pending_pc} skipped={skipped_total} '
+                    f'secondary_only={projected_secondary_only} '
                     f'orphans_flagged={orphaned_delivery + orphaned_pc} orphans_cleared={unorphaned} '
                     f'orphan_pending_cleared={orphan_pending_cleared} identity_stamps={stamped} '
                     f'titles_captured={len(parent_titles)} titles_written={titles_written} '
@@ -3017,6 +3043,7 @@ def main(dry_run: bool = False):
                 skipped_unmapped=skipped_unmapped,
                 skipped_inactive_noop=skipped_inactive_noop,
                 skipped_inactive_wrongtable=skipped_inactive_wrongtable,
+                projected_secondary_only=projected_secondary_only,
                 failed_inserts_delivery=failed_inserts_delivery,
                 failed_inserts_pc=failed_inserts_pc,
                 split_projection={'planned': dict(sec_planned), **sec_written},
