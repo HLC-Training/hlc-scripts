@@ -25,9 +25,12 @@ Read-only against sync state. This script:
     counters are nonzero). See decision 2026-08-29-ap-sync-monitor-run-health.md.
   - Pushes via SAM COS notification_queue (the house Pushover pattern —
     see sync_ap.py's escalation page) on a healthy→broken transition, a
-    re-nag every >=12h a break stays open, and once on broken→healthy
-    recovery. Stays quiet otherwise, including while merely still-broken
-    inside the 12h window.
+    re-nag while a break stays open, and once on broken→healthy recovery.
+    Stays quiet otherwise. The re-nag cadence is per check: the child
+    identity check pushes on a status transition or a CHANGE of its residual
+    value and otherwise reminds at most once per 7 days (decision
+    2026-10-14-ap-sync-residual-and-repage.md — an unchanged page every 12h
+    trained the page into noise); titles and run_health keep the 12h re-nag.
   - Writes ONLY its own dedup-state key (system:ap_sync_monitor:alert_state).
 
 It never writes to the accounting key, the heartbeat key, or anything
@@ -66,6 +69,10 @@ RUN_OVERDUE_THRESHOLD = timedelta(hours=4)
 # before reaching the accounting write.
 ACCOUNTING_STARTUP_TOLERANCE = timedelta(minutes=2)
 DEDUP_WINDOW    = timedelta(hours=12)
+# Child identity check only (bug 6a9e3545): while the same broken state with
+# the same residual persists, remind at most this often. A change of status or
+# of residual value pushes immediately, whatever the window.
+CHILD_REMINDER_WINDOW = timedelta(days=7)
 
 CHICAGO = ZoneInfo("America/Chicago")
 
@@ -217,16 +224,24 @@ def build_message(check: str, status: str, accounting: dict | None,
     raise ValueError(f"unknown check {check!r}")
 
 
-def evaluate_and_dedup(check: str, status: str, state: dict, now: datetime):
+def evaluate_and_dedup(check: str, status: str, state: dict, now: datetime,
+                       value=None, reminder_window: timedelta = DEDUP_WINDOW):
     """
-    Decides whether this check's status change warrants a push, per the
-    transition + 12h re-nag rule (decision doc §3.4):
+    Decides whether this check's status warrants a push, per the transition +
+    re-nag rule (decision doc §3.4, amended 2026-10-14):
       healthy -> broken:        push (transition)
       broken  -> different broken: push (transition — a distinct failure mode)
-      still broken, <12h since last push: quiet
-      still broken, >=12h since last push: re-nag
+      still broken, VALUE changed since the last evaluation: push (the break
+        is not the one last reported — only for checks that pass a `value`)
+      still broken, same value, <reminder_window since last push: quiet
+      still broken, same value, >=reminder_window since last push: reminder
       broken  -> healthy:       push once (recovery), state resets
       healthy -> healthy:       quiet
+    `value` is the check's tracked number (the child check's residual); it is
+    stored in the state entry so the next run can see a change. A stored
+    entry with no value (written before this rule) is treated as unchanged —
+    it records the value silently rather than paging once for the upgrade.
+    `reminder_window` defaults to the original 12h; the child check passes 7d.
     Returns (should_push, new_state_entry_for_this_check).
     """
     prev = state.get(check, {"status": "healthy", "last_push": None})
@@ -234,16 +249,21 @@ def evaluate_and_dedup(check: str, status: str, state: dict, now: datetime):
     if status != prev["status"]:
         push = True
     elif status != 'healthy':
-        if prev["last_push"] is None:
+        prev_value = prev.get("value")
+        if value is not None and prev_value is not None and value != prev_value:
+            push = True
+        elif prev["last_push"] is None:
             push = True
         else:
             last_push_dt = datetime.fromisoformat(prev["last_push"])
-            if (now - last_push_dt) >= DEDUP_WINDOW:
+            if (now - last_push_dt) >= reminder_window:
                 push = True
     new_entry = {
         "status": status,
         "last_push": now.isoformat() if push else prev["last_push"],
     }
+    if value is not None:
+        new_entry["value"] = value
     return push, new_entry
 
 
@@ -275,7 +295,13 @@ def run_monitor(accounting: dict | None, heartbeat_value: str | None,
         for check, evaluator in (('child', evaluate_child), ('titles', evaluate_titles)):
             status = evaluator(accounting)
             evaluations[check] = status
-            push, entry = evaluate_and_dedup(check, status, state, now)
+            if check == 'child':
+                push, entry = evaluate_and_dedup(
+                    check, status, state, now,
+                    value=accounting['child']['child_identity_residual'],
+                    reminder_window=CHILD_REMINDER_WINDOW)
+            else:
+                push, entry = evaluate_and_dedup(check, status, state, now)
             new_state[check] = entry
             if push:
                 title = (f"AP sync monitor — recovered ({check})" if status == 'healthy'
