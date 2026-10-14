@@ -94,3 +94,20 @@ ships and verifies live first.
   need their own accounting is a Phase 2 open question, not a Phase 1 blocker.
 - `escalations` is an overlay on `skipped_pending`, not a competing bucket — the
   monitor must not treat it as a term in the sum.
+
+## Addendum 2026-10-14 — the disposition list gained a third fall-through bucket
+
+Added 2026-10-14; the decisions above are not rewritten. Decision 3 named two
+fall-through buckets (`skipped_inactive_noop`, `skipped_inactive_wrongtable`).
+The list is now incomplete without a third:
+
+- `projected_secondary_only` — an in-scope pure parent whose own primary module
+  (a director lead resolves to `pc` via_director) is outside its family's module
+  set, so it projects only through the secondary stream (`split_projection`) and
+  no primary counter ever fired. First seen as a standing residual of 1 from
+  2026-09-11 (AP-0775). Counted once per row; the projection itself is unchanged.
+  See `2026-10-14-ap-sync-residual-and-repage.md`.
+
+The monitor's re-nag cadence in decision 5's neighbourhood also changed for the
+child check only: page on a status transition or a change of residual value,
+remind at most every 7 days (same doc).

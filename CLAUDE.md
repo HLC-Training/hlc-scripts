@@ -1,6 +1,17 @@
 # hlc-scripts
 
-Last updated: 2026-10-12 — held-field release is FIELD-level (decision
+Last updated: 2026-10-14 — AP sync residual closed and monitor re-page rule
+(decision `2026-10-14-ap-sync-residual-and-repage.md`, bug `6a9e3545`):
+`sync_ap.py` counts a third child fall-through bucket,
+`projected_secondary_only` (an in-scope pure parent whose own primary module
+sits outside its family's module set — AP-0775, led by a director in a
+delivery-only family — which projected only via `split_projection` and left
+`child_identity_residual` at 1 from 2026-09-11). `ap_sync_monitor.py` now pushes
+the child check on a status transition or a CHANGE of the residual and
+otherwise reminds at most once per 7 days (titles/run_health keep their 12h
+re-nag). Tests: `tests/test_ap_sync_child_identity.py`,
+`tests/test_ap_sync_monitor_repage.py`.
+Prior: 2026-10-12 — held-field release is FIELD-level (decision
 `2026-10-12-held-field-release-is-field-level.md`, action items `7bf22072`
 + `dc6f52d6`, Jen feedback `da8a19f1`): `ap_pending.classify_field` and
 `sync_ap.plan_mirror_writes` no longer read a newer ROW `modifiedAt` as
@@ -127,6 +138,16 @@ Scheduled sync and automation scripts for the SAM COS and ORiON systems.
   orion-pll's ack flow) only fire an event for ACTIVE parent APs since
   2026-09-11 (`ACTIVE_STATUSES` gate, bug `ca9beaeb` Phase 2) — a
   Complete/Cancelled/On-Hold parent's date still baselines silently.
+- `ap_sync_monitor.py` — reconciliation monitor over SAM COS
+  `health:github:orion_ap_sync:accounting` / `:last_run`, triggered by samcos
+  Vercel Cron (`ap-sync-monitor.yml`, `workflow_dispatch` only). Audits the
+  child identity (`child_identity_residual == 0`), parent-titles integrity and
+  run health; pushes via `notification_queue`. Child check: push on status
+  change or residual-value change, remind every 7 days while unchanged;
+  titles/run_health: 12h re-nag. Dedup state in
+  `system:ap_sync_monitor:alert_state`. Never alters the sync; the fix for a
+  broken identity is at the source (`sync_ap.py`), never a tolerated residual.
+  Harness: `--accounting-file/--state-file/--now/--last-run`.
 - `ap_pending.py` — the ONE implementation of "has this ORiON edit been
   reconciled in the tracker" (decision `2026-09-08-ap-pending-clear-and-
   direction.md`): per-field over the row's `ap_change_log` episode, judged

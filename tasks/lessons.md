@@ -1041,3 +1041,9 @@ send_ap_pending_digest.py groups AP rows by parent number (parsed as integers fo
 ## 2026-10-12 — Row modified time is not field evidence
 
 **Row modified time is not field evidence.** A held field was released because the row it lives on was touched, while the field itself never changed. Any rule that decides "the other side changed this field" must compare the field, not the row. (2026-10-12, Mid-Month pilot, AP-0952-2 lost.)
+
+## 2026-10-14 | A page that repeats unchanged stops being read
+The AP monitor pushed the same "residual 1" every 12 hours for five weeks. By
+the third day nobody was reading it, which is the same blindness the monitor
+was built to prevent. Page on a change of state or value; remind on a slow
+cadence while it stays broken.
